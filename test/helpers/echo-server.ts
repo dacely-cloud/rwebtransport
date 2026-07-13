@@ -38,11 +38,9 @@ export async function startEchoServer(): Promise<EchoServer> {
         );
     }
 
-    const proc = spawn(
-        bin,
-        ['--cert', CERT, '--key', KEY, '--host', '127.0.0.1', '--port', '0'],
-        { stdio: ['ignore', 'pipe', 'pipe'] },
-    );
+    const proc = spawn(bin, ['--cert', CERT, '--key', KEY, '--host', '127.0.0.1', '--port', '0'], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
 
     const port = await new Promise<number>((resolve, reject) => {
         let buf = '';

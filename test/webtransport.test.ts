@@ -165,6 +165,23 @@ describe('Unidirectional streams', () => {
     });
 });
 
+describe('Robustness / panic containment', () => {
+    it('a driver-thread panic rejects the session and never crashes Node', async () => {
+        // Arm the test-only panic hook for connections created while this is set.
+        process.env.RWT_TEST_PANIC = '1';
+        try {
+            const wt = connect();
+            await expect(wt.ready).rejects.toBeInstanceOf(WebTransportError);
+        } finally {
+            delete process.env.RWT_TEST_PANIC;
+        }
+        // If we got here, the process is still alive — prove it with a normal session.
+        const wt2 = connect();
+        await expect(wt2.ready).resolves.toBeUndefined();
+        wt2.close();
+    });
+});
+
 describe('Datagrams', () => {
     it('echoes datagrams', async () => {
         const wt = connect();

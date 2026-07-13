@@ -816,10 +816,13 @@ impl WtSession {
             }
         }
 
-        if st.out.is_empty() && st.fin_queued && !st.fin_sent
-            && conn.stream_send(id, &[], true).is_ok() {
-                st.fin_sent = true;
-            }
+        if st.out.is_empty()
+            && st.fin_queued
+            && !st.fin_sent
+            && conn.stream_send(id, &[], true).is_ok()
+        {
+            st.fin_sent = true;
+        }
     }
 
     // ---- lifecycle -----------------------------------------------------------

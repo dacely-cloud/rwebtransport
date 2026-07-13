@@ -70,17 +70,64 @@ pub trait EventSink: Send {
     fn emit(&self, events: Vec<Ev>);
 }
 
-/// Run the driver loop until the connection closes or a fatal error occurs.
+/// Entry point for the driver thread. Wraps the event loop in `catch_unwind` so
+/// that a panic anywhere in the driver (or in quiche) can NEVER crash the Node
+/// process and can NEVER silently hang the session: on panic we emit an `error`
+/// event followed by `closed`, so the JS `ready`/`closed` promises reject.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
+    poll: Poll,
+    socket: UdpSocket,
+    local_addr: std::net::SocketAddr,
+    conn: quiche::Connection,
+    session: WtSession,
+    rx: Receiver<Command>,
+    sink: Box<dyn EventSink>,
+    shared: Arc<DriverShared>,
+) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_inner(
+            poll,
+            socket,
+            local_addr,
+            conn,
+            session,
+            rx,
+            sink.as_ref(),
+            &shared,
+        );
+    }));
+    if let Err(payload) = result {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        shared.closed.store(true, Ordering::Relaxed);
+        sink.emit(vec![
+            Ev::Error(format!("rwebtransport internal driver error: {msg}")),
+            Ev::Closed {
+                code: 0,
+                reason: b"driver panic".to_vec(),
+                remote: false,
+            },
+        ]);
+    }
+}
+
+/// The actual event loop. Runs until the connection closes or a fatal error
+/// occurs. Never call this directly from the spawned thread — go through
+/// [`run`], which contains the panic boundary.
+#[allow(clippy::too_many_arguments)]
+fn run_inner(
     mut poll: Poll,
     mut socket: UdpSocket,
     local_addr: std::net::SocketAddr,
     mut conn: quiche::Connection,
     mut session: WtSession,
     rx: Receiver<Command>,
-    sink: Box<dyn EventSink>,
-    shared: Arc<DriverShared>,
+    sink: &dyn EventSink,
+    shared: &Arc<DriverShared>,
 ) {
     if let Err(e) = poll
         .registry()
@@ -95,6 +142,9 @@ pub fn run(
     let mut send_buf = vec![0u8; 1350];
 
     let debug = std::env::var("RWT_DEBUG").is_ok();
+    // Read once per driver thread (each session spawns a fresh thread), so tests
+    // can arm/disarm it per-connection via the environment.
+    let test_panic = std::env::var("RWT_TEST_PANIC").is_ok();
     let mut established_logged = false;
     if debug {
         eprintln!("[rwt-driver] start local={local_addr}");
@@ -189,6 +239,12 @@ pub fn run(
 
         // 4. Drive the session forward.
         if conn.is_established() {
+            // Test-only hook: prove that a panic on the driver thread is
+            // contained (rejects ready/closed, never crashes Node). Gated behind
+            // an env var so it is inert in production.
+            if test_panic {
+                panic!("RWT_TEST_PANIC: intentional driver-thread panic for containment testing");
+            }
             if debug && !established_logged {
                 established_logged = true;
                 eprintln!(
