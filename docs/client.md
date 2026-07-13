@@ -148,12 +148,12 @@ Treat them as forward-compatible hints, not guarantees.
 
 ### Certificate verification: which mode applies
 
-| You set | Verification used |
-| --- | --- |
-| neither `serverCertificateHashes` nor `insecure` | Full PKI: CA chain **and** hostname validation |
-| `serverCertificateHashes` | Fingerprint match only (CA and hostname bypassed) |
-| `insecure: true` (and no hashes) | None (accepts any certificate) |
-| both `serverCertificateHashes` and `insecure` | Fingerprint match (`insecure` is ignored) |
+| You set                                          | Verification used                                 |
+| ------------------------------------------------ | ------------------------------------------------- |
+| neither `serverCertificateHashes` nor `insecure` | Full PKI: CA chain **and** hostname validation    |
+| `serverCertificateHashes`                        | Fingerprint match only (CA and hostname bypassed) |
+| `insecure: true` (and no hashes)                 | None (accepts any certificate)                    |
+| both `serverCertificateHashes` and `insecure`    | Fingerprint match (`insecure` is ignored)         |
 
 ---
 
@@ -384,9 +384,7 @@ async function main(): Promise<void> {
         // Pin a self-signed cert by its 32-byte SHA-256 fingerprint. In dev you
         // could instead pass `insecure: true`. With neither, full CA + hostname
         // validation applies.
-        serverCertificateHashes: [
-            { algorithm: 'sha-256', value: loadFingerprint() },
-        ],
+        serverCertificateHashes: [{ algorithm: 'sha-256', value: loadFingerprint() }],
         headers: { 'x-client': 'demo' },
     });
 

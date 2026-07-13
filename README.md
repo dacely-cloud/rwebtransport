@@ -42,11 +42,11 @@
 2. [Install](#install)
 3. [Quick start](#quick-start)
 4. [The client API](#the-client-api)
-   - [Connecting](#connecting)
-   - [Bidirectional streams](#bidirectional-streams)
-   - [Unidirectional streams](#unidirectional-streams)
-   - [Datagrams](#datagrams)
-   - [Closing](#closing)
+    - [Connecting](#connecting)
+    - [Bidirectional streams](#bidirectional-streams)
+    - [Unidirectional streams](#unidirectional-streams)
+    - [Datagrams](#datagrams)
+    - [Closing](#closing)
 5. [The server API](#the-server-api)
 6. [Threading, workers, and cluster](#threading-workers-and-cluster)
 7. [Docs and examples](#docs-and-examples)
@@ -93,14 +93,14 @@ console.log(new TextDecoder().decode(value)); // "hello over QUIC"
 
 ## Why
 
-| | WebSocket | `rwebtransport` |
-|---|---|---|
-| Transport | TCP + TLS | **QUIC** (UDP + TLS 1.3) |
-| Head-of-line blocking | Yes, one stream | **No**, independent streams |
-| Multiple streams | One per connection | **Many**, multiplexed |
-| Unreliable messages | ✗ | **Datagrams** ✓ |
-| Client and server | ✗ (server only) | **Both**, one package |
-| Browser-identical API | ✗ | **✓ WHATWG `WebTransport`** |
+|                       | WebSocket          | `rwebtransport`             |
+| --------------------- | ------------------ | --------------------------- |
+| Transport             | TCP + TLS          | **QUIC** (UDP + TLS 1.3)    |
+| Head-of-line blocking | Yes, one stream    | **No**, independent streams |
+| Multiple streams      | One per connection | **Many**, multiplexed       |
+| Unreliable messages   | ✗                  | **Datagrams** ✓             |
+| Client and server     | ✗ (server only)    | **Both**, one package       |
+| Browser-identical API | ✗                  | **✓ WHATWG `WebTransport`** |
 
 If you are building game netcode, live media, collaborative editing, financial tick feeds, or anything where a stalled TCP segment must not freeze every other message, this is the transport you want, and now you can share client code between the browser and Node.
 
@@ -127,8 +127,8 @@ import { WebTransport } from 'rwebtransport';
 
 // 1. Open a session (QUIC handshake plus HTTP/3 Extended CONNECT).
 const wt = new WebTransport('https://localhost:4433/chat', {
-  // Trust a specific self-signed cert by its SHA-256, exactly like the browser API:
-  serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
+    // Trust a specific self-signed cert by its SHA-256, exactly like the browser API:
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
 });
 await wt.ready;
 
@@ -140,8 +140,8 @@ await dgramWriter.write(new Uint8Array([1, 2, 3]));
 const reader = wt.incomingUnidirectionalStreams.getReader();
 const { value: receive } = await reader.read();
 if (receive) {
-  const { value: bytes } = await receive.getReader().read();
-  console.log('server pushed', bytes?.length ?? 0, 'bytes');
+    const { value: bytes } = await receive.getReader().read();
+    console.log('server pushed', bytes?.length ?? 0, 'bytes');
 }
 
 // 4. Close.
@@ -164,13 +164,13 @@ await wt.ready;   // resolves when the session is established, rejects if it fai
 await wt.closed;  // resolves when the session ends cleanly, rejects on abnormal close
 ```
 
-| Option | Type | Meaning |
-|---|---|---|
-| `serverCertificateHashes` | `{ algorithm: 'sha-256', value: BufferSource }[]` | Accept a server cert by its SHA-256 fingerprint (self-signed or pinned). Bypasses CA and hostname checks for the matching cert, exactly like the browser. |
-| `insecure` | `boolean` | Node extension. Disable **all** certificate verification. Development only. |
-| `headers` | `Record<string, string>` | Node extension. Extra request headers on the Extended CONNECT. |
-| `origin` | `string` | Node extension. Value for the `Origin` request header. |
-| `allowPooling`, `requireUnreliable`, `congestionControl` | | Accepted for spec parity; currently informational. |
+| Option                                                   | Type                                              | Meaning                                                                                                                                                   |
+| -------------------------------------------------------- | ------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `serverCertificateHashes`                                | `{ algorithm: 'sha-256', value: BufferSource }[]` | Accept a server cert by its SHA-256 fingerprint (self-signed or pinned). Bypasses CA and hostname checks for the matching cert, exactly like the browser. |
+| `insecure`                                               | `boolean`                                         | Node extension. Disable **all** certificate verification. Development only.                                                                               |
+| `headers`                                                | `Record<string, string>`                          | Node extension. Extra request headers on the Extended CONNECT.                                                                                            |
+| `origin`                                                 | `string`                                          | Node extension. Value for the `Origin` request header.                                                                                                    |
+| `allowPooling`, `requireUnreliable`, `congestionControl` |                                                   | Accepted for spec parity; currently informational.                                                                                                        |
 
 When neither `serverCertificateHashes` nor `insecure` is set, the client performs full PKI validation against the system trust store with hostname checking.
 
@@ -224,34 +224,34 @@ The same package ships a **WebTransport server**. Bind a UDP port with a certifi
 import { WebTransportServer } from 'rwebtransport';
 
 const server = new WebTransportServer({
-  port: 4433,
-  host: '0.0.0.0',
-  cert: '/path/to/cert.pem', // PEM certificate chain (file path)
-  key: '/path/to/key.pem',   // PEM private key (file path)
+    port: 4433,
+    host: '0.0.0.0',
+    cert: '/path/to/cert.pem', // PEM certificate chain (file path)
+    key: '/path/to/key.pem', // PEM private key (file path)
 });
 await server.ready;
 console.log('listening on', server.port);
 
 const reader = server.incomingSessions.getReader();
 for (;;) {
-  const { value: session, done } = await reader.read();
-  if (done) break;
+    const { value: session, done } = await reader.read();
+    if (done) break;
 
-  console.log('new session:', session.path, session.authority);
+    console.log('new session:', session.path, session.authority);
 
-  // Echo every bidirectional stream straight back:
-  const streams = session.incomingBidirectionalStreams.getReader();
-  void (async () => {
-    for (;;) {
-      const { value: stream, done } = await streams.read();
-      if (done) break;
-      void stream.readable.pipeTo(stream.writable);
-    }
-  })();
+    // Echo every bidirectional stream straight back:
+    const streams = session.incomingBidirectionalStreams.getReader();
+    void (async () => {
+        for (;;) {
+            const { value: stream, done } = await streams.read();
+            if (done) break;
+            void stream.readable.pipeTo(stream.writable);
+        }
+    })();
 
-  // Open a stream or send a datagram from the server side:
-  const outbound = await session.createUnidirectionalStream();
-  await outbound.getWriter().write(new TextEncoder().encode('welcome'));
+    // Open a stream or send a datagram from the server side:
+    const outbound = await session.createUnidirectionalStream();
+    await outbound.getWriter().write(new TextEncoder().encode('welcome'));
 }
 ```
 
@@ -263,7 +263,7 @@ for (;;) {
 
 - **Threading.** Each session runs its QUIC/HTTP-3 work on its own background thread and talks to the JS event loop through neon's `Channel`. Every hand-off is non-blocking (an unbounded command channel, a non-blocking event channel, atomics), so the library never deadlocks internally; it only ever applies backpressure. The one way to wedge a stream is the universal one: writing a large bidirectional stream without concurrently reading it. Read while you write.
 - **`worker_threads`.** Fully supported. The addon is context-aware, so a client or server can be created inside any Worker and each Worker gets its own instance bound to its own event loop. Multiple Workers run concurrently.
-- **`cluster`.** Clients work as-is (each process is independent). A server binds a UDP socket without `SO_REUSEPORT`, so multiple cluster workers cannot currently share a single listening port; run one server per port, or put a UDP load balancer in front.
+- **`cluster`.** Clients work as-is (each process is independent). A server can share one listening port across cluster workers with `reusePort: true` (`SO_REUSEPORT`, Unix only); the kernel load-balances connections across the workers. On Windows, run one server per port or put a UDP load balancer in front.
 
 ---
 

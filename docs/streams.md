@@ -17,12 +17,12 @@ For the session itself (opening, `ready`, `closed`, closing) see the
 
 ## The two kinds of stream
 
-| | Bidirectional | Unidirectional |
-|---|---|---|
-| Open it | `session.createBidirectionalStream()` | `session.createUnidirectionalStream()` |
-| You get | `WebTransportBidirectionalStream` (read + write) | `WebTransportSendStream` (write only) |
-| Peer accepts it via | `incomingBidirectionalStreams` | `incomingUnidirectionalStreams` |
-| Peer gets | `WebTransportBidirectionalStream` (read + write) | `WebTransportReceiveStream` (read only) |
+|                     | Bidirectional                                    | Unidirectional                          |
+| ------------------- | ------------------------------------------------ | --------------------------------------- |
+| Open it             | `session.createBidirectionalStream()`            | `session.createUnidirectionalStream()`  |
+| You get             | `WebTransportBidirectionalStream` (read + write) | `WebTransportSendStream` (write only)   |
+| Peer accepts it via | `incomingBidirectionalStreams`                   | `incomingUnidirectionalStreams`         |
+| Peer gets           | `WebTransportBidirectionalStream` (read + write) | `WebTransportReceiveStream` (read only) |
 
 Either side (client or server) can open either kind. A
 `WebTransportBidirectionalStream` bundles a `.readable`
@@ -35,7 +35,7 @@ reads.
 import { WebTransport } from 'rwebtransport';
 
 const wt = new WebTransport('https://localhost:4433/demo', {
-  serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
 });
 await wt.ready;
 
@@ -84,17 +84,17 @@ loop with a reader:
 // Bidirectional streams the peer opens.
 const bidiReader = wt.incomingBidirectionalStreams.getReader();
 for (;;) {
-  const { value: stream, done } = await bidiReader.read();
-  if (done) break; // session closed
-  handleBidi(stream); // stream is a WebTransportBidirectionalStream
+    const { value: stream, done } = await bidiReader.read();
+    if (done) break; // session closed
+    handleBidi(stream); // stream is a WebTransportBidirectionalStream
 }
 
 // Unidirectional streams the peer opens (read-only).
 const uniReader = wt.incomingUnidirectionalStreams.getReader();
 for (;;) {
-  const { value: recv, done } = await uniReader.read();
-  if (done) break;
-  handleReceive(recv); // recv is a WebTransportReceiveStream
+    const { value: recv, done } = await uniReader.read();
+    if (done) break;
+    handleReceive(recv); // recv is a WebTransportReceiveStream
 }
 ```
 
@@ -109,26 +109,26 @@ Get a reader and loop until `done`. Each chunk is a `Uint8Array`.
 
 ```ts
 async function readAll(readable: ReadableStream<Uint8Array>): Promise<Uint8Array> {
-  const reader = readable.getReader();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break; // the peer sent FIN: stream finished normally
-      chunks.push(value);
-      total += value.length;
+    const reader = readable.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+        for (;;) {
+            const { value, done } = await reader.read();
+            if (done) break; // the peer sent FIN: stream finished normally
+            chunks.push(value);
+            total += value.length;
+        }
+    } finally {
+        reader.releaseLock();
     }
-  } finally {
-    reader.releaseLock();
-  }
-  const out = new Uint8Array(total);
-  let offset = 0;
-  for (const chunk of chunks) {
-    out.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return out;
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
 }
 ```
 
@@ -169,12 +169,12 @@ deadlock, see the rule below):
 // Server side: echo every incoming bidi stream straight back to the peer.
 const streams = session.incomingBidirectionalStreams.getReader();
 for (;;) {
-  const { value: stream, done } = await streams.read();
-  if (done) break;
-  // readable -> writable: bytes the peer sends come right back.
-  void stream.readable.pipeTo(stream.writable).catch(() => {
-    // the stream was reset or the session closed; nothing to clean up.
-  });
+    const { value: stream, done } = await streams.read();
+    if (done) break;
+    // readable -> writable: bytes the peer sends come right back.
+    void stream.readable.pipeTo(stream.writable).catch(() => {
+        // the stream was reset or the session closed; nothing to clean up.
+    });
 }
 ```
 
@@ -206,10 +206,10 @@ observe the pressure through the writer without awaiting every write:
 ```ts
 const writer = send.getWriter();
 for (const chunk of chunks) {
-  // writer.ready pends while more than the high-water mark is buffered,
-  // and resolves once the peer has read enough for QUIC to accept more.
-  await writer.ready;
-  void writer.write(chunk); // do not await: ready already gates the pace
+    // writer.ready pends while more than the high-water mark is buffered,
+    // and resolves once the peer has read enough for QUIC to accept more.
+    await writer.ready;
+    void writer.write(chunk); // do not await: ready already gates the pace
 }
 await writer.ready;
 await writer.close();
@@ -258,7 +258,7 @@ other reason maps to code 0.
 import { WebTransportError } from 'rwebtransport';
 
 await bidi.readable.cancel(
-  new WebTransportError('not needed', { source: 'stream', streamErrorCode: 7 }),
+    new WebTransportError('not needed', { source: 'stream', streamErrorCode: 7 }),
 ); // sends STOP_SENDING(7)
 ```
 
@@ -273,9 +273,7 @@ the stream. It sends a QUIC `RESET_STREAM` frame.
 import { WebTransportError } from 'rwebtransport';
 
 const writer = bidi.writable.getWriter();
-await writer.abort(
-  new WebTransportError('give up', { source: 'stream', streamErrorCode: 3 }),
-); // sends RESET_STREAM(3)
+await writer.abort(new WebTransportError('give up', { source: 'stream', streamErrorCode: 3 })); // sends RESET_STREAM(3)
 ```
 
 As with `cancel()`, the error code comes from a `WebTransportError.streamErrorCode`
@@ -300,25 +298,25 @@ import { WebTransportError } from 'rwebtransport';
 
 // Reading: catch a peer reset.
 try {
-  const reader = bidi.readable.getReader();
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    handle(value);
-  }
+    const reader = bidi.readable.getReader();
+    for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        handle(value);
+    }
 } catch (err) {
-  if (err instanceof WebTransportError) {
-    console.log('peer reset the stream, code', err.streamErrorCode);
-  }
+    if (err instanceof WebTransportError) {
+        console.log('peer reset the stream, code', err.streamErrorCode);
+    }
 }
 
 // Writing: catch a peer STOP_SENDING.
 try {
-  await writer.write(chunk);
+    await writer.write(chunk);
 } catch (err) {
-  if (err instanceof WebTransportError) {
-    console.log('peer stopped receiving, code', err.streamErrorCode);
-  }
+    if (err instanceof WebTransportError) {
+        console.log('peer stopped receiving, code', err.streamErrorCode);
+    }
 }
 ```
 
@@ -358,9 +356,9 @@ other.
 const stream = await wt.createBidirectionalStream();
 
 const writing = (async () => {
-  const writer = stream.writable.getWriter();
-  await writer.write(hugePayload);
-  await writer.close();
+    const writer = stream.writable.getWriter();
+    await writer.write(hugePayload);
+    await writer.close();
 })();
 
 const reading = readAll(stream.readable); // drains while writing proceeds
@@ -387,23 +385,23 @@ with read and write running concurrently so it is safe for any size.
 import { WebTransport } from 'rwebtransport';
 
 const wt = new WebTransport('https://localhost:4433/rpc', {
-  serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
 });
 await wt.ready;
 
 async function request(payload: Uint8Array): Promise<Uint8Array> {
-  const stream = await wt.createBidirectionalStream();
+    const stream = await wt.createBidirectionalStream();
 
-  const writing = (async () => {
-    const writer = stream.writable.getWriter();
-    await writer.write(payload);
-    await writer.close();
-  })();
+    const writing = (async () => {
+        const writer = stream.writable.getWriter();
+        await writer.write(payload);
+        await writer.close();
+    })();
 
-  const reading = readAll(stream.readable);
+    const reading = readAll(stream.readable);
 
-  const [, response] = await Promise.all([writing, reading]);
-  return response;
+    const [, response] = await Promise.all([writing, reading]);
+    return response;
 }
 
 const reply = await request(new TextEncoder().encode('ping'));

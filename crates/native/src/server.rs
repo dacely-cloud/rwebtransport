@@ -29,12 +29,40 @@ const MAX_INFLIGHT_BATCHES: i64 = 128;
 /// source addresses) cannot grow the connection table without bound.
 const MAX_CONNECTIONS: usize = 16_384;
 
+/// Maximum UDP packets read per event-loop wake before yielding to the rest of
+/// the loop (timeouts, commands, reaping). Bounds per-wake work so a sustained
+/// inbound flood cannot starve `Shutdown` handling or idle-connection reaping.
+const MAX_RECV_PER_WAKE: usize = 1024;
+
 /// Everything the server thread needs to start listening.
 pub struct ServerSetup {
     pub host: String,
     pub port: u16,
     pub cert_path: String,
     pub key_path: String,
+    /// Bind with `SO_REUSEPORT` (Unix) so several processes (e.g. Node `cluster`
+    /// workers) can share one listening port and have the kernel load-balance
+    /// connections across them.
+    pub reuse_port: bool,
+}
+
+/// Bind a non-blocking UDP socket, optionally with `SO_REUSEPORT` for clustering.
+fn bind_udp(addr: SocketAddr, reuse_port: bool) -> std::io::Result<UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let sock = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    sock.set_nonblocking(true)?;
+    #[cfg(unix)]
+    if reuse_port {
+        sock.set_reuse_port(true)?;
+    }
+    let _ = reuse_port; // SO_REUSEPORT is Unix-only
+    sock.bind(&addr.into())?;
+    Ok(UdpSocket::from_std(sock.into()))
 }
 
 /// Commands from JS into the server thread. All session-scoped commands carry the
@@ -135,30 +163,114 @@ pub fn run(
     }
 }
 
-/// Mint a stateless Retry token binding the client's source address to the
-/// original destination connection id. A spoofed source never receives the
-/// Retry, so it cannot produce a valid token; this prevents both source-address
-/// spoofing (reflection) and per-connection state exhaustion from spoofed IPs.
-fn mint_token(orig_dcid: &[u8], src: &SocketAddr) -> Vec<u8> {
-    let mut token = Vec::with_capacity(4 + 16 + orig_dcid.len());
-    token.extend_from_slice(b"rwt1");
-    match src.ip() {
-        std::net::IpAddr::V4(a) => token.extend_from_slice(&a.octets()),
-        std::net::IpAddr::V6(a) => token.extend_from_slice(&a.octets()),
-    }
-    token.extend_from_slice(orig_dcid);
-    token
-}
+/// Length of the authentication tag appended to a Retry token.
+const TOKEN_TAG_LEN: usize = 16;
 
-/// Validate a Retry token and recover the original destination connection id.
-fn validate_token<'a>(src: &SocketAddr, token: &'a [u8]) -> Option<quiche::ConnectionId<'a>> {
-    let rest = token.strip_prefix(b"rwt1")?;
-    let ip: Vec<u8> = match src.ip() {
+/// A serialized source-address identity (IP + port) used as the address the
+/// token is bound to. A spoofed source can never receive the Retry, and the tag
+/// is keyed by a per-process secret it does not know, so it cannot forge one.
+fn addr_identity(src: &SocketAddr) -> Vec<u8> {
+    let mut id = match src.ip() {
         std::net::IpAddr::V4(a) => a.octets().to_vec(),
         std::net::IpAddr::V6(a) => a.octets().to_vec(),
     };
-    let rest = rest.strip_prefix(ip.as_slice())?;
-    Some(quiche::ConnectionId::from_ref(rest))
+    id.extend_from_slice(&src.port().to_be_bytes());
+    id
+}
+
+/// HMAC-SHA256 (RFC 2104) over `data` keyed by `secret`, built on BoringSSL's
+/// SHA-256. Infallible: `boring::sha::sha256` cannot fail.
+fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut key = [0u8; BLOCK];
+    if secret.len() > BLOCK {
+        key[..32].copy_from_slice(&boring::sha::sha256(secret));
+    } else {
+        key[..secret.len()].copy_from_slice(secret);
+    }
+    let mut ipad = [0x36u8; BLOCK];
+    let mut opad = [0x5cu8; BLOCK];
+    for i in 0..BLOCK {
+        ipad[i] ^= key[i];
+        opad[i] ^= key[i];
+    }
+    let mut inner = Vec::with_capacity(BLOCK + data.len());
+    inner.extend_from_slice(&ipad);
+    inner.extend_from_slice(data);
+    let inner_hash = boring::sha::sha256(&inner);
+    let mut outer = Vec::with_capacity(BLOCK + 32);
+    outer.extend_from_slice(&opad);
+    outer.extend_from_slice(&inner_hash);
+    boring::sha::sha256(&outer)
+}
+
+/// Constant-time byte comparison so token validation does not leak the tag via
+/// timing.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+/// Mint a stateless Retry token that authenticates the client's source address
+/// and carries the original destination connection id. The token is
+/// `b"rwt1" || orig_dcid || HMAC(secret, addr || orig_dcid)[..16]`. Because the
+/// tag is keyed by a secret known only to this process, a spoofed source cannot
+/// forge a token it never received, which is what makes the Retry actually
+/// prevent source-address spoofing (reflection) and state exhaustion rather than
+/// just being a formality.
+fn mint_token(secret: &[u8], orig_dcid: &[u8], src: &SocketAddr) -> Vec<u8> {
+    let mut mac_input = addr_identity(src);
+    mac_input.extend_from_slice(orig_dcid);
+    let tag = hmac_sha256(secret, &mac_input);
+    let mut token = Vec::with_capacity(4 + orig_dcid.len() + TOKEN_TAG_LEN);
+    token.extend_from_slice(b"rwt1");
+    token.extend_from_slice(orig_dcid);
+    token.extend_from_slice(&tag[..TOKEN_TAG_LEN]);
+    token
+}
+
+/// Validate a Retry token against `src` and recover the original destination
+/// connection id. Fails closed on any mismatch (forged/replayed/truncated).
+fn validate_token<'a>(
+    secret: &[u8],
+    src: &SocketAddr,
+    token: &'a [u8],
+) -> Option<quiche::ConnectionId<'a>> {
+    let rest = token.strip_prefix(b"rwt1")?;
+    if rest.len() < TOKEN_TAG_LEN {
+        return None;
+    }
+    let (orig_dcid, tag) = rest.split_at(rest.len() - TOKEN_TAG_LEN);
+    let mut mac_input = addr_identity(src);
+    mac_input.extend_from_slice(orig_dcid);
+    let expected = hmac_sha256(secret, &mac_input);
+    if !constant_time_eq(&expected[..TOKEN_TAG_LEN], tag) {
+        return None;
+    }
+    Some(quiche::ConnectionId::from_ref(orig_dcid))
+}
+
+/// A per-process random secret keying the Retry-token HMAC. Regenerated on every
+/// start, so tokens are unforgeable and do not survive a restart.
+fn random_secret() -> [u8; 32] {
+    let mut b = [0u8; 32];
+    if getrandom::getrandom(&mut b).is_err() {
+        let seed: u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let s = seed.to_le_bytes();
+        for (i, slot) in b.iter_mut().enumerate() {
+            *slot = s[i % s.len()];
+        }
+    }
+    b
 }
 
 fn random_scid() -> [u8; LOCAL_CONN_ID_LEN] {
@@ -189,7 +301,7 @@ fn run_inner(
             return;
         }
     };
-    let mut socket = match UdpSocket::bind(bind) {
+    let mut socket = match bind_udp(bind, setup.reuse_port) {
         Ok(s) => s,
         Err(e) => {
             sink.emit(vec![ServerMsg::ServerError(format!("bind failed: {e}"))]);
@@ -229,6 +341,9 @@ fn run_inner(
     let mut sessions: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut next_session_id: u64 = 1;
 
+    // Per-process secret keying the stateless Retry token (see mint_token).
+    let token_secret = random_secret();
+
     loop {
         let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
         if poll.poll(&mut events, timeout).is_err() {
@@ -237,9 +352,15 @@ fn run_inner(
 
         let mut out: Vec<ServerMsg> = Vec::new();
 
-        // 1. Read all datagrams and route them.
+        // 1. Read datagrams and route them, up to a per-wake budget so a flood
+        // cannot starve the rest of the loop (commands, timeouts, reaping).
         let mut got_packet = false;
+        let mut budget = MAX_RECV_PER_WAKE;
         loop {
+            if budget == 0 {
+                break;
+            }
+            budget -= 1;
             let (len, from) = match socket.recv_from(&mut recv_buf) {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -270,7 +391,7 @@ fn run_inner(
                         // source that has not proven it owns its address.
                         let new_scid = random_scid();
                         let new_scid_id = quiche::ConnectionId::from_ref(&new_scid);
-                        let retry_token = mint_token(&hdr.dcid, &from);
+                        let retry_token = mint_token(&token_secret, &hdr.dcid, &from);
                         if let Ok(len) = quiche::retry(
                             &hdr.scid,
                             &hdr.dcid,
@@ -286,7 +407,7 @@ fn run_inner(
 
                     // The client echoed a Retry token: validate it before we
                     // allocate any connection state.
-                    let Some(odcid) = validate_token(&from, token) else {
+                    let Some(odcid) = validate_token(&token_secret, &from, token) else {
                         continue;
                     };
                     // Our Retry SCID, echoed back as this Initial's DCID.
@@ -485,9 +606,16 @@ fn apply_command(
 fn flush_send(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8]) {
     loop {
         match conn.send(out) {
-            Ok((write, info)) => {
-                let _ = socket.send_to(&out[..write], info.to);
-            }
+            Ok((write, info)) => match socket.send_to(&out[..write], info.to) {
+                Ok(_) => {}
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    // Kernel send buffer is full. Stop draining rather than
+                    // discarding packets quiche already accounted as sent; its
+                    // loss recovery retransmits the frames on a later flush.
+                    return;
+                }
+                Err(_) => return,
+            },
             Err(quiche::Error::Done) => return,
             Err(_) => return,
         }
@@ -502,4 +630,89 @@ fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool) {
         return (err.error_code as u32, err.reason.clone(), false);
     }
     (0, Vec::new(), true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn addr(s: &str) -> SocketAddr {
+        s.parse().expect("addr")
+    }
+
+    #[test]
+    fn token_roundtrip_recovers_dcid() {
+        let secret = [7u8; 32];
+        let dcid = b"\x11\x22\x33\x44\x55\x66\x77\x88";
+        let src = addr("192.0.2.10:4433");
+        let token = mint_token(&secret, dcid, &src);
+        let recovered = validate_token(&secret, &src, &token).expect("valid token");
+        assert_eq!(recovered.as_ref(), &dcid[..]);
+    }
+
+    #[test]
+    fn token_rejected_for_different_source_address() {
+        let secret = [7u8; 32];
+        let dcid = b"abcdefghij";
+        let token = mint_token(&secret, dcid, &addr("192.0.2.10:4433"));
+        // Spoofed source IP: the whole point of the Retry.
+        assert!(validate_token(&secret, &addr("192.0.2.11:4433"), &token).is_none());
+        // Same IP, different port: still not the address the token was minted for.
+        assert!(validate_token(&secret, &addr("192.0.2.10:5555"), &token).is_none());
+    }
+
+    #[test]
+    fn token_rejected_under_a_different_secret() {
+        let dcid = b"abcdefghij";
+        let src = addr("198.51.100.7:443");
+        let token = mint_token(&[1u8; 32], dcid, &src);
+        // A server that restarted (new secret) rejects the stale token.
+        assert!(validate_token(&[2u8; 32], &src, &token).is_none());
+    }
+
+    #[test]
+    fn forged_and_truncated_tokens_are_rejected() {
+        let secret = [9u8; 32];
+        let src = addr("198.51.100.7:443");
+        // Attacker who does not know the secret guesses the layout with a zero tag.
+        let mut forged = Vec::new();
+        forged.extend_from_slice(b"rwt1");
+        forged.extend_from_slice(b"deadbeefdcid");
+        forged.extend_from_slice(&[0u8; TOKEN_TAG_LEN]);
+        assert!(validate_token(&secret, &src, &forged).is_none());
+        // Too short to hold a tag, wrong prefix, empty.
+        assert!(validate_token(&secret, &src, b"rwt1short").is_none());
+        assert!(validate_token(&secret, &src, b"nope").is_none());
+        assert!(validate_token(&secret, &src, b"").is_none());
+        // A valid token with a single tag byte flipped.
+        let mut token = mint_token(&secret, b"abcdefghij", &src);
+        let last = token.len() - 1;
+        token[last] ^= 0xff;
+        assert!(validate_token(&secret, &src, &token).is_none());
+    }
+
+    #[test]
+    fn hmac_is_deterministic_and_key_dependent() {
+        assert_eq!(
+            hmac_sha256(&[0u8; 32], b"msg"),
+            hmac_sha256(&[0u8; 32], b"msg")
+        );
+        assert_ne!(
+            hmac_sha256(&[0u8; 32], b"msg"),
+            hmac_sha256(&[1u8; 32], b"msg")
+        );
+        // Known RFC 4231 test case 1: key=0x0b*20, data="Hi There".
+        let key = [0x0bu8; 20];
+        let tag = hmac_sha256(&key, b"Hi There");
+        let expected =
+            hex_to_bytes("b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+        assert_eq!(&tag[..], &expected[..]);
+    }
+
+    fn hex_to_bytes(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
 }

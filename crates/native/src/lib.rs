@@ -450,7 +450,8 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
     let key_path = cx.argument::<JsString>(1)?.value(&mut cx);
     let host = cx.argument::<JsString>(2)?.value(&mut cx);
     let port = cx.argument::<JsNumber>(3)?.value(&mut cx) as u16;
-    let callback = cx.argument::<JsFunction>(4)?;
+    let reuse_port = cx.argument::<JsBoolean>(4)?.value(&mut cx);
+    let callback = cx.argument::<JsFunction>(5)?;
 
     let poll = match mio::Poll::new() {
         Ok(p) => p,
@@ -474,6 +475,7 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
         port,
         cert_path,
         key_path,
+        reuse_port,
     };
 
     let shared_for_thread = shared.clone();

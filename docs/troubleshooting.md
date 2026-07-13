@@ -258,9 +258,18 @@ await server.ready;
 console.log('OS-assigned port:', server.port); // valid once ready resolves
 ```
 
-**cluster port sharing.** The server binds its UDP socket **without**
-`SO_REUSEPORT`, so multiple `cluster` workers **cannot** share one server port.
-Options:
+**cluster port sharing.** To let several `cluster` workers share one server
+port, pass `reusePort: true`. The library sets `SO_REUSEPORT` and the kernel
+load-balances inbound QUIC connections across the workers:
+
+```js
+const server = new WebTransportServer({ port: 4433, cert, key, reusePort: true });
+await server.ready; // every worker can bind the same port
+```
+
+`SO_REUSEPORT` is Unix-only (Linux and the BSDs, including macOS). On Windows the
+flag is ignored, so the second worker to bind the same port still fails with
+`EADDRINUSE`. Portable options that work everywhere:
 
 - Run **one server per port** (give each worker its own port), or
 - Put a **UDP load balancer** in front and fan connections out to per-worker

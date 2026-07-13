@@ -20,3 +20,4 @@ octets.workspace = true
 log.workspace = true
 mio.workspace = true
 getrandom.workspace = true
+socket2.workspace = true

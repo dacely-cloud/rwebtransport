@@ -64,6 +64,7 @@ export interface NativeAddon {
         keyPath: string,
         host: string,
         port: number,
+        reusePort: boolean,
         onEvent: (ev: ServerNativeEvent) => void,
     ): NativeServerHandle;
     serverOpenStream(

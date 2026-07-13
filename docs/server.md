@@ -8,10 +8,10 @@ One WebTransport session maps to one QUIC connection. The server auto-accepts an
 import { WebTransportServer } from 'rwebtransport';
 
 const server = new WebTransportServer({
-  port: 4433,
-  host: '0.0.0.0',
-  cert: '/path/to/cert.pem', // PEM certificate chain (a file path)
-  key: '/path/to/key.pem',   // PEM private key (a file path)
+    port: 4433,
+    host: '0.0.0.0',
+    cert: '/path/to/cert.pem', // PEM certificate chain (a file path)
+    key: '/path/to/key.pem', // PEM private key (a file path)
 });
 
 await server.ready;
@@ -47,28 +47,30 @@ You need a certificate and a matching private key on disk. For local development
 
 ```ts
 interface WebTransportServerOptions {
-  port: number;   // UDP port to listen on; 0 lets the OS pick one
-  host?: string;  // interface to bind, default "0.0.0.0"
-  cert: string;   // path to the PEM certificate-chain file
-  key: string;    // path to the PEM private-key file
+    port: number; // UDP port to listen on; 0 lets the OS pick one
+    host?: string; // interface to bind, default "0.0.0.0"
+    cert: string; // path to the PEM certificate-chain file
+    key: string; // path to the PEM private-key file
+    reusePort?: boolean; // share the port across processes (Unix), default false
 }
 ```
 
-| Field  | Type     | Required | Meaning |
-| ------ | -------- | -------- | ------- |
-| `port` | `number` | yes      | UDP port to bind. Pass `0` to let the OS assign a free port, then read the actual value back from [`server.port`](#ready-closed-and-port) after `ready`. |
-| `host` | `string` | no       | Interface address to bind. Defaults to `"0.0.0.0"` (all IPv4 interfaces). Use `"127.0.0.1"` to stay on loopback. |
-| `cert` | `string` | yes      | Filesystem path to a PEM file containing the server certificate chain (leaf first). This is a path, not the PEM text. |
-| `key`  | `string` | yes      | Filesystem path to a PEM file containing the private key for `cert`. This is a path, not the PEM text. |
+| Field       | Type      | Required | Meaning                                                                                                                                                                                                                                                                    |
+| ----------- | --------- | -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `port`      | `number`  | yes      | UDP port to bind. Pass `0` to let the OS assign a free port, then read the actual value back from [`server.port`](#ready-closed-and-port) after `ready`.                                                                                                                   |
+| `host`      | `string`  | no       | Interface address to bind. Defaults to `"0.0.0.0"` (all IPv4 interfaces). Use `"127.0.0.1"` to stay on loopback.                                                                                                                                                           |
+| `cert`      | `string`  | yes      | Filesystem path to a PEM file containing the server certificate chain (leaf first). This is a path, not the PEM text.                                                                                                                                                      |
+| `key`       | `string`  | yes      | Filesystem path to a PEM file containing the private key for `cert`. This is a path, not the PEM text.                                                                                                                                                                     |
+| `reusePort` | `boolean` | no       | Bind with `SO_REUSEPORT` so multiple processes (for example Node `cluster` workers) can share one listening port and have the kernel load-balance connections across them. Defaults to `false`. Unix-only; ignored on Windows. See [threading.md](./threading.md#cluster). |
 
 Both `cert` and `key` are file paths that the native layer reads at bind time. A missing file, an unreadable key, or a cert and key that do not match are fatal: `ready` (and `closed`) reject with a `WebTransportError`.
 
 ## `ready`, `closed`, and `port`
 
 ```ts
-server.ready;  // Promise<void>
+server.ready; // Promise<void>
 server.closed; // Promise<void>
-server.port;   // number
+server.port; // number
 ```
 
 - **`ready: Promise<void>`** resolves once the server is listening and accepting packets. It rejects with a [`WebTransportError`](./errors.md) on a fatal startup error, for example the port is already in use, the bind address is invalid, or the certificate or key cannot be loaded.
@@ -79,11 +81,11 @@ server.port;   // number
 const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert, key });
 
 try {
-  await server.ready;
-  console.log(`listening on 127.0.0.1:${server.port}`);
+    await server.ready;
+    console.log(`listening on 127.0.0.1:${server.port}`);
 } catch (err) {
-  // bind failure, bad cert/key, etc.
-  console.error('server failed to start:', err);
+    // bind failure, bad cert/key, etc.
+    console.error('server failed to start:', err);
 }
 ```
 
@@ -100,10 +102,10 @@ import type { WebTransportServerSession } from 'rwebtransport';
 
 const reader = server.incomingSessions.getReader();
 for (;;) {
-  const { value: session, done } = await reader.read();
-  if (done) break; // the server has stopped
-  if (!session) continue;
-  handleSession(session); // fire and forget; do not await it here
+    const { value: session, done } = await reader.read();
+    if (done) break; // the server has stopped
+    if (!session) continue;
+    handleSession(session); // fire and forget; do not await it here
 }
 ```
 
@@ -115,25 +117,25 @@ for (;;) {
 
 Shared surface (identical to the client, documented in [client.md](./client.md), [streams.md](./streams.md), and [datagrams.md](./datagrams.md)):
 
-| Member | Type | Notes |
-| ------ | ---- | ----- |
-| `ready` | `Promise<void>` | Already resolved for a server session. |
-| `closed` | `Promise<WebTransportCloseInfo>` | Resolves `{ closeCode, reason }` on a clean close, rejects with a `WebTransportError` on abnormal termination. |
-| `datagrams` | `WebTransportDatagramDuplexStream` | Unreliable, unordered datagrams. |
-| `incomingBidirectionalStreams` | `ReadableStream<WebTransportBidirectionalStream>` | Bidi streams the client opens. |
-| `incomingUnidirectionalStreams` | `ReadableStream<WebTransportReceiveStream>` | Uni streams the client opens. |
-| `createBidirectionalStream()` | `Promise<WebTransportBidirectionalStream>` | Open a bidi stream from the server. |
-| `createUnidirectionalStream()` | `Promise<WebTransportSendStream>` | Open a send-only stream from the server. |
-| `close(closeInfo?)` | `void` | Close this session. `closeInfo` is `{ closeCode?: number; reason?: string }`. |
+| Member                          | Type                                              | Notes                                                                                                          |
+| ------------------------------- | ------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `ready`                         | `Promise<void>`                                   | Already resolved for a server session.                                                                         |
+| `closed`                        | `Promise<WebTransportCloseInfo>`                  | Resolves `{ closeCode, reason }` on a clean close, rejects with a `WebTransportError` on abnormal termination. |
+| `datagrams`                     | `WebTransportDatagramDuplexStream`                | Unreliable, unordered datagrams.                                                                               |
+| `incomingBidirectionalStreams`  | `ReadableStream<WebTransportBidirectionalStream>` | Bidi streams the client opens.                                                                                 |
+| `incomingUnidirectionalStreams` | `ReadableStream<WebTransportReceiveStream>`       | Uni streams the client opens.                                                                                  |
+| `createBidirectionalStream()`   | `Promise<WebTransportBidirectionalStream>`        | Open a bidi stream from the server.                                                                            |
+| `createUnidirectionalStream()`  | `Promise<WebTransportSendStream>`                 | Open a send-only stream from the server.                                                                       |
+| `close(closeInfo?)`             | `void`                                            | Close this session. `closeInfo` is `{ closeCode?: number; reason?: string }`.                                  |
 
 Request metadata (only on `WebTransportServerSession`):
 
-| Member | Type | Meaning |
-| ------ | ---- | ------- |
-| `authority` | `string` | The `:authority` of the client's CONNECT (host and port the client asked for). |
-| `path` | `string` | The `:path` of the client's CONNECT, taken from the URL the client connected to (for example `/chat/room1`). |
-| `origin` | `string \| null` | The `origin` request header, or `null` if the client sent none. |
-| `headers` | `Record<string, string>` | Any additional (non-pseudo) request headers the client sent. |
+| Member      | Type                     | Meaning                                                                                                      |
+| ----------- | ------------------------ | ------------------------------------------------------------------------------------------------------------ |
+| `authority` | `string`                 | The `:authority` of the client's CONNECT (host and port the client asked for).                               |
+| `path`      | `string`                 | The `:path` of the client's CONNECT, taken from the URL the client connected to (for example `/chat/room1`). |
+| `origin`    | `string \| null`         | The `origin` request header, or `null` if the client sent none.                                              |
+| `headers`   | `Record<string, string>` | Any additional (non-pseudo) request headers the client sent.                                                 |
 
 Use `path`, `origin`, and `headers` to route and authorize each session, as shown next.
 
@@ -145,20 +147,20 @@ To reject a client, close the session as soon as you see it. You can decide base
 
 ```ts
 function handleSession(session: WebTransportServerSession): void {
-  // Reject anything that is not a known path.
-  if (session.path !== '/echo' && !session.path.startsWith('/chat/')) {
-    session.close({ closeCode: 404, reason: 'no such path' });
-    return;
-  }
+    // Reject anything that is not a known path.
+    if (session.path !== '/echo' && !session.path.startsWith('/chat/')) {
+        session.close({ closeCode: 404, reason: 'no such path' });
+        return;
+    }
 
-  // Reject an unauthorized origin on a sensitive path.
-  if (session.path.startsWith('/chat/') && session.origin !== 'https://app.example') {
-    session.close({ closeCode: 403, reason: 'forbidden origin' });
-    return;
-  }
+    // Reject an unauthorized origin on a sensitive path.
+    if (session.path.startsWith('/chat/') && session.origin !== 'https://app.example') {
+        session.close({ closeCode: 403, reason: 'forbidden origin' });
+        return;
+    }
 
-  // Otherwise: accept by serving the session.
-  serve(session);
+    // Otherwise: accept by serving the session.
+    serve(session);
 }
 ```
 
@@ -168,8 +170,8 @@ It is good practice to watch each accepted session's `closed` so a client that d
 
 ```ts
 session.closed.then(
-  (info) => console.log(`session ${session.path} closed cleanly:`, info),
-  (err) => console.warn(`session ${session.path} died:`, err),
+    (info) => console.log(`session ${session.path} closed cleanly:`, info),
+    (err) => console.warn(`session ${session.path} died:`, err),
 );
 ```
 
@@ -209,7 +211,7 @@ server.close(); // void
 
 ```ts
 process.on('SIGINT', () => {
-  server.close();
+    server.close();
 });
 
 await server.closed;
@@ -227,10 +229,10 @@ const enc = new TextEncoder();
 const dec = new TextDecoder();
 
 const server = new WebTransportServer({
-  port: 4433,
-  host: '0.0.0.0',
-  cert: '/path/to/cert.pem',
-  key: '/path/to/key.pem',
+    port: 4433,
+    host: '0.0.0.0',
+    cert: '/path/to/cert.pem',
+    key: '/path/to/key.pem',
 });
 
 await server.ready;
@@ -241,86 +243,86 @@ const rooms = new Map<string, Set<WritableStreamDefaultWriter<Uint8Array>>>();
 
 const reader = server.incomingSessions.getReader();
 for (;;) {
-  const { value: session, done } = await reader.read();
-  if (done) break;
-  if (session) route(session);
+    const { value: session, done } = await reader.read();
+    if (done) break;
+    if (session) route(session);
 }
 
 function route(session: WebTransportServerSession): void {
-  if (session.path === '/echo') {
-    serveEcho(session);
-  } else if (session.path.startsWith('/chat/')) {
-    const room = session.path.slice('/chat/'.length);
-    if (room.length === 0) {
-      session.close({ closeCode: 400, reason: 'missing room' });
-      return;
+    if (session.path === '/echo') {
+        serveEcho(session);
+    } else if (session.path.startsWith('/chat/')) {
+        const room = session.path.slice('/chat/'.length);
+        if (room.length === 0) {
+            session.close({ closeCode: 400, reason: 'missing room' });
+            return;
+        }
+        serveChat(session, room);
+    } else {
+        // Reject: unknown path. The client sees its session close.
+        session.close({ closeCode: 404, reason: 'no such path' });
     }
-    serveChat(session, room);
-  } else {
-    // Reject: unknown path. The client sees its session close.
-    session.close({ closeCode: 404, reason: 'no such path' });
-  }
 }
 
 // /echo: pipe each incoming bidi stream straight back, and echo datagrams.
 function serveEcho(session: WebTransportServerSession): void {
-  void (async () => {
-    const streams = session.incomingBidirectionalStreams.getReader();
-    for (;;) {
-      const { value: stream, done } = await streams.read();
-      if (done) break;
-      if (stream) void stream.readable.pipeTo(stream.writable).catch(() => undefined);
-    }
-  })().catch(() => undefined);
+    void (async () => {
+        const streams = session.incomingBidirectionalStreams.getReader();
+        for (;;) {
+            const { value: stream, done } = await streams.read();
+            if (done) break;
+            if (stream) void stream.readable.pipeTo(stream.writable).catch(() => undefined);
+        }
+    })().catch(() => undefined);
 
-  void (async () => {
-    const r = session.datagrams.readable.getReader();
-    const w = session.datagrams.writable.getWriter();
-    for (;;) {
-      const { value, done } = await r.read();
-      if (done) break;
-      if (value) await w.write(value);
-    }
-  })().catch(() => undefined);
+    void (async () => {
+        const r = session.datagrams.readable.getReader();
+        const w = session.datagrams.writable.getWriter();
+        for (;;) {
+            const { value, done } = await r.read();
+            if (done) break;
+            if (value) await w.write(value);
+        }
+    })().catch(() => undefined);
 }
 
 // /chat/<room>: each datagram from a client is broadcast to every peer in the room.
 function serveChat(session: WebTransportServerSession, room: string): void {
-  const writer = session.datagrams.writable.getWriter();
-  let members = rooms.get(room);
-  if (!members) {
-    members = new Set();
-    rooms.set(room, members);
-  }
-  members.add(writer);
-
-  // Greet the newcomer on a server-opened unidirectional stream.
-  void (async () => {
-    const uni = await session.createUnidirectionalStream();
-    const w = uni.getWriter();
-    await w.write(enc.encode(`welcome to ${room}`));
-    await w.close();
-  })().catch(() => undefined);
-
-  // Fan every inbound datagram out to the rest of the room.
-  void (async () => {
-    const r = session.datagrams.readable.getReader();
-    for (;;) {
-      const { value, done } = await r.read();
-      if (done) break;
-      if (!value) continue;
-      const line = enc.encode(`${session.authority}: ${dec.decode(value)}`);
-      for (const peer of members) {
-        if (peer !== writer) void peer.write(line).catch(() => undefined);
-      }
+    const writer = session.datagrams.writable.getWriter();
+    let members = rooms.get(room);
+    if (!members) {
+        members = new Set();
+        rooms.set(room, members);
     }
-  })().catch(() => undefined);
+    members.add(writer);
 
-  // On close, drop this member from the room.
-  session.closed.finally(() => {
-    members.delete(writer);
-    if (members.size === 0) rooms.delete(room);
-  });
+    // Greet the newcomer on a server-opened unidirectional stream.
+    void (async () => {
+        const uni = await session.createUnidirectionalStream();
+        const w = uni.getWriter();
+        await w.write(enc.encode(`welcome to ${room}`));
+        await w.close();
+    })().catch(() => undefined);
+
+    // Fan every inbound datagram out to the rest of the room.
+    void (async () => {
+        const r = session.datagrams.readable.getReader();
+        for (;;) {
+            const { value, done } = await r.read();
+            if (done) break;
+            if (!value) continue;
+            const line = enc.encode(`${session.authority}: ${dec.decode(value)}`);
+            for (const peer of members) {
+                if (peer !== writer) void peer.write(line).catch(() => undefined);
+            }
+        }
+    })().catch(() => undefined);
+
+    // On close, drop this member from the room.
+    session.closed.finally(() => {
+        members.delete(writer);
+        if (members.size === 0) rooms.delete(room);
+    });
 }
 
 // Graceful shutdown.
@@ -343,5 +345,5 @@ Notes on the pattern above:
 - [datagrams.md](./datagrams.md) The datagram duplex, `maxDatagramSize`, high-water marks, and max age.
 - [certificates.md](./certificates.md) Certificate and key formats, trust models, and generating a dev cert.
 - [errors.md](./errors.md) `WebTransportError`, its `source` and `streamErrorCode`, and how failures surface.
-- [threading.md](./threading.md) The per-session thread model, `worker_threads` support, and the `cluster` port-sharing caveat (a server binds without `SO_REUSEPORT`, so run one server per port).
+- [threading.md](./threading.md) The per-session thread model, `worker_threads` support, and `cluster` port sharing via `reusePort: true` (`SO_REUSEPORT`, Unix-only).
 - [`../examples`](../examples) Runnable client and server programs and a cert generator.

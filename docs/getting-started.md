@@ -98,10 +98,10 @@ import { fileURLToPath } from 'node:url';
 const here = dirname(fileURLToPath(import.meta.url));
 
 const server = new WebTransportServer({
-  port: 4433,
-  host: '127.0.0.1',
-  cert: join(here, 'cert.pem'), // PEM certificate file path
-  key: join(here, 'key.pem'),   // PEM private-key file path
+    port: 4433,
+    host: '127.0.0.1',
+    cert: join(here, 'cert.pem'), // PEM certificate file path
+    key: join(here, 'key.pem'), // PEM private-key file path
 });
 
 await server.ready;
@@ -110,21 +110,21 @@ console.log(`listening on https://127.0.0.1:${server.port}/echo`);
 // Accept sessions as clients connect.
 const sessions = server.incomingSessions.getReader();
 for (;;) {
-  const { value: session, done } = await sessions.read();
-  if (done) break;
-  console.log('session opened:', session.path);
-  handleSession(session).catch((err) => console.error('session error:', err));
+    const { value: session, done } = await sessions.read();
+    if (done) break;
+    console.log('session opened:', session.path);
+    handleSession(session).catch((err) => console.error('session error:', err));
 }
 
 async function handleSession(session) {
-  // Echo every bidirectional stream the client opens.
-  const streams = session.incomingBidirectionalStreams.getReader();
-  for (;;) {
-    const { value: stream, done } = await streams.read();
-    if (done) break;
-    // readable -> writable on the same stream: the bytes go right back.
-    stream.readable.pipeTo(stream.writable).catch(() => {});
-  }
+    // Echo every bidirectional stream the client opens.
+    const streams = session.incomingBidirectionalStreams.getReader();
+    for (;;) {
+        const { value: stream, done } = await streams.read();
+        if (done) break;
+        // readable -> writable on the same stream: the bytes go right back.
+        stream.readable.pipeTo(stream.writable).catch(() => {});
+    }
 }
 ```
 
@@ -159,7 +159,7 @@ const der = new X509Certificate(readFileSync(join(here, 'cert.pem'))).raw;
 const certHash = new Uint8Array(createHash('sha256').update(der).digest());
 
 const wt = new WebTransport('https://127.0.0.1:4433/echo', {
-  serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash }],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash }],
 });
 
 await wt.ready;
@@ -177,9 +177,9 @@ const reader = stream.readable.getReader();
 const decoder = new TextDecoder();
 let received = '';
 for (;;) {
-  const { value, done } = await reader.read();
-  if (done) break;
-  received += decoder.decode(value, { stream: true });
+    const { value, done } = await reader.read();
+    if (done) break;
+    received += decoder.decode(value, { stream: true });
 }
 received += decoder.decode();
 console.log('server echoed:', received);

@@ -228,4 +228,62 @@ describe('WebTransportServer', () => {
         );
         expect(results).toEqual(['s1', 's2', 's3']);
     });
+
+    // SO_REUSEPORT is Unix-only; on Windows binding the same port twice fails.
+    it.skipIf(process.platform === 'win32')(
+        'shares one port across servers with reusePort (cluster mode)',
+        async () => {
+            // First server lets the OS pick a port, with SO_REUSEPORT enabled.
+            const a = new WebTransportServer({
+                port: 0,
+                host: '127.0.0.1',
+                cert: CERT,
+                key: KEY,
+                reusePort: true,
+            });
+            servers.push(a);
+            await a.ready;
+            const port = a.port;
+
+            // Second server binds the SAME port. Without SO_REUSEPORT this would
+            // reject with EADDRINUSE; with it, both bind and the kernel
+            // load-balances connections across them (Node `cluster` model).
+            const b = new WebTransportServer({
+                port,
+                host: '127.0.0.1',
+                cert: CERT,
+                key: KEY,
+                reusePort: true,
+            });
+            servers.push(b);
+            await expect(b.ready).resolves.toBeUndefined();
+            expect(b.port).toBe(port);
+
+            for (const s of [a, b]) {
+                void (async () => {
+                    const reader = s.incomingSessions.getReader();
+                    for (;;) {
+                        const { value: session, done } = await reader.read();
+                        if (done) break;
+                        if (session) handleSession(session);
+                    }
+                })();
+            }
+
+            // Every client is echoed, whichever worker the kernel routed it to.
+            const url = `https://127.0.0.1:${port}/echo`;
+            const results = await Promise.all(
+                Array.from({ length: 8 }, async (_unused, i) => {
+                    const wt = connect(url);
+                    await wt.ready;
+                    const stream = await wt.createBidirectionalStream();
+                    const w = stream.writable.getWriter();
+                    await w.write(enc.encode(`c${i}`));
+                    await w.close();
+                    return dec.decode(await readAll(stream.readable));
+                }),
+            );
+            expect(results.sort()).toEqual(['c0', 'c1', 'c2', 'c3', 'c4', 'c5', 'c6', 'c7']);
+        },
+    );
 });

@@ -16,12 +16,12 @@ patterns for `ready`, reads, and writes.
 import { WebTransportError } from 'rwebtransport';
 ```
 
-| Field             | Type                       | Meaning                                                                                   |
-| ----------------- | -------------------------- | ----------------------------------------------------------------------------------------- |
-| `name`            | `"WebTransportError"`      | Always this string.                                                                        |
-| `message`         | `string`                   | Human-readable cause (`"stream reset by peer"`, a TLS error, a connect failure, and so on).|
-| `source`          | `"stream" \| "session"`    | Whether the error came from a single stream or from the session as a whole.               |
-| `streamErrorCode` | `number \| null`           | The peer's 32-bit application error code when `source` is `"stream"`; otherwise `null`.    |
+| Field             | Type                    | Meaning                                                                                     |
+| ----------------- | ----------------------- | ------------------------------------------------------------------------------------------- |
+| `name`            | `"WebTransportError"`   | Always this string.                                                                         |
+| `message`         | `string`                | Human-readable cause (`"stream reset by peer"`, a TLS error, a connect failure, and so on). |
+| `source`          | `"stream" \| "session"` | Whether the error came from a single stream or from the session as a whole.                 |
+| `streamErrorCode` | `number \| null`        | The peer's 32-bit application error code when `source` is `"stream"`; otherwise `null`.     |
 
 Read `source` first: it tells you which layer failed. A `"stream"` error means one
 stream was reset or stopped and the rest of the session is fine. A `"session"`
@@ -30,15 +30,15 @@ error means the whole connection is gone and every stream on it is finished too.
 
 ## Where each failure surfaces
 
-| Situation                                              | Channel                        | `source`   |
-| ------------------------------------------------------ | ------------------------------ | ---------- |
-| Malformed URL or bad option shape                      | `throw` from `new WebTransport`| `"session"`|
-| Connect fails (bad cert, 4xx CONNECT, host unreachable)| `ready` rejects                | `"session"`|
-| Session terminates abnormally after it was established | `closed` rejects               | `"session"`|
-| Session closes cleanly                                 | `closed` resolves (no error)   | n/a        |
-| Peer sends `RESET_STREAM`                              | the readable's `read()` rejects| `"stream"` |
-| Peer sends `STOP_SENDING`                              | the writable's `write()` rejects| `"stream"`|
-| `createBidirectionalStream` / `write` after close      | that call's promise rejects    | `"session"`|
+| Situation                                               | Channel                          | `source`    |
+| ------------------------------------------------------- | -------------------------------- | ----------- |
+| Malformed URL or bad option shape                       | `throw` from `new WebTransport`  | `"session"` |
+| Connect fails (bad cert, 4xx CONNECT, host unreachable) | `ready` rejects                  | `"session"` |
+| Session terminates abnormally after it was established  | `closed` rejects                 | `"session"` |
+| Session closes cleanly                                  | `closed` resolves (no error)     | n/a         |
+| Peer sends `RESET_STREAM`                               | the readable's `read()` rejects  | `"stream"`  |
+| Peer sends `STOP_SENDING`                               | the writable's `write()` rejects | `"stream"`  |
+| `createBidirectionalStream` / `write` after close       | that call's promise rejects      | `"session"` |
 
 Datagrams never surface a `WebTransportError`: writes resolve fire-and-forget
 (and silently drop when they cannot be sent), and the datagram readable simply
@@ -234,7 +234,7 @@ analogous promises (see [server.md](./server.md)):
 - `WebTransportServer.closed` is a `Promise<void>`: it resolves when the server
   stops cleanly, and rejects with a `WebTransportError` on a fatal server error.
 - `WebTransportServer.incomingSessions` is **closed** (not errored) when the
-  server stops or fails, so its reader observes `done: true`. To learn *why* the
+  server stops or fails, so its reader observes `done: true`. To learn _why_ the
   server stopped, await `server.closed`.
 - A `WebTransportServerSession` has the same `ready`, `closed`, streams, and
   datagrams as a client session, so every pattern on this page applies to it. A

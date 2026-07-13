@@ -10,14 +10,14 @@ By default the client puts **Chrome on the wire**. Because QUIC pins the TLS ver
 
 The profile is fixed and applies to every client connection regardless of the verification mode you pick:
 
-| Parameter | Value |
-| --- | --- |
-| TLS version | 1.3 only (min and max both TLS 1.3) |
-| ALPN | `h3` |
-| Named groups (curves) | `X25519`, `P-256` (secp256r1), `P-384` (secp384r1), in that order |
-| Signature algorithms | `ecdsa_secp256r1_sha256`, `rsa_pss_rsae_sha256`, `rsa_pkcs1_sha256`, `ecdsa_secp384r1_sha384`, `rsa_pss_rsae_sha384`, `rsa_pkcs1_sha384`, `rsa_pss_rsae_sha512`, `rsa_pkcs1_sha512`, `rsa_pkcs1_sha1` |
-| Cipher suites | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256` (BoringSSL's fixed TLS 1.3 order, which already matches Chrome) |
-| ClientHello shaping | GREASE enabled, extensions permuted |
+| Parameter             | Value                                                                                                                                                                                                 |
+| --------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| TLS version           | 1.3 only (min and max both TLS 1.3)                                                                                                                                                                   |
+| ALPN                  | `h3`                                                                                                                                                                                                  |
+| Named groups (curves) | `X25519`, `P-256` (secp256r1), `P-384` (secp384r1), in that order                                                                                                                                     |
+| Signature algorithms  | `ecdsa_secp256r1_sha256`, `rsa_pss_rsae_sha256`, `rsa_pkcs1_sha256`, `ecdsa_secp384r1_sha384`, `rsa_pss_rsae_sha384`, `rsa_pkcs1_sha384`, `rsa_pss_rsae_sha512`, `rsa_pkcs1_sha512`, `rsa_pkcs1_sha1` |
+| Cipher suites         | `TLS_AES_128_GCM_SHA256`, `TLS_AES_256_GCM_SHA384`, `TLS_CHACHA20_POLY1305_SHA256` (BoringSSL's fixed TLS 1.3 order, which already matches Chrome)                                                    |
+| ClientHello shaping   | GREASE enabled, extensions permuted                                                                                                                                                                   |
 
 The `congestionControl`, `allowPooling`, and `requireUnreliable` options are accepted for spec parity but do not currently change the profile or the transport.
 
@@ -31,11 +31,11 @@ The client decides whether to trust the server certificate in exactly one of thr
 
 Because pinning wins over `insecure`, setting `insecure: true` alongside `serverCertificateHashes` has no effect: the pin is still enforced.
 
-| Mode | Option | CA chain checked | Hostname checked | Use for |
-| --- | --- | --- | --- | --- |
-| Default PKI | (none) | yes | yes | public servers with a CA-issued certificate |
-| Hash pinning | `serverCertificateHashes` | no | no | self-signed or pinned certificates |
-| Insecure | `insecure: true` | no | no | local development only |
+| Mode         | Option                    | CA chain checked | Hostname checked | Use for                                     |
+| ------------ | ------------------------- | ---------------- | ---------------- | ------------------------------------------- |
+| Default PKI  | (none)                    | yes              | yes              | public servers with a CA-issued certificate |
+| Hash pinning | `serverCertificateHashes` | no               | no               | self-signed or pinned certificates          |
+| Insecure     | `insecure: true`          | no               | no               | local development only                      |
 
 ### Default: full PKI plus hostname validation
 
@@ -69,7 +69,7 @@ const der = new X509Certificate(readFileSync('cert.pem')).raw;
 const value = new Uint8Array(createHash('sha256').update(der).digest());
 
 const wt = new WebTransport('https://127.0.0.1:4433/echo', {
-  serverCertificateHashes: [{ algorithm: 'sha-256', value }],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value }],
 });
 await wt.ready; // resolves only if the server's leaf cert hashes to `value`
 ```
@@ -103,10 +103,10 @@ The server loads a certificate and private key as **PEM file paths** through `We
 import { WebTransportServer } from 'rwebtransport';
 
 const server = new WebTransportServer({
-  port: 4433,
-  host: '127.0.0.1',
-  cert: './cert.pem', // PEM certificate chain, a FILE PATH (not the PEM text)
-  key: './key.pem',   // PEM private key, a FILE PATH (not the PEM text)
+    port: 4433,
+    host: '127.0.0.1',
+    cert: './cert.pem', // PEM certificate chain, a FILE PATH (not the PEM text)
+    key: './key.pem', // PEM private key, a FILE PATH (not the PEM text)
 });
 await server.ready;
 console.log('listening on', server.port);

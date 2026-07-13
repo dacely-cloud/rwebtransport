@@ -12,13 +12,13 @@ For the top-level overview see [`../README.md`](../README.md). The loader that t
 
 Prebuilt binaries are published for these targets:
 
-| Target (`process.platform`-`process.arch`) | OS         | Arch  | Prebuilt? |
-| ------------------------------------------- | ---------- | ----- | --------- |
-| `linux-x64`                                 | Linux      | x64   | yes       |
-| `linux-arm64`                               | Linux      | arm64 | yes       |
-| `darwin-x64`                                | macOS      | x64   | yes       |
-| `darwin-arm64`                              | macOS      | arm64 | yes       |
-| `win32-x64`                                 | Windows    | x64   | yes       |
+| Target (`process.platform`-`process.arch`) | OS      | Arch  | Prebuilt? |
+| ------------------------------------------ | ------- | ----- | --------- |
+| `linux-x64`                                | Linux   | x64   | yes       |
+| `linux-arm64`                              | Linux   | arm64 | yes       |
+| `darwin-x64`                               | macOS   | x64   | yes       |
+| `darwin-arm64`                             | macOS   | arm64 | yes       |
+| `win32-x64`                                | Windows | x64   | yes       |
 
 Any other combination (for example `win32-arm64`) has no prebuilt binary and is compiled from source at install time, which requires the toolchain described below. The directory name is always `${process.platform}-${process.arch}`, so it matches the values Node reports at runtime.
 
@@ -82,12 +82,12 @@ The Rust workspace ([`../Cargo.toml`](../Cargo.toml)) has three crates under `cr
 
 All scripts are defined in [`../package.json`](../package.json):
 
-| Command                   | What it does                                                                                  |
-| ------------------------- | -------------------------------------------------------------------------------------------- |
-| `npm run build`           | `build:rust` then `build:ts` (the full build).                                               |
-| `npm run build:rust`      | Release build of the native addon via [`../scripts/build.js`](../scripts/build.js).           |
-| `npm run build:rust:debug`| Faster debug build (`node scripts/build.js --debug`), no optimization or LTO.                 |
-| `npm run build:ts`        | Bundles the TypeScript layer to `dist/` (tsup for CJS + ESM, then `tsc` for declarations).   |
+| Command                    | What it does                                                                               |
+| -------------------------- | ------------------------------------------------------------------------------------------ |
+| `npm run build`            | `build:rust` then `build:ts` (the full build).                                             |
+| `npm run build:rust`       | Release build of the native addon via [`../scripts/build.js`](../scripts/build.js).        |
+| `npm run build:rust:debug` | Faster debug build (`node scripts/build.js --debug`), no optimization or LTO.              |
+| `npm run build:ts`         | Bundles the TypeScript layer to `dist/` (tsup for CJS + ESM, then `tsc` for declarations). |
 
 ### What `scripts/build.js` does
 
@@ -95,9 +95,9 @@ All scripts are defined in [`../package.json`](../package.json):
 
 1. Runs `cargo build -p rwebtransport-native` (adding `--release` unless `--debug` was passed, and `--target <triple>` if `CARGO_BUILD_TARGET` is set).
 2. Locates the resulting shared library in the cargo target directory. The `cdylib` filename is platform-specific:
-   - Linux: `librwebtransport_native.so`
-   - macOS: `librwebtransport_native.dylib`
-   - Windows: `rwebtransport_native.dll`
+    - Linux: `librwebtransport_native.so`
+    - macOS: `librwebtransport_native.dylib`
+    - Windows: `rwebtransport_native.dll`
 3. Copies that library to `prebuilds/<platform>-<arch>/rwebtransport.node`, creating the directory if needed. Renaming the `cdylib` to `.node` is what makes it loadable with `require()`.
 
 If the expected artifact is missing after the cargo build, it throws so the failure is obvious.
@@ -108,13 +108,13 @@ The release profile in [`../Cargo.toml`](../Cargo.toml) is tuned for a shippable
 
 `scripts/build.js` reads a few variables, mainly for cross-compiling in CI:
 
-| Variable                        | Effect                                                                         |
-| ------------------------------- | ------------------------------------------------------------------------------ |
-| `CARGO_BUILD_TARGET`            | Passes `--target <triple>` to cargo and looks for the artifact under that target. |
-| `CARGO_TARGET_DIR`              | Overrides where cargo writes build output (default: `./target`).               |
-| `PREBUILD_PLATFORM`             | Overrides the platform segment of the output directory (default: `process.platform`). |
-| `PREBUILD_ARCH`                 | Overrides the arch segment of the output directory (default: `process.arch`).  |
-| `RWEBTRANSPORT_SKIP_POSTINSTALL`| When `1`, [`../scripts/postinstall.js`](../scripts/postinstall.js) does nothing. |
+| Variable                         | Effect                                                                                |
+| -------------------------------- | ------------------------------------------------------------------------------------- |
+| `CARGO_BUILD_TARGET`             | Passes `--target <triple>` to cargo and looks for the artifact under that target.     |
+| `CARGO_TARGET_DIR`               | Overrides where cargo writes build output (default: `./target`).                      |
+| `PREBUILD_PLATFORM`              | Overrides the platform segment of the output directory (default: `process.platform`). |
+| `PREBUILD_ARCH`                  | Overrides the arch segment of the output directory (default: `process.arch`).         |
+| `RWEBTRANSPORT_SKIP_POSTINSTALL` | When `1`, [`../scripts/postinstall.js`](../scripts/postinstall.js) does nothing.      |
 
 ### Where the addon lands
 
@@ -139,9 +139,9 @@ import { WebTransport, WebTransportServer } from 'rwebtransport';
 // (even to reject) proves the native binary loaded.
 const wt = new WebTransport('https://127.0.0.1:1/does-not-exist');
 try {
-  await wt.ready;
+    await wt.ready;
 } catch {
-  // expected: nothing is listening. The point is that the addon loaded.
+    // expected: nothing is listening. The point is that the addon loaded.
 }
 console.log('native addon loaded');
 ```
@@ -160,13 +160,13 @@ Prebuilt binaries and the npm publish are produced by [`../.github/workflows/rel
 
 A build matrix compiles the native addon on a native runner for each shipped target, so no cross-compilation is needed:
 
-| Target         | Runner              |
-| -------------- | ------------------- |
-| `linux-x64`    | `ubuntu-24.04`      |
-| `linux-arm64`  | `ubuntu-24.04-arm`  |
-| `darwin-x64`   | `macos-13`          |
-| `darwin-arm64` | `macos-14`          |
-| `win32-x64`    | `windows-2022`      |
+| Target         | Runner             |
+| -------------- | ------------------ |
+| `linux-x64`    | `ubuntu-24.04`     |
+| `linux-arm64`  | `ubuntu-24.04-arm` |
+| `darwin-x64`   | `macos-13`         |
+| `darwin-arm64` | `macos-14`         |
+| `win32-x64`    | `windows-2022`     |
 
 Each job installs the stable Rust toolchain, Go 1.22, NASM (Windows only), and cmake + ninja (via apt on Linux, brew on macOS), then sets up Node 26 and runs `node scripts/build.js`. The resulting `prebuilds/<target>/rwebtransport.node` is uploaded as an artifact named `prebuild-<target>`. All targets build with Node 26, and the napi-8 ABI keeps them compatible with Node 24 as well.
 

@@ -40,6 +40,13 @@ export interface WebTransportServerOptions {
     cert: string;
     /** Path to the PEM private-key file. */
     key: string;
+    /**
+     * Bind with `SO_REUSEPORT` (Unix only) so multiple processes, for example
+     * Node `cluster` workers, can share one listening port and let the kernel
+     * load-balance connections across them. Defaults to `false`. Ignored on
+     * Windows, where the flag does not exist.
+     */
+    reusePort?: boolean;
 }
 
 /** Metadata about the Extended CONNECT that opened a server session. */
@@ -114,6 +121,7 @@ export class WebTransportServer {
             options.key,
             options.host ?? '0.0.0.0',
             options.port,
+            options.reusePort ?? false,
             (ev) => this.onEvent(ev),
         );
     }

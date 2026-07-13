@@ -19,6 +19,7 @@ octets = { version = "0.3.5", features = ["huffman_hpack"] }
 log = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
 getrandom = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
 
 # Release profile tuned for a shippable native addon without pathological compile times.
 # NOTE: panic must stay "unwind" (the default) so neon can catch Rust panics at the

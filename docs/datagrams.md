@@ -24,7 +24,7 @@ packet. Unlike a stream, a datagram has no delivery guarantee and no sequencing:
 - **Bounded size.** A datagram must fit in one packet. Anything larger than the
   current path limit (`maxDatagramSize`) is dropped rather than fragmented.
 - **Lossy queues.** Both the inbound and the outbound queue are bounded. When a
-  queue is full, the *datagram* is dropped, never buffered indefinitely. This is
+  queue is full, the _datagram_ is dropped, never buffered indefinitely. This is
   by design: datagrams trade reliability for freshness and latency.
 
 If you need every byte to arrive, in order, use a stream instead.
@@ -34,15 +34,15 @@ If you need every byte to arrive, in order, use a stream instead.
 `session.datagrams` is a `WebTransportDatagramDuplexStream` with the following
 surface.
 
-| Member | Type | Description |
-| --- | --- | --- |
-| `readable` | `ReadableStream<Uint8Array>` | Inbound datagrams, each chunk is one datagram payload. |
-| `writable` | `WritableStream<Uint8Array>` | Outbound datagrams, each written chunk is sent as one datagram. |
-| `maxDatagramSize` | `number` (get) | Largest payload, in bytes, that currently fits one packet. |
-| `incomingHighWaterMark` | `number` (get/set) | Max number of inbound datagrams queued before overflow drops begin. |
-| `outgoingHighWaterMark` | `number` (get/set) | Max number of outbound datagrams buffered before `write()` applies backpressure. |
-| `incomingMaxAge` | `number \| null` (get/set) | Max age in ms an inbound datagram is retained before being dropped, or `null` for no limit. |
-| `outgoingMaxAge` | `number \| null` (get/set) | Max age in ms an outbound datagram waits before being dropped, or `null` for no limit. |
+| Member                  | Type                         | Description                                                                                 |
+| ----------------------- | ---------------------------- | ------------------------------------------------------------------------------------------- |
+| `readable`              | `ReadableStream<Uint8Array>` | Inbound datagrams, each chunk is one datagram payload.                                      |
+| `writable`              | `WritableStream<Uint8Array>` | Outbound datagrams, each written chunk is sent as one datagram.                             |
+| `maxDatagramSize`       | `number` (get)               | Largest payload, in bytes, that currently fits one packet.                                  |
+| `incomingHighWaterMark` | `number` (get/set)           | Max number of inbound datagrams queued before overflow drops begin.                         |
+| `outgoingHighWaterMark` | `number` (get/set)           | Max number of outbound datagrams buffered before `write()` applies backpressure.            |
+| `incomingMaxAge`        | `number \| null` (get/set)   | Max age in ms an inbound datagram is retained before being dropped, or `null` for no limit. |
+| `outgoingMaxAge`        | `number \| null` (get/set)   | Max age in ms an outbound datagram waits before being dropped, or `null` for no limit.      |
 
 Notes:
 
@@ -69,11 +69,11 @@ before writing if a silent drop would be a problem:
 const writer = session.datagrams.writable.getWriter();
 
 function trySend(payload: Uint8Array): boolean {
-  if (payload.byteLength > session.datagrams.maxDatagramSize) {
-    return false; // too big for one packet, would be dropped
-  }
-  void writer.write(payload); // fire and forget
-  return true;
+    if (payload.byteLength > session.datagrams.maxDatagramSize) {
+        return false; // too big for one packet, would be dropped
+    }
+    void writer.write(payload); // fire and forget
+    return true;
 }
 ```
 
@@ -107,7 +107,7 @@ accepted for sending.
 import { WebTransport } from 'rwebtransport';
 
 const session = new WebTransport('https://example.com:4433/telemetry', {
-  serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash }],
+    serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash }],
 });
 await session.ready;
 
@@ -115,10 +115,10 @@ const writer = session.datagrams.writable.getWriter();
 const encoder = new TextEncoder();
 
 setInterval(() => {
-  const payload = encoder.encode(JSON.stringify({ t: Date.now(), fps: 60 }));
-  if (payload.byteLength <= session.datagrams.maxDatagramSize) {
-    void writer.write(payload);
-  }
+    const payload = encoder.encode(JSON.stringify({ t: Date.now(), fps: 60 }));
+    if (payload.byteLength <= session.datagrams.maxDatagramSize) {
+        void writer.write(payload);
+    }
 }, 16);
 ```
 
@@ -127,8 +127,8 @@ backpressure can slow you down:
 
 ```ts
 async function sendPaced(writer: WritableStreamDefaultWriter<Uint8Array>, payload: Uint8Array) {
-  await writer.ready;   // resolves when the outbound queue has room
-  await writer.write(payload);
+    await writer.ready; // resolves when the outbound queue has room
+    await writer.write(payload);
 }
 ```
 
@@ -141,14 +141,14 @@ const reader = session.datagrams.readable.getReader();
 const decoder = new TextDecoder();
 
 try {
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break; // session closed
-    const message = decoder.decode(value);
-    handle(message);
-  }
+    while (true) {
+        const { value, done } = await reader.read();
+        if (done) break; // session closed
+        const message = decoder.decode(value);
+        handle(message);
+    }
 } finally {
-  reader.releaseLock();
+    reader.releaseLock();
 }
 ```
 
@@ -187,13 +187,13 @@ Guidance:
 
 ## Datagrams vs streams
 
-| Use datagrams when | Use [streams](./streams.md) when |
-| --- | --- |
-| Data is time-sensitive and a late copy is useless | Every byte must arrive |
-| You send frequent small updates where the newest supersedes the old | You send ordered, arbitrarily large payloads |
+| Use datagrams when                                                            | Use [streams](./streams.md) when                      |
+| ----------------------------------------------------------------------------- | ----------------------------------------------------- |
+| Data is time-sensitive and a late copy is useless                             | Every byte must arrive                                |
+| You send frequent small updates where the newest supersedes the old           | You send ordered, arbitrarily large payloads          |
 | Occasional loss is acceptable (positions, telemetry, real-time media control) | Loss is not acceptable (files, RPC, control messages) |
-| You want the lowest possible latency and no head-of-line blocking | You want ordering and reliable delivery |
-| Each message fits in one packet (`<= maxDatagramSize`) | Messages exceed one packet or are of unbounded length |
+| You want the lowest possible latency and no head-of-line blocking             | You want ordering and reliable delivery               |
+| Each message fits in one packet (`<= maxDatagramSize`)                        | Messages exceed one packet or are of unbounded length |
 
 Mixing both is normal: send bulk or must-arrive data over a stream, and use
 datagrams for the fast-moving updates alongside it. A single session carries
@@ -210,35 +210,35 @@ Server (`server.mjs`):
 import { WebTransportServer } from 'rwebtransport';
 
 const server = new WebTransportServer({
-  port: 4433,
-  cert: './cert.pem',
-  key: './key.pem',
+    port: 4433,
+    cert: './cert.pem',
+    key: './key.pem',
 });
 await server.ready;
 console.log(`listening on ${server.port}`);
 
 const sessions = server.incomingSessions.getReader();
 while (true) {
-  const { value: session, done } = await sessions.read();
-  if (done) break;
+    const { value: session, done } = await sessions.read();
+    if (done) break;
 
-  // A surfaced server session is already established.
-  const reader = session.datagrams.readable.getReader();
-  const writer = session.datagrams.writable.getWriter();
+    // A surfaced server session is already established.
+    const reader = session.datagrams.readable.getReader();
+    const writer = session.datagrams.writable.getWriter();
 
-  (async () => {
-    try {
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-        if (value.byteLength <= session.datagrams.maxDatagramSize) {
-          await writer.write(value); // echo it straight back
+    (async () => {
+        try {
+            while (true) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value.byteLength <= session.datagrams.maxDatagramSize) {
+                    await writer.write(value); // echo it straight back
+                }
+            }
+        } catch {
+            // session ended
         }
-      }
-    } catch {
-      // session ended
-    }
-  })();
+    })();
 }
 ```
 
@@ -248,8 +248,8 @@ Client (`client.mjs`):
 import { WebTransport } from 'rwebtransport';
 
 const session = new WebTransport('https://localhost:4433/echo', {
-  // Dev only: skip cert validation on a self-signed loopback server.
-  insecure: true,
+    // Dev only: skip cert validation on a self-signed loopback server.
+    insecure: true,
 });
 await session.ready;
 
@@ -259,16 +259,16 @@ const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
 for (let i = 0; i < 5; i++) {
-  await writer.write(encoder.encode(`ping ${i}`));
+    await writer.write(encoder.encode(`ping ${i}`));
 }
 
 // Datagrams are unordered and lossy: replies may arrive in any order, and some
 // may never arrive, so read for a short window rather than expecting all five.
 const deadline = Date.now() + 500;
 while (Date.now() < deadline) {
-  const { value, done } = await reader.read();
-  if (done) break;
-  console.log('got', decoder.decode(value));
+    const { value, done } = await reader.read();
+    if (done) break;
+    console.log('got', decoder.decode(value));
 }
 
 session.close();

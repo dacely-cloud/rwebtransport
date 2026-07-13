@@ -8,7 +8,7 @@ the library behaves inside `worker_threads` and `cluster`.
 
 Every WebTransport session (client `WebTransport` or `WebTransportServerSession`)
 runs its QUIC and HTTP/3 work on its own dedicated background thread, the
-*driver thread*. Your JavaScript never touches quiche or BoringSSL directly. It
+_driver thread_. Your JavaScript never touches quiche or BoringSSL directly. It
 talks to the driver thread across a boundary that is non-blocking in both
 directions:
 
@@ -28,7 +28,7 @@ directions:
 Because no hand-off in either direction ever blocks on the other side making
 progress, there is no lock-ordering cycle and **the library cannot deadlock
 internally**. When a peer stops reading, or a send buffer fills, the effect is
-*backpressure*, not a hang: `write()` simply resolves later, once the bytes are
+_backpressure_, not a hang: `write()` simply resolves later, once the bytes are
 accepted into the QUIC send buffer. Read backpressure is symmetric, if you stop
 reading a stream, the peer is flow-controlled until you resume.
 
@@ -60,10 +60,7 @@ async function drain(readable: ReadableStream<Uint8Array>): Promise<void> {
     }
 }
 
-async function sendAll(
-    writable: WritableStream<Uint8Array>,
-    payload: Uint8Array,
-): Promise<void> {
+async function sendAll(writable: WritableStream<Uint8Array>, payload: Uint8Array): Promise<void> {
     const writer = writable.getWriter();
     // write() resolves once the bytes are accepted into the QUIC send buffer,
     // applying backpressure rather than blocking.
@@ -85,7 +82,7 @@ await Promise.all([sendAll(stream.writable, bigPayload), drain(stream.readable)]
 session.close();
 ```
 
-Sending on a *unidirectional* stream (`createUnidirectionalStream()`) has no
+Sending on a _unidirectional_ stream (`createUnidirectionalStream()`) has no
 readable side to drain, so this wedge does not apply there.
 
 ## worker_threads
@@ -150,14 +147,16 @@ if (isMainThread) {
     const url = 'https://localhost:4433/echo';
 
     const replies = await Promise.all(
-        Array.from({ length: 4 }, () =>
-            new Promise((resolve, reject) => {
-                const worker = new Worker(new URL(import.meta.url), {
-                    workerData: { url, certHash },
-                });
-                worker.once('message', resolve);
-                worker.once('error', reject);
-            }),
+        Array.from(
+            { length: 4 },
+            () =>
+                new Promise((resolve, reject) => {
+                    const worker = new Worker(new URL(import.meta.url), {
+                        workerData: { url, certHash },
+                    });
+                    worker.once('message', resolve);
+                    worker.once('error', reject);
+                }),
         ),
     );
 
@@ -184,20 +183,13 @@ The story splits by role.
 - **Clients: fine as-is.** `cluster` forks independent processes, and a
   WebTransport client is fully self-contained, so each worker process can create
   and use its own clients with no coordination.
-- **Server: one listener per port.** The server binds its UDP socket **without
-  `SO_REUSEPORT`**. That means multiple `cluster` workers **cannot share a single
-  listening port**, the second worker that tries to bind the same port will fail
-  its `ready` promise with a bind error. This is a deliberate current limitation,
-  not a bug in your code.
-
-Two supported ways to scale a server across processes:
-
-1. **One server per port.** Give each `cluster` worker its own port (for example
-   `4433`, `4434`, `4435`, ...), each with its own `WebTransportServer`. Clients
-   pick a port, or you distribute across them at a higher layer.
-2. **A UDP load balancer in front.** Put a UDP-aware load balancer ahead of a
-   fleet of single-port server processes and let it spread inbound QUIC flows
-   across them.
+- **Server: share one port with `reusePort`.** Pass `reusePort: true` and every
+  `cluster` worker can bind the **same** UDP port. The library sets
+  `SO_REUSEPORT` on the socket and the kernel load-balances inbound QUIC
+  connections across the workers. Because every packet of a given QUIC connection
+  carries the same 4-tuple, the kernel routes a connection and all its follow-up
+  packets to the same worker, so a session always stays on the worker that
+  accepted it.
 
 ```js
 // cluster-server.mjs  (run with: node cluster-server.mjs)
@@ -205,19 +197,17 @@ import cluster from 'node:cluster';
 import { availableParallelism } from 'node:os';
 import { WebTransportServer } from 'rwebtransport';
 
-const BASE_PORT = 4433;
+const PORT = 4433;
 
 if (cluster.isPrimary) {
     const workers = availableParallelism();
-    for (let i = 0; i < workers; i++) {
-        // Give each worker its own distinct port: no SO_REUSEPORT sharing.
-        cluster.fork({ WT_PORT: String(BASE_PORT + i) });
-    }
+    for (let i = 0; i < workers; i++) cluster.fork();
 } else {
     const server = new WebTransportServer({
-        port: Number(process.env.WT_PORT),
+        port: PORT,
         cert: './cert.pem',
         key: './key.pem',
+        reusePort: true, // every worker binds the same port
     });
     await server.ready;
     console.log(`worker ${process.pid} listening on udp/${server.port}`);
@@ -234,10 +224,21 @@ if (cluster.isPrimary) {
 }
 ```
 
+Notes and alternatives:
+
+- **`reusePort` is Unix-only.** `SO_REUSEPORT` exists on Linux and the BSDs
+  (including macOS). On Windows the flag is ignored, so fall back to one distinct
+  port per worker (for example `4433`, `4434`, ...), each with its own
+  `WebTransportServer`, and distribute across them at a higher layer, or put a
+  UDP-aware load balancer in front of a fleet of single-port processes.
+- **Load balancing is per-connection, not per-packet.** The kernel hashes the
+  4-tuple, so an even spread depends on having many client addresses. A handful
+  of clients may land on the same worker.
+
 If you only need in-process concurrency for a server, prefer `worker_threads`
-(each Worker binds its own port) or simply run several `WebTransportServer`
-instances on different ports in one process, since each session already has its
-own driver thread.
+(each Worker binds its own port, or share one with `reusePort`) or simply run
+several `WebTransportServer` instances on different ports in one process, since
+each session already has its own driver thread.
 
 ## See also
 
