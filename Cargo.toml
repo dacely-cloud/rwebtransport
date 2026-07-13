@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: Apache-2.0
+[workspace]
+resolver = "2"
+members = ["crates/native", "crates/echo-server"]
+exclude = ["vendor/quiche"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/felixantoinebelleau/rwebtransport"
+
+[workspace.dependencies]
+quiche = { path = "vendor/quiche", default-features = false, features = ["boringssl-boring-crate"] }
+boring = "4.22"
+boring-sys = "4.22"
+octets = { version = "0.3.5", features = ["huffman_hpack"] }
+log = "0.4"
+mio = { version = "1", features = ["net", "os-poll"] }
+
+# Release profile tuned for a shippable native addon without pathological compile times.
+# NOTE: panic must stay "unwind" (the default) so neon can catch Rust panics at the
+# N-API boundary and turn them into JS exceptions instead of aborting the Node process.
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

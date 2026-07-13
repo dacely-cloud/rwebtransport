@@ -1,0 +1,51 @@
+{
+  "name": "rwebtransport",
+  "version": "0.1.0",
+  "description": "A fully-compatible WebTransport client for Node.js, powered by Cloudflare quiche + BoringSSL via neon.",
+  "type": "commonjs",
+  "main": "./dist/index.js",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "scripts",
+    "crates",
+    "vendor",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=24 <25 || >=26 <27"
+  },
+  "scripts": {
+    "build": "npm run build:rust && npm run build:ts",
+    "build:rust": "node scripts/build.js",
+    "build:rust:debug": "node scripts/build.js --debug",
+    "build:ts": "tsup",
+    "postinstall": "node scripts/postinstall.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "keywords": [
+    "webtransport",
+    "quic",
+    "http3",
+    "quiche",
+    "neon"
+  ],
+  "license": "Apache-2.0"
+}

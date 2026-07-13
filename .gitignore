@@ -1,0 +1,27 @@
+# Rust
+/target
+**/*.rs.bk
+*.pdb
+
+# Node
+node_modules
+/dist
+*.tsbuildinfo
+npm-debug.log*
+
+# Native build outputs (produced by CI / local build, not committed)
+/prebuilds
+*.node
+
+# Logs / scratch
+build-native.log
+*.log
+
+# Editor / OS
+.DS_Store
+.idea
+.vscode/*
+!.vscode/extensions.json
+
+# Local harness/session state
+.claude/

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "rwebtransport-echo-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "wt-echo-server"
+path = "src/main.rs"
+
+[dependencies]
+quiche.workspace = true
+boring.workspace = true
+boring-sys.workspace = true
+octets.workspace = true
+log.workspace = true
+mio.workspace = true

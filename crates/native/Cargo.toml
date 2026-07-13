@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "rwebtransport-native"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "rwebtransport_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+neon = { version = "1", default-features = false, features = ["napi-8"] }
+quiche.workspace = true
+boring.workspace = true
+boring-sys.workspace = true
+octets.workspace = true
+log.workspace = true
