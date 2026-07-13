@@ -7,7 +7,13 @@
 //! await wt.ready;
 //! ```
 
-export { WebTransport } from './webtransport.js';
+export { WebTransport, WebTransportSession } from './webtransport.js';
+export {
+    WebTransportServer,
+    WebTransportServerSession,
+    type WebTransportServerOptions,
+    type WebTransportSessionRequest,
+} from './server.js';
 export { WebTransportError } from './errors.js';
 export {
     WebTransportBidirectionalStream,

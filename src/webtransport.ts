@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The `WebTransport` class — the W3C entry point.
 
-import { Session, type ConnectConfig } from './native.js';
+import { SessionCore, createClientSession, type ConnectConfig } from './native.js';
 import { WebTransportError } from './errors.js';
 import { WebTransportDatagramDuplexStream } from './datagrams.js';
 import {
@@ -62,11 +62,12 @@ function buildConfig(url: string, options: WebTransportOptions): ConnectConfig {
 }
 
 /**
- * A WebTransport session, matching the [W3C WebTransport](https://w3c.github.io/webtransport/)
- * interface.
+ * The symmetric surface of an established WebTransport session — streams and
+ * datagrams — shared by the client {@link WebTransport} and the server-side
+ * session ({@link WebTransportServerSession}).
  */
-export class WebTransport {
-    private readonly session: Session;
+export class WebTransportSession {
+    protected readonly core: SessionCore;
     /** The session's datagram transport. */
     public readonly datagrams: WebTransportDatagramDuplexStream;
     /** Streams the peer opens bidirectionally. */
@@ -75,10 +76,9 @@ export class WebTransport {
     public readonly incomingUnidirectionalStreams: ReadableStream<WebTransportReceiveStream>;
     private closeCalled = false;
 
-    public constructor(url: string, options: WebTransportOptions = {}) {
-        const config = buildConfig(url, options);
-        this.session = new Session(config);
-        this.datagrams = new WebTransportDatagramDuplexStream(this.session);
+    public constructor(core: SessionCore) {
+        this.core = core;
+        this.datagrams = new WebTransportDatagramDuplexStream(core);
 
         let bidiController!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
         let uniController!: ReadableStreamDefaultController<WebTransportReceiveStream>;
@@ -93,26 +93,26 @@ export class WebTransport {
             },
         });
 
-        this.session.setIncomingHandler({
+        core.setIncomingHandler({
             onBidi: (id) => {
                 // Guard: enqueue throws if the consumer already cancelled the
                 // reader — that must not escape the native event dispatch.
                 try {
-                    bidiController.enqueue(new WebTransportBidirectionalStream(this.session, id));
+                    bidiController.enqueue(new WebTransportBidirectionalStream(core, id));
                 } catch {
                     // consumer no longer reading incoming bidi streams
                 }
             },
             onUni: (id) => {
                 try {
-                    uniController.enqueue(new WebTransportReceiveStream(this.session, id));
+                    uniController.enqueue(new WebTransportReceiveStream(core, id));
                 } catch {
                     // consumer no longer reading incoming uni streams
                 }
             },
         });
 
-        this.session.closed.promise.then(
+        core.closed.promise.then(
             () => {
                 safeClose(bidiController);
                 safeClose(uniController);
@@ -126,31 +126,41 @@ export class WebTransport {
 
     /** Resolves when the session is established. */
     public get ready(): Promise<void> {
-        return this.session.ready.promise;
+        return this.core.ready.promise;
     }
 
     /** Resolves when the session closes cleanly, rejects on abnormal termination. */
     public get closed(): Promise<WebTransportCloseInfo> {
-        return this.session.closed.promise;
+        return this.core.closed.promise;
     }
 
     /** Open a new bidirectional stream. */
     public async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
-        const id = await this.session.openStream(true);
-        return new WebTransportBidirectionalStream(this.session, id);
+        const id = await this.core.openStream(true);
+        return new WebTransportBidirectionalStream(this.core, id);
     }
 
     /** Open a new unidirectional (send) stream. */
     public async createUnidirectionalStream(): Promise<WebTransportSendStream> {
-        const id = await this.session.openStream(false);
-        return new WebTransportSendStream(this.session, id);
+        const id = await this.core.openStream(false);
+        return new WebTransportSendStream(this.core, id);
     }
 
     /** Close the session. */
     public close(closeInfo: WebTransportCloseOptions = {}): void {
         if (this.closeCalled) return;
         this.closeCalled = true;
-        this.session.close(closeInfo.closeCode ?? 0, closeInfo.reason ?? '');
+        this.core.close(closeInfo.closeCode ?? 0, closeInfo.reason ?? '');
+    }
+}
+
+/**
+ * A WebTransport client session, matching the
+ * [W3C WebTransport](https://w3c.github.io/webtransport/) interface.
+ */
+export class WebTransport extends WebTransportSession {
+    public constructor(url: string, options: WebTransportOptions = {}) {
+        super(createClientSession(buildConfig(url, options)));
     }
 }
 

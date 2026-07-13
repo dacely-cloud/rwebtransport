@@ -6,12 +6,22 @@ import { loadNative } from './loader.js';
 import { WebTransportError } from './errors.js';
 import type { WebTransportCloseInfo } from './types.js';
 
-/** Opaque handle to a native session (a neon `JsBox`). */
+/** Opaque handle to a native client session (a neon `JsBox`). */
 export type NativeHandle = { readonly __brand: 'rwt-session' };
+
+/** Opaque handle to a native server (a neon `JsBox`). */
+export type NativeServerHandle = { readonly __brand: 'rwt-server' };
 
 /** Events delivered by the native addon to the `onEvent` callback. */
 export type NativeEvent =
     | { type: 'ready' }
+    | {
+          type: 'serverReady';
+          authority: string;
+          path: string;
+          origin: string | null;
+          headers: Record<string, string>;
+      }
     | { type: 'closed'; code: number; reason: Uint8Array; remote: boolean }
     | { type: 'error'; message: string }
     | { type: 'datagram'; data: Uint8Array }
@@ -47,7 +57,64 @@ export interface NativeAddon {
     isClosed(handle: NativeHandle): boolean;
     closeSession(handle: NativeHandle, code: number, reason: Uint8Array): void;
     shutdown(handle: NativeHandle): void;
+
+    // ---- server ----
+    serverListen(
+        certPath: string,
+        keyPath: string,
+        host: string,
+        port: number,
+        onEvent: (ev: ServerNativeEvent) => void,
+    ): NativeServerHandle;
+    serverOpenStream(
+        handle: NativeServerHandle,
+        session: number,
+        bidi: boolean,
+        requestId: number,
+    ): void;
+    serverWrite(
+        handle: NativeServerHandle,
+        session: number,
+        streamId: number,
+        bytes: Uint8Array,
+        requestId: number,
+    ): void;
+    serverFin(handle: NativeServerHandle, session: number, streamId: number): void;
+    serverReset(handle: NativeServerHandle, session: number, streamId: number, code: number): void;
+    serverStopSending(
+        handle: NativeServerHandle,
+        session: number,
+        streamId: number,
+        code: number,
+    ): void;
+    serverSetPaused(
+        handle: NativeServerHandle,
+        session: number,
+        streamId: number,
+        paused: boolean,
+    ): void;
+    serverSendDatagram(
+        handle: NativeServerHandle,
+        session: number,
+        bytes: Uint8Array,
+        requestId: number,
+    ): void;
+    serverMaxDatagramSize(handle: NativeServerHandle): number;
+    serverCloseSession(
+        handle: NativeServerHandle,
+        session: number,
+        code: number,
+        reason: Uint8Array,
+    ): void;
+    serverShutdown(handle: NativeServerHandle): void;
 }
+
+/** Server-level events, plus session-scoped events tagged with a `session` id. */
+export type ServerNativeEvent =
+    | { type: 'listening'; port: number }
+    | { type: 'serverError'; message: string }
+    | { type: 'serverClosed' }
+    | (NativeEvent & { session: number });
 
 /** Normalized inputs for opening a session. */
 export interface ConnectConfig {
@@ -97,12 +164,30 @@ function deferred<T>(): Deferred<T> {
 }
 
 /**
- * Owns the native handle and dispatches native events to promises / sinks.
- * Exactly one `Session` backs one `WebTransport` object.
+ * The low-level per-session command surface. Implemented by a client transport
+ * (native session handle) or a server transport (server handle + session id), so
+ * the same {@link SessionCore} drives both roles.
  */
-export class Session {
-    private readonly native: NativeAddon;
-    private handle: NativeHandle | undefined;
+export interface SessionTransport {
+    openStream(bidi: boolean, requestId: number): void;
+    write(streamId: number, bytes: Uint8Array, requestId: number): void;
+    fin(streamId: number): void;
+    reset(streamId: number, code: number): void;
+    stopSending(streamId: number, code: number): void;
+    setPaused(streamId: number, paused: boolean): void;
+    sendDatagram(bytes: Uint8Array, requestId: number): void;
+    maxDatagramSize(): number;
+    closeSession(code: number, reason: Uint8Array): void;
+    shutdown(): void;
+}
+
+/**
+ * Dispatches native events to promises / sinks and issues commands through an
+ * injected {@link SessionTransport}. Exactly one `SessionCore` backs one
+ * WebTransport session (client or server side).
+ */
+export class SessionCore {
+    private transport: SessionTransport | undefined;
 
     private nextRequestId = 1;
     private readonly opens = new Map<number, Deferred<number>>();
@@ -120,28 +205,23 @@ export class Session {
     public readonly ready = deferred<void>();
     public readonly closed = deferred<WebTransportCloseInfo>();
 
-    public constructor(config: ConnectConfig) {
-        this.native = loadNative();
+    public constructor() {
         // Swallow default unhandled-rejection warnings; the user observes these.
         void this.closed.promise.catch(() => {});
         void this.ready.promise.catch(() => {});
-        try {
-            this.handle = this.native.connect(
-                config.url,
-                config.hashes,
-                config.insecure,
-                config.origin,
-                config.headerNames,
-                config.headerValues,
-                (ev) => this.dispatch(ev),
-            );
-        } catch (e) {
-            const message = e instanceof Error ? e.message : String(e);
-            // Defer so the caller can attach `.ready`/`.closed` handlers first.
-            queueMicrotask(() =>
-                this.finish(null, new WebTransportError(message, { source: 'session' })),
-            );
-        }
+    }
+
+    /** Attach the transport once the underlying native handle exists. */
+    public attach(transport: SessionTransport): void {
+        this.transport = transport;
+    }
+
+    /** Fail a session that could not be set up at all (e.g. client connect threw). */
+    public failSetup(message: string): void {
+        // Defer so the caller can attach `.ready`/`.closed` handlers first.
+        queueMicrotask(() =>
+            this.finish(null, new WebTransportError(message, { source: 'session' })),
+        );
     }
 
     private nextId(): number {
@@ -155,7 +235,7 @@ export class Session {
         const requestId = this.nextId();
         const d = deferred<number>();
         this.opens.set(requestId, d);
-        this.native.openStream(this.handle!, bidi, requestId);
+        this.transport!.openStream(bidi, requestId);
         return d.promise;
     }
 
@@ -164,24 +244,24 @@ export class Session {
         const requestId = this.nextId();
         const d = deferred<void>();
         this.writes.set(requestId, d);
-        this.native.writeStream(this.handle!, streamId, chunk, requestId);
+        this.transport!.write(streamId, chunk, requestId);
         return d.promise;
     }
 
     public finStream(streamId: number): void {
-        if (this.handle) this.native.finStream(this.handle, streamId);
+        this.transport?.fin(streamId);
     }
 
     public resetStream(streamId: number, code: number): void {
-        if (this.handle) this.native.resetStream(this.handle, streamId, code >>> 0);
+        this.transport?.reset(streamId, code >>> 0);
     }
 
     public stopSending(streamId: number, code: number): void {
-        if (this.handle) this.native.stopSending(this.handle, streamId, code >>> 0);
+        this.transport?.stopSending(streamId, code >>> 0);
     }
 
     public setPaused(streamId: number, paused: boolean): void {
-        if (this.handle) this.native.setPaused(this.handle, streamId, paused);
+        this.transport?.setPaused(streamId, paused);
     }
 
     public sendDatagram(chunk: Uint8Array): Promise<boolean> {
@@ -189,26 +269,26 @@ export class Session {
         const requestId = this.nextId();
         const d = deferred<boolean>();
         this.datagramAcks.set(requestId, d);
-        this.native.sendDatagram(this.handle!, chunk, requestId);
+        this.transport!.sendDatagram(chunk, requestId);
         return d.promise;
     }
 
     public maxDatagramSize(): number {
-        return this.handle ? this.native.maxDatagramSize(this.handle) : 0;
+        return this.transport ? this.transport.maxDatagramSize() : 0;
     }
 
     public close(code: number, reason: string): void {
-        if (this.closedState || !this.handle) return;
-        this.native.closeSession(this.handle, code >>> 0, new TextEncoder().encode(reason));
+        if (this.closedState || !this.transport) return;
+        this.transport.closeSession(code >>> 0, new TextEncoder().encode(reason));
     }
 
     public shutdown(): void {
-        if (this.handle) this.native.shutdown(this.handle);
+        this.transport?.shutdown();
     }
 
-    /** Whether outbound operations can still be issued (handle live, not closed). */
+    /** Whether outbound operations can still be issued (attached, not closed). */
     private usable(): boolean {
-        return this.handle !== undefined && !this.closedState;
+        return this.transport !== undefined && !this.closedState;
     }
 
     private deadError(): WebTransportError {
@@ -238,9 +318,10 @@ export class Session {
 
     // ---- event dispatch -------------------------------------------------------
 
-    private dispatch(ev: NativeEvent): void {
+    public dispatch(ev: NativeEvent): void {
         switch (ev.type) {
-            case 'ready': {
+            case 'ready':
+            case 'serverReady': {
                 this.readyState = true;
                 this.ready.resolve();
                 break;
@@ -333,10 +414,108 @@ export class Session {
         this.receives.clear();
         this.sends.clear();
 
-        if (this.handle) this.native.shutdown(this.handle);
+        this.transport?.shutdown();
     }
 
     public get isClosed(): boolean {
         return this.closedState;
+    }
+}
+
+/** Routes session commands through a native client session handle. */
+class ClientTransport implements SessionTransport {
+    public constructor(
+        private readonly native: NativeAddon,
+        private readonly handle: NativeHandle,
+    ) {}
+    public openStream(bidi: boolean, requestId: number): void {
+        this.native.openStream(this.handle, bidi, requestId);
+    }
+    public write(streamId: number, bytes: Uint8Array, requestId: number): void {
+        this.native.writeStream(this.handle, streamId, bytes, requestId);
+    }
+    public fin(streamId: number): void {
+        this.native.finStream(this.handle, streamId);
+    }
+    public reset(streamId: number, code: number): void {
+        this.native.resetStream(this.handle, streamId, code);
+    }
+    public stopSending(streamId: number, code: number): void {
+        this.native.stopSending(this.handle, streamId, code);
+    }
+    public setPaused(streamId: number, paused: boolean): void {
+        this.native.setPaused(this.handle, streamId, paused);
+    }
+    public sendDatagram(bytes: Uint8Array, requestId: number): void {
+        this.native.sendDatagram(this.handle, bytes, requestId);
+    }
+    public maxDatagramSize(): number {
+        return this.native.maxDatagramSize(this.handle);
+    }
+    public closeSession(code: number, reason: Uint8Array): void {
+        this.native.closeSession(this.handle, code, reason);
+    }
+    public shutdown(): void {
+        this.native.shutdown(this.handle);
+    }
+}
+
+/** Create and connect a client-role session. */
+export function createClientSession(config: ConnectConfig): SessionCore {
+    const native = loadNative();
+    const core = new SessionCore();
+    try {
+        const handle = native.connect(
+            config.url,
+            config.hashes,
+            config.insecure,
+            config.origin,
+            config.headerNames,
+            config.headerValues,
+            (ev) => core.dispatch(ev),
+        );
+        core.attach(new ClientTransport(native, handle));
+    } catch (e) {
+        core.failSetup(e instanceof Error ? e.message : String(e));
+    }
+    return core;
+}
+
+/** Routes session commands through a native server handle + session id. */
+export class ServerTransport implements SessionTransport {
+    public constructor(
+        private readonly native: NativeAddon,
+        private readonly handle: NativeServerHandle,
+        private readonly session: number,
+    ) {}
+    public openStream(bidi: boolean, requestId: number): void {
+        this.native.serverOpenStream(this.handle, this.session, bidi, requestId);
+    }
+    public write(streamId: number, bytes: Uint8Array, requestId: number): void {
+        this.native.serverWrite(this.handle, this.session, streamId, bytes, requestId);
+    }
+    public fin(streamId: number): void {
+        this.native.serverFin(this.handle, this.session, streamId);
+    }
+    public reset(streamId: number, code: number): void {
+        this.native.serverReset(this.handle, this.session, streamId, code);
+    }
+    public stopSending(streamId: number, code: number): void {
+        this.native.serverStopSending(this.handle, this.session, streamId, code);
+    }
+    public setPaused(streamId: number, paused: boolean): void {
+        this.native.serverSetPaused(this.handle, this.session, streamId, paused);
+    }
+    public sendDatagram(bytes: Uint8Array, requestId: number): void {
+        this.native.serverSendDatagram(this.handle, this.session, bytes, requestId);
+    }
+    public maxDatagramSize(): number {
+        return this.native.serverMaxDatagramSize(this.handle);
+    }
+    public closeSession(code: number, reason: Uint8Array): void {
+        this.native.serverCloseSession(this.handle, this.session, code, reason);
+    }
+    public shutdown(): void {
+        // The server driver owns the session lifecycle; nothing to tear down here.
     }
 }

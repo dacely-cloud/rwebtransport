@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! `WebTransportDatagramDuplexStream` — unreliable, unordered datagrams.
 
-import type { Session } from './native.js';
+import type { SessionCore } from './native.js';
 
 /**
  * The datagram transport for a session. `readable` yields inbound datagrams and
@@ -9,7 +9,7 @@ import type { Session } from './native.js';
  * queue are dropped rather than buffered indefinitely).
  */
 export class WebTransportDatagramDuplexStream {
-    private readonly session: Session;
+    private readonly session: SessionCore;
     public readonly readable: ReadableStream<Uint8Array>;
     public readonly writable: WritableStream<Uint8Array>;
 
@@ -21,7 +21,7 @@ export class WebTransportDatagramDuplexStream {
     /** Max age (ms) an outbound datagram waits to be sent before being dropped, or null. */
     public outgoingMaxAge: number | null = null;
 
-    public constructor(session: Session) {
+    public constructor(session: SessionCore) {
         this.session = session;
 
         let rController!: ReadableStreamDefaultController<Uint8Array>;

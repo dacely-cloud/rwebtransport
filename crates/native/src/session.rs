@@ -22,13 +22,22 @@ fn dbg_on() -> bool {
     *ENABLED.get_or_init(|| std::env::var("RWT_DEBUG").is_ok())
 }
 
-/// The session id / CONNECT stream id.
+/// The session id / CONNECT stream id (always the client-initiated bidi 0).
 const CONNECT_ID: u64 = 0;
-const LOCAL_CONTROL_ID: u64 = 2;
-const LOCAL_QPACK_ENC_ID: u64 = 6;
-const LOCAL_QPACK_DEC_ID: u64 = 10;
-const FIRST_WT_BIDI_ID: u64 = 4;
-const FIRST_WT_UNI_ID: u64 = 14;
+
+// Client-role local stream ids (client-initiated).
+const CLIENT_CONTROL_ID: u64 = 2;
+const CLIENT_QPACK_ENC_ID: u64 = 6;
+const CLIENT_QPACK_DEC_ID: u64 = 10;
+const CLIENT_FIRST_WT_BIDI_ID: u64 = 4;
+const CLIENT_FIRST_WT_UNI_ID: u64 = 14;
+
+// Server-role local stream ids (server-initiated).
+const SERVER_CONTROL_ID: u64 = 3;
+const SERVER_QPACK_ENC_ID: u64 = 7;
+const SERVER_QPACK_DEC_ID: u64 = 11;
+const SERVER_FIRST_WT_BIDI_ID: u64 = 1;
+const SERVER_FIRST_WT_UNI_ID: u64 = 15;
 
 /// Cap on a single buffered HTTP/3 control/CONNECT frame (protects against a
 /// hostile peer advertising a huge length).
@@ -37,8 +46,16 @@ const MAX_CONTROL_FRAME: usize = 1 << 20;
 /// Events the session emits for the driver to forward to JS.
 #[derive(Debug)]
 pub enum Ev {
-    /// The WebTransport session is established (CONNECT got a 2xx).
+    /// The WebTransport session is established (client role: CONNECT got a 2xx).
     Ready,
+    /// A server-role session was established: a valid Extended CONNECT arrived
+    /// and we answered 200. Carries the request details for the application.
+    ServerReady {
+        authority: String,
+        path: String,
+        origin: Option<String>,
+        headers: Vec<(String, String)>,
+    },
     /// The session ended. `remote` is true if the peer initiated it.
     Closed {
         code: u32,
@@ -88,9 +105,9 @@ enum Role {
     /// A resolved WebTransport data stream.
     WtData { bidi: bool },
     /// A peer-initiated uni stream whose type varint isn't fully read yet.
-    PendingServerUni,
+    PendingUni,
     /// A peer-initiated bidi stream whose WT signal isn't fully read yet.
-    PendingServerBidi,
+    PendingBidi,
 }
 
 struct Stream {
@@ -183,6 +200,9 @@ struct CloseReq {
 }
 
 pub struct WtSession {
+    is_server: bool,
+
+    // Client role only: the Extended CONNECT request we send.
     authority: String,
     path: String,
     origin: Option<String>,
@@ -205,19 +225,41 @@ pub struct WtSession {
 }
 
 impl WtSession {
-    pub fn new(
+    /// A client-role session that will send an Extended CONNECT.
+    pub fn new_client(
         authority: String,
         path: String,
         origin: Option<String>,
         extra_headers: Vec<(String, String)>,
     ) -> Self {
         Self {
+            is_server: false,
             authority,
             path,
             origin,
             extra_headers,
-            next_bidi: FIRST_WT_BIDI_ID,
-            next_uni: FIRST_WT_UNI_ID,
+            next_bidi: CLIENT_FIRST_WT_BIDI_ID,
+            next_uni: CLIENT_FIRST_WT_UNI_ID,
+            setup_sent: false,
+            ready: false,
+            closed: false,
+            peer_settings: None,
+            streams: HashMap::new(),
+            close_req: None,
+            want_quic_close: None,
+        }
+    }
+
+    /// A server-role session that will accept an incoming Extended CONNECT.
+    pub fn new_server() -> Self {
+        Self {
+            is_server: true,
+            authority: String::new(),
+            path: String::new(),
+            origin: None,
+            extra_headers: Vec::new(),
+            next_bidi: SERVER_FIRST_WT_BIDI_ID,
+            next_uni: SERVER_FIRST_WT_UNI_ID,
             setup_sent: false,
             ready: false,
             closed: false,
@@ -235,49 +277,60 @@ impl WtSession {
     // ---- handshake -----------------------------------------------------------
 
     /// Called once the QUIC connection is established: open the HTTP/3
-    /// control-plane streams, advertise SETTINGS, and send Extended CONNECT.
+    /// control-plane streams and advertise SETTINGS. A client also sends the
+    /// Extended CONNECT immediately; a server waits for the client's CONNECT on
+    /// bidi stream 0.
     pub fn on_established(&mut self, ev: &mut Vec<Ev>) {
         if self.setup_sent {
             return;
         }
         self.setup_sent = true;
 
+        let (control_id, qpack_enc_id, qpack_dec_id) = if self.is_server {
+            (SERVER_CONTROL_ID, SERVER_QPACK_ENC_ID, SERVER_QPACK_DEC_ID)
+        } else {
+            (CLIENT_CONTROL_ID, CLIENT_QPACK_ENC_ID, CLIENT_QPACK_DEC_ID)
+        };
+
         // HTTP/3 control stream: type prefix + SETTINGS.
         self.streams.insert(
-            LOCAL_CONTROL_ID,
+            control_id,
             Stream::with_prefix(Role::LocalControlPlane, h3::control_stream_prefix()),
         );
         // QPACK encoder / decoder streams (dynamic table disabled → type only).
         let mut enc = Vec::new();
         h3::put_varint(h3::QPACK_ENCODER_STREAM_TYPE, &mut enc);
         self.streams.insert(
-            LOCAL_QPACK_ENC_ID,
+            qpack_enc_id,
             Stream::with_prefix(Role::LocalControlPlane, enc),
         );
         let mut dec = Vec::new();
         h3::put_varint(h3::QPACK_DECODER_STREAM_TYPE, &mut dec);
         self.streams.insert(
-            LOCAL_QPACK_DEC_ID,
+            qpack_dec_id,
             Stream::with_prefix(Role::LocalControlPlane, dec),
         );
 
-        // CONNECT request on the session (bidi 0) stream.
-        let headers = h3::connect_headers(
-            &self.authority,
-            &self.path,
-            self.origin.as_deref(),
-            &self.extra_headers,
-        );
-        match h3::encode_headers_frame(&headers) {
-            Ok(frame) => {
-                self.streams
-                    .insert(CONNECT_ID, Stream::with_prefix(Role::Connect, frame));
+        if !self.is_server {
+            // CONNECT request on the session (bidi 0) stream.
+            let headers = h3::connect_headers(
+                &self.authority,
+                &self.path,
+                self.origin.as_deref(),
+                &self.extra_headers,
+            );
+            match h3::encode_headers_frame(&headers) {
+                Ok(frame) => {
+                    self.streams
+                        .insert(CONNECT_ID, Stream::with_prefix(Role::Connect, frame));
+                }
+                Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT: {e}"))),
             }
-            Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT: {e}"))),
         }
         if dbg_on() {
             eprintln!(
-                "[rwt-session] on_established: queued setup, {} streams",
+                "[rwt-session] on_established (server={}): queued setup, {} streams",
+                self.is_server,
                 self.streams.len()
             );
         }
@@ -296,10 +349,10 @@ impl WtSession {
         backpressured: bool,
         ev: &mut Vec<Ev>,
     ) {
-        self.streams.entry(id).or_insert_with(|| {
-            let role = classify_new(id);
-            Stream::new(role)
-        });
+        let is_server = self.is_server;
+        self.streams
+            .entry(id)
+            .or_insert_with(|| Stream::new(classify_new(id, is_server)));
 
         // Respect per-stream and global read backpressure for resolved data
         // streams (leave the bytes in quiche so the peer is flow-controlled).
@@ -423,7 +476,11 @@ impl WtSession {
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.frames.push(&chunk);
                 }
-                self.parse_connect_frames(conn, id, ev);
+                if self.is_server {
+                    self.parse_server_connect_frames(conn, id, ev);
+                } else {
+                    self.parse_connect_frames(conn, id, ev);
+                }
                 if self.frame_error(id) && !self.closed {
                     self.kill_recv(conn, id);
                     ev.push(Ev::Error("malformed HTTP/3 CONNECT stream".to_string()));
@@ -445,10 +502,10 @@ impl WtSession {
                     ev.push(Ev::StreamFinished { id });
                 }
             }
-            Some(Role::PendingServerUni) => {
+            Some(Role::PendingUni) => {
                 self.resolve_pending_uni(conn, id, chunk, fin, ev);
             }
-            Some(Role::PendingServerBidi) => {
+            Some(Role::PendingBidi) => {
                 self.resolve_pending_bidi(conn, id, chunk, fin, ev);
             }
         }
@@ -541,6 +598,125 @@ impl WtSession {
             }
             buf = &buf[start + len..];
         }
+    }
+
+    /// Server role: parse the client's Extended CONNECT request on the session
+    /// stream, validate it, respond `200`, and surface the request to the app.
+    fn parse_server_connect_frames(
+        &mut self,
+        conn: &mut quiche::Connection,
+        id: u64,
+        ev: &mut Vec<Ev>,
+    ) {
+        loop {
+            let (frame, headers_done) = {
+                let Some(st) = self.streams.get_mut(&id) else {
+                    return;
+                };
+                (st.frames.next_frame(), st.headers_done)
+            };
+            let Some((ty, payload)) = frame else { break };
+
+            if ty == h3::FRAME_HEADERS && !headers_done {
+                if let Some(st) = self.streams.get_mut(&id) {
+                    st.headers_done = true;
+                }
+                match h3::decode_header_block(&payload) {
+                    Ok(headers) => self.accept_connect(conn, id, &headers, ev),
+                    Err(e) => {
+                        ev.push(Ev::Error(format!("failed to decode CONNECT request: {e}")));
+                        self.reject_connect(conn, id, 400, ev);
+                    }
+                }
+            } else if ty == h3::FRAME_DATA {
+                self.scan_capsules(&payload, ev);
+            }
+        }
+    }
+
+    fn accept_connect(
+        &mut self,
+        conn: &mut quiche::Connection,
+        id: u64,
+        headers: &[quiche::h3::Header],
+        ev: &mut Vec<Ev>,
+    ) {
+        use quiche::h3::NameValue;
+        let mut method: Option<&[u8]> = None;
+        let mut protocol: Option<&[u8]> = None;
+        let mut authority = String::new();
+        let mut path = String::from("/");
+        let mut origin: Option<String> = None;
+        let mut extra: Vec<(String, String)> = Vec::new();
+        for h in headers {
+            let name = h.name();
+            let value = h.value();
+            match name {
+                b":method" => method = Some(value),
+                b":protocol" => protocol = Some(value),
+                b":authority" => authority = String::from_utf8_lossy(value).into_owned(),
+                b":path" => path = String::from_utf8_lossy(value).into_owned(),
+                b"origin" => origin = Some(String::from_utf8_lossy(value).into_owned()),
+                _ if name.starts_with(b":") => {} // other pseudo-headers
+                _ => extra.push((
+                    String::from_utf8_lossy(name).into_owned(),
+                    String::from_utf8_lossy(value).into_owned(),
+                )),
+            }
+        }
+
+        let ok = method == Some(b"CONNECT".as_ref()) && protocol == Some(b"webtransport".as_ref());
+        if !ok {
+            self.reject_connect(conn, id, 400, ev);
+            return;
+        }
+
+        let resp = vec![quiche::h3::Header::new(b":status", b"200")];
+        match h3::encode_headers_frame(&resp) {
+            Ok(frame) => {
+                if let Some(st) = self.streams.get_mut(&id) {
+                    st.out.push_back(OutChunk {
+                        data: frame,
+                        off: 0,
+                        request_id: None,
+                    });
+                }
+                self.ready = true;
+                ev.push(Ev::ServerReady {
+                    authority,
+                    path,
+                    origin,
+                    headers: extra,
+                });
+            }
+            Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT response: {e}"))),
+        }
+    }
+
+    fn reject_connect(
+        &mut self,
+        conn: &mut quiche::Connection,
+        id: u64,
+        status: u16,
+        ev: &mut Vec<Ev>,
+    ) {
+        let status_str = status.to_string();
+        let resp = vec![quiche::h3::Header::new(b":status", status_str.as_bytes())];
+        if let Ok(frame) = h3::encode_headers_frame(&resp) {
+            if let Some(st) = self.streams.get_mut(&id) {
+                st.out.push_back(OutChunk {
+                    data: frame,
+                    off: 0,
+                    request_id: None,
+                });
+                st.fin_queued = true;
+            }
+        }
+        if !self.ready && !self.closed {
+            ev.push(Ev::Error(format!("rejected CONNECT with status {status}")));
+        }
+        self.mark_closed(ev, 0, Vec::new(), false);
+        let _ = conn;
     }
 
     fn resolve_pending_uni(
@@ -834,17 +1010,25 @@ impl WtSession {
             self.flush_stream(conn, id, ev);
         }
 
-        // Prune fully-terminated streams so a hostile server churning streams
+        // Prune fully-terminated streams so a hostile peer churning streams
         // cannot grow the map without bound. Keep the CONNECT (session) stream
         // and our send-only control-plane streams for the session's lifetime.
+        let is_server = self.is_server;
         self.streams.retain(|&id, st| {
             if id == CONNECT_ID || matches!(st.role, Role::LocalControlPlane) {
                 return true;
             }
-            // can_recv: not a client-initiated (send-only) uni stream.
-            // can_send: not a server-initiated (recv-only) uni stream.
-            let can_recv = (id & 0x3) != 0x2;
-            let can_send = (id & 0x3) != 0x3;
+            // Direction from OUR perspective: a uni stream we initiated is
+            // send-only; a uni stream the peer initiated is recv-only; bidi is
+            // both. (id & 0x1 == 0 is client-initiated.)
+            let is_uni = (id & 0x2) != 0;
+            let our_init = if is_server {
+                (id & 0x1) == 1
+            } else {
+                (id & 0x1) == 0
+            };
+            let can_recv = !is_uni || !our_init;
+            let can_send = !is_uni || our_init;
             let recv_done = !can_recv || st.recv_dead;
             let send_done = !can_send || (st.fin_sent && st.out.is_empty());
             !(recv_done && send_done)
@@ -968,16 +1152,35 @@ fn role_name(role: Role) -> &'static str {
         Role::PeerControl => "PeerControl",
         Role::Ignored => "Ignored",
         Role::WtData { .. } => "WtData",
-        Role::PendingServerUni => "PendingServerUni",
-        Role::PendingServerBidi => "PendingServerBidi",
+        Role::PendingUni => "PendingUni",
+        Role::PendingBidi => "PendingBidi",
     }
 }
 
 /// Classify a not-yet-seen stream id by its QUIC stream-type bits.
-fn classify_new(id: u64) -> Role {
-    match id & 0x3 {
-        0x3 => Role::PendingServerUni,  // server-initiated unidirectional
-        0x1 => Role::PendingServerBidi, // server-initiated bidirectional
-        _ => Role::Ignored,             // an unexpected client-initiated id
+/// Classify a not-yet-seen peer-initiated stream by its QUIC stream-type bits.
+/// The peer is the server (for a client-role session) or the client (for a
+/// server-role session).
+fn classify_new(id: u64, is_server: bool) -> Role {
+    if is_server {
+        // Peer = client (id & 0x1 == 0).
+        match id & 0x3 {
+            0x0 => {
+                if id == CONNECT_ID {
+                    Role::Connect // the incoming Extended CONNECT
+                } else {
+                    Role::PendingBidi // a client-opened WebTransport bidi stream
+                }
+            }
+            0x2 => Role::PendingUni, // client control/QPACK or WT uni stream
+            _ => Role::Ignored,
+        }
+    } else {
+        // Peer = server (id & 0x1 == 1).
+        match id & 0x3 {
+            0x3 => Role::PendingUni,  // server-initiated unidirectional
+            0x1 => Role::PendingBidi, // server-initiated bidirectional
+            _ => Role::Ignored,       // an unexpected client-initiated id
+        }
     }
 }

@@ -194,7 +194,9 @@ impl Server {
     }
 
     fn on_readable(&mut self, id: u64) {
-        self.streams.entry(id).or_insert_with(|| Stream::new(classify(id)));
+        self.streams
+            .entry(id)
+            .or_insert_with(|| Stream::new(classify(id)));
         let mut chunk = Vec::new();
         let mut fin = false;
         let mut buf = [0u8; 16 * 1024];
@@ -412,10 +414,13 @@ impl Server {
             if s.reset_queued && !s.fin_sent {
                 let _ = self.conn.stream_shutdown(id, quiche::Shutdown::Write, 7);
                 s.fin_sent = true;
-            } else if s.out_off >= s.out.len() && s.fin_queued && !s.fin_sent
-                && self.conn.stream_send(id, &[], true).is_ok() {
-                    s.fin_sent = true;
-                }
+            } else if s.out_off >= s.out.len()
+                && s.fin_queued
+                && !s.fin_sent
+                && self.conn.stream_send(id, &[], true).is_ok()
+            {
+                s.fin_sent = true;
+            }
         }
     }
 

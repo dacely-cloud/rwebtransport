@@ -25,6 +25,7 @@
 
 mod config;
 mod driver;
+mod server;
 mod session;
 mod tls;
 
@@ -389,6 +390,238 @@ fn shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+// ---- server -----------------------------------------------------------------
+
+use server::{ServerCommand, ServerEventSink, ServerMsg, ServerSetup};
+
+/// JS-facing server handle (a `JsBox`).
+struct ServerHandle {
+    tx: Mutex<Option<Sender<ServerCommand>>>,
+    waker: Arc<mio::Waker>,
+    shared: Arc<DriverShared>,
+}
+
+impl ServerHandle {
+    fn send(&self, cmd: ServerCommand) {
+        if let Ok(guard) = self.tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(cmd);
+                let _ = self.waker.wake();
+            }
+        }
+    }
+}
+
+impl Finalize for ServerHandle {
+    fn finalize<'a, C: Context<'a>>(self, _cx: &mut C) {
+        self.send(ServerCommand::Shutdown);
+    }
+}
+
+struct NeonServerSink {
+    channel: Channel,
+    callback: Arc<Root<JsFunction>>,
+    shared: Arc<DriverShared>,
+}
+
+impl ServerEventSink for NeonServerSink {
+    fn emit(&self, messages: Vec<ServerMsg>) {
+        let cb = self.callback.clone();
+        let shared = self.shared.clone();
+        self.channel.send(move |mut cx| {
+            shared.inflight.fetch_sub(1, Ordering::Relaxed);
+            let f = cb.to_inner(&mut cx);
+            for msg in &messages {
+                let obj = server_msg_to_js(&mut cx, msg)?;
+                let this = cx.undefined();
+                let args = [obj.upcast::<JsValue>()];
+                f.call(&mut cx, this, args)?;
+            }
+            Ok(())
+        });
+    }
+}
+
+fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
+    let cert_path = cx.argument::<JsString>(0)?.value(&mut cx);
+    let key_path = cx.argument::<JsString>(1)?.value(&mut cx);
+    let host = cx.argument::<JsString>(2)?.value(&mut cx);
+    let port = cx.argument::<JsNumber>(3)?.value(&mut cx) as u16;
+    let callback = cx.argument::<JsFunction>(4)?;
+
+    let poll = match mio::Poll::new() {
+        Ok(p) => p,
+        Err(e) => return cx.throw_error(format!("mio poll: {e}")),
+    };
+    let waker = match mio::Waker::new(poll.registry(), driver::WAKE_TOKEN) {
+        Ok(w) => Arc::new(w),
+        Err(e) => return cx.throw_error(format!("mio waker: {e}")),
+    };
+    let (tx, rx) = std::sync::mpsc::channel::<ServerCommand>();
+    let shared = Arc::new(DriverShared::default());
+
+    let sink: Box<dyn ServerEventSink> = Box::new(NeonServerSink {
+        channel: cx.channel(),
+        callback: Arc::new(callback.root(&mut cx)),
+        shared: shared.clone(),
+    });
+
+    let setup = ServerSetup {
+        host,
+        port,
+        cert_path,
+        key_path,
+    };
+
+    let shared_for_thread = shared.clone();
+    let spawned = std::thread::Builder::new()
+        .name("rwt-server".into())
+        .spawn(move || {
+            server::run(setup, poll, rx, sink, shared_for_thread);
+        });
+    if let Err(e) = spawned {
+        return cx.throw_error(format!("failed to spawn server thread: {e}"));
+    }
+
+    Ok(cx.boxed(ServerHandle {
+        tx: Mutex::new(Some(tx)),
+        waker,
+        shared,
+    }))
+}
+
+fn server_open_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let bidi = cx.argument::<JsBoolean>(2)?.value(&mut cx);
+    let request_id = to_request_id(cx.argument::<JsNumber>(3)?.value(&mut cx));
+    handle.send(ServerCommand::OpenStream {
+        session,
+        request_id,
+        bidi,
+    });
+    Ok(cx.undefined())
+}
+
+fn server_write(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let id = to_stream_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    let data = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
+    let request_id = to_request_id(cx.argument::<JsNumber>(4)?.value(&mut cx));
+    handle.send(ServerCommand::Write {
+        session,
+        id,
+        data,
+        request_id,
+    });
+    Ok(cx.undefined())
+}
+
+fn server_fin(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let id = to_stream_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    handle.send(ServerCommand::Fin { session, id });
+    Ok(cx.undefined())
+}
+
+fn server_reset(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let id = to_stream_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    let code = to_code(cx.argument::<JsNumber>(3)?.value(&mut cx));
+    handle.send(ServerCommand::ResetStream { session, id, code });
+    Ok(cx.undefined())
+}
+
+fn server_stop_sending(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let id = to_stream_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    let code = to_code(cx.argument::<JsNumber>(3)?.value(&mut cx));
+    handle.send(ServerCommand::StopSending { session, id, code });
+    Ok(cx.undefined())
+}
+
+fn server_set_paused(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let id = to_stream_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    let paused = cx.argument::<JsBoolean>(3)?.value(&mut cx);
+    handle.send(ServerCommand::SetPaused {
+        session,
+        id,
+        paused,
+    });
+    Ok(cx.undefined())
+}
+
+fn server_send_datagram(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let data = cx.argument::<JsTypedArray<u8>>(2)?.as_slice(&cx).to_vec();
+    let request_id = to_request_id(cx.argument::<JsNumber>(3)?.value(&mut cx));
+    handle.send(ServerCommand::SendDatagram {
+        session,
+        data,
+        request_id,
+    });
+    Ok(cx.undefined())
+}
+
+fn server_max_datagram_size(mut cx: FunctionContext) -> JsResult<JsNumber> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let n = handle.shared.max_datagram_size.load(Ordering::Relaxed);
+    Ok(cx.number(n as f64))
+}
+
+fn server_close_session(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let code = to_code(cx.argument::<JsNumber>(2)?.value(&mut cx)) as u32;
+    let reason = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
+    handle.send(ServerCommand::CloseSession {
+        session,
+        code,
+        reason,
+    });
+    Ok(cx.undefined())
+}
+
+fn server_shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    handle.send(ServerCommand::Shutdown);
+    Ok(cx.undefined())
+}
+
+fn server_msg_to_js<'a>(cx: &mut TaskContext<'a>, msg: &ServerMsg) -> JsResult<'a, JsObject> {
+    match msg {
+        ServerMsg::Listening(port) => {
+            let obj = cx.empty_object();
+            set_str(cx, &obj, "type", "listening")?;
+            set_num(cx, &obj, "port", *port as f64)?;
+            Ok(obj)
+        }
+        ServerMsg::ServerError(m) => {
+            let obj = cx.empty_object();
+            set_str(cx, &obj, "type", "serverError")?;
+            set_str(cx, &obj, "message", m)?;
+            Ok(obj)
+        }
+        ServerMsg::ServerClosed => {
+            let obj = cx.empty_object();
+            set_str(cx, &obj, "type", "serverClosed")?;
+            Ok(obj)
+        }
+        ServerMsg::Session(session, ev) => {
+            let obj = ev_to_js(cx, ev)?;
+            set_num(cx, &obj, "session", *session as f64)?;
+            Ok(obj)
+        }
+    }
+}
+
 // ---- event → JS -------------------------------------------------------------
 
 fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
@@ -396,6 +629,28 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
     match ev {
         Ev::Ready => {
             set_str(cx, &obj, "type", "ready")?;
+        }
+        Ev::ServerReady {
+            authority,
+            path,
+            origin,
+            headers,
+        } => {
+            set_str(cx, &obj, "type", "serverReady")?;
+            set_str(cx, &obj, "authority", authority)?;
+            set_str(cx, &obj, "path", path)?;
+            match origin {
+                Some(o) => set_str(cx, &obj, "origin", o)?,
+                None => {
+                    let n = cx.null();
+                    obj.set(cx, "origin", n)?;
+                }
+            }
+            let hobj = cx.empty_object();
+            for (k, v) in headers {
+                set_str(cx, &hobj, k, v)?;
+            }
+            obj.set(cx, "headers", hobj)?;
         }
         Ev::Closed {
             code,
@@ -516,5 +771,18 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("isClosed", is_closed)?;
     cx.export_function("closeSession", close_session)?;
     cx.export_function("shutdown", shutdown)?;
+
+    // Server surface.
+    cx.export_function("serverListen", server_listen)?;
+    cx.export_function("serverOpenStream", server_open_stream)?;
+    cx.export_function("serverWrite", server_write)?;
+    cx.export_function("serverFin", server_fin)?;
+    cx.export_function("serverReset", server_reset)?;
+    cx.export_function("serverStopSending", server_stop_sending)?;
+    cx.export_function("serverSetPaused", server_set_paused)?;
+    cx.export_function("serverSendDatagram", server_send_datagram)?;
+    cx.export_function("serverMaxDatagramSize", server_max_datagram_size)?;
+    cx.export_function("serverCloseSession", server_close_session)?;
+    cx.export_function("serverShutdown", server_shutdown)?;
     Ok(())
 }

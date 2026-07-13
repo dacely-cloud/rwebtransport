@@ -84,3 +84,46 @@ pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
 
     Ok(config)
 }
+
+/// Build a QUIC **server** config from PEM certificate + private-key file paths.
+/// Uses the same conservative transport limits as the client and the same
+/// bounded datagram queues.
+pub fn build_server_config(cert_path: &str, key_path: &str) -> Result<quiche::Config, String> {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVersion};
+
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|e| format!("SslContextBuilder: {e}"))?;
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| format!("set_min_proto_version: {e}"))?;
+    builder
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|e| format!("set_max_proto_version: {e}"))?;
+
+    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
+        .map_err(|e| format!("quiche config: {e:?}"))?;
+    config
+        .load_cert_chain_from_pem_file(cert_path)
+        .map_err(|e| format!("failed to load certificate {cert_path}: {e:?}"))?;
+    config
+        .load_priv_key_from_pem_file(key_path)
+        .map_err(|e| format!("failed to load private key {key_path}: {e:?}"))?;
+    config
+        .set_application_protos(&[H3_ALPN])
+        .map_err(|e| format!("set_application_protos: {e:?}"))?;
+
+    let p = ClientConfigParams::default();
+    config.set_max_idle_timeout(p.max_idle_timeout_ms);
+    config.set_max_recv_udp_payload_size(p.max_udp_payload_size);
+    config.set_max_send_udp_payload_size(p.max_udp_payload_size);
+    config.set_initial_max_data(p.initial_max_data);
+    config.set_initial_max_stream_data_bidi_local(p.initial_max_stream_data);
+    config.set_initial_max_stream_data_bidi_remote(p.initial_max_stream_data);
+    config.set_initial_max_stream_data_uni(p.initial_max_stream_data);
+    config.set_initial_max_streams_bidi(p.initial_max_streams_bidi);
+    config.set_initial_max_streams_uni(p.initial_max_streams_uni);
+    config.set_disable_active_migration(true);
+    config.enable_dgram(true, p.dgram_recv_queue, p.dgram_send_queue);
+
+    Ok(config)
+}

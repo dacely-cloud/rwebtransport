@@ -3,7 +3,7 @@
 //! with end-to-end backpressure onto the native QUIC flow-control window.
 
 import { WebTransportError } from './errors.js';
-import type { Session } from './native.js';
+import type { SessionCore } from './native.js';
 
 /** Derive a QUIC/WebTransport application error code from an abort/cancel reason. */
 function errorCode(reason: unknown): number {
@@ -22,7 +22,7 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
     /** The underlying QUIC stream id. */
     public readonly streamId: number;
 
-    public constructor(session: Session, streamId: number) {
+    public constructor(session: SessionCore, streamId: number) {
         let controller!: ReadableStreamDefaultController<Uint8Array>;
         super(
             {
@@ -79,7 +79,7 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
     /** The underlying QUIC stream id. */
     public readonly streamId: number;
 
-    public constructor(session: Session, streamId: number) {
+    public constructor(session: SessionCore, streamId: number) {
         let controller!: WritableStreamDefaultController;
         super(
             {
@@ -126,7 +126,7 @@ export class WebTransportBidirectionalStream {
     public readonly readable: WebTransportReceiveStream;
     public readonly writable: WebTransportSendStream;
 
-    public constructor(session: Session, streamId: number) {
+    public constructor(session: SessionCore, streamId: number) {
         this.readable = new WebTransportReceiveStream(session, streamId);
         this.writable = new WebTransportSendStream(session, streamId);
     }

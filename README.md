@@ -4,7 +4,7 @@
 
 ### WebTransport for Node.js. The real thing.
 
-#### A fully-compatible [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport) client for Node.js — the browser API, backed by Cloudflare **quiche** and **BoringSSL**, bound to Node through **neon**.
+#### A fully-compatible [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport) client **and server** for Node.js — the browser API, backed by Cloudflare **quiche** and **BoringSSL**, bound to Node through **neon**.
 
 <br/>
 
@@ -47,7 +47,8 @@
    - [Unidirectional streams](#unidirectional-streams)
    - [Datagrams](#datagrams)
    - [Closing](#closing)
-5. [Requirements](#requirements)
+5. [Server](#server)
+6. [Requirements](#requirements)
 6. [How it works](#how-it-works)
 7. [Building from source](#building-from-source)
 8. [Testing](#testing)
@@ -203,6 +204,49 @@ wt.datagrams.maxDatagramSize; // largest payload that will fit in one packet
 wt.close({ closeCode: 0, reason: 'done' });
 await wt.closed;
 ```
+
+---
+
+## Server
+
+The same package ships a **WebTransport server**. Bind a UDP port with a certificate, then consume `incomingSessions` — each is a `WebTransportServerSession` with the exact same stream and datagram surface as the client `WebTransport`.
+
+```ts
+import { WebTransportServer } from 'rwebtransport';
+
+const server = new WebTransportServer({
+  port: 4433,
+  host: '0.0.0.0',
+  cert: '/path/to/cert.pem', // PEM certificate chain
+  key: '/path/to/key.pem', // PEM private key
+});
+await server.ready;
+console.log('listening on', server.port);
+
+const reader = server.incomingSessions.getReader();
+for (;;) {
+  const { value: session, done } = await reader.read();
+  if (done) break;
+
+  console.log('new session:', session.path, session.authority);
+
+  // Echo every bidirectional stream straight back:
+  const streams = session.incomingBidirectionalStreams.getReader();
+  void (async () => {
+    for (;;) {
+      const { value: stream, done } = await streams.read();
+      if (done) break;
+      void stream.readable.pipeTo(stream.writable);
+    }
+  })();
+
+  // Open a stream / send a datagram from the server side:
+  const outbound = await session.createUnidirectionalStream();
+  await outbound.getWriter().write(new TextEncoder().encode('welcome'));
+}
+```
+
+`WebTransportServerSession` exposes `ready`, `closed`, `datagrams`, `createBidirectionalStream()`, `createUnidirectionalStream()`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, and `close()` — identical to the client — plus the request metadata (`authority`, `path`, `origin`, `headers`). The server is powered by the same quiche engine and inherits the same panic containment and hostile-peer hardening as the client.
 
 ---
 

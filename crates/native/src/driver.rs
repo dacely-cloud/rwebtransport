@@ -221,7 +221,7 @@ fn setup_and_run(
         }
     };
 
-    let session = WtSession::new(
+    let session = WtSession::new_client(
         setup.authority,
         setup.path,
         setup.origin,
