@@ -3,7 +3,7 @@
 //! the quiche connection, feeds packets to [`crate::session::WtSession`], and
 //! ferries commands in and events out.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,14 @@ use crate::session::{Ev, WtSession};
 pub const SOCKET_TOKEN: Token = Token(0);
 pub const WAKE_TOKEN: Token = Token(1);
 
+/// Max number of event batches that may be in flight to the JS event loop before
+/// the driver stops pulling high-volume data (datagrams + WebTransport stream
+/// bytes) out of quiche. This bounds the neon Channel / libuv queue so a hostile
+/// server flooding datagrams or stream data cannot grow it without limit (OOM).
+/// When exceeded, unread stream data stays in quiche (flow-controlling the peer)
+/// and excess datagrams are dropped by quiche's bounded recv queue.
+const MAX_INFLIGHT_BATCHES: i64 = 128;
+
 /// State shared between the driver thread and the JS-facing handle so that
 /// synchronous property reads (e.g. `datagrams.maxDatagramSize`) don't require a
 /// round trip through the command channel.
@@ -24,6 +32,9 @@ pub struct DriverShared {
     pub max_datagram_size: AtomicUsize,
     pub ready: AtomicBool,
     pub closed: AtomicBool,
+    /// Event batches emitted but not yet processed by the JS thread. Incremented
+    /// by the sink before `Channel::send`, decremented inside the JS callback.
+    pub inflight: AtomicI64,
 }
 
 /// Commands sent from JS (via the neon layer) into the driver thread.
@@ -254,11 +265,22 @@ fn run_inner(
             }
             session.on_established(&mut evs);
         }
-        session.on_datagrams(&mut conn, &mut evs);
+
+        // Backpressure: if the JS thread is behind on processing events, stop
+        // pulling high-volume data out of quiche this iteration. Unread stream
+        // bytes stay flow-controlled in quiche and excess datagrams are dropped
+        // by quiche's bounded recv queue, so the event queue cannot grow without
+        // bound (hostile-flood OOM protection). Control-plane processing (the
+        // CONNECT response, SETTINGS, session close) always runs.
+        let backpressured = shared.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_BATCHES;
+
+        if !backpressured {
+            session.on_datagrams(&mut conn, &mut evs);
+        }
 
         let readable: Vec<u64> = conn.readable().collect();
         for id in readable {
-            session.on_readable(&mut conn, id, &mut evs);
+            session.on_readable(&mut conn, id, backpressured, &mut evs);
         }
 
         session.flush(&mut conn, &mut evs);

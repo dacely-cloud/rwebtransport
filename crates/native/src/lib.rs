@@ -70,12 +70,19 @@ impl Finalize for SessionHandle {
 struct NeonSink {
     channel: Channel,
     callback: Arc<Root<JsFunction>>,
+    shared: Arc<DriverShared>,
 }
 
 impl EventSink for NeonSink {
     fn emit(&self, events: Vec<Ev>) {
         let cb = self.callback.clone();
+        let shared = self.shared.clone();
+        // Count this batch as in flight to the JS loop; the driver reads this to
+        // back off from pulling more data out of quiche when JS falls behind.
+        self.shared.inflight.fetch_add(1, Ordering::Relaxed);
         self.channel.send(move |mut cx| {
+            // Dequeued by the JS loop: no longer contributing to queue depth.
+            shared.inflight.fetch_sub(1, Ordering::Relaxed);
             let f = cb.to_inner(&mut cx);
             for ev in &events {
                 let obj = ev_to_js(&mut cx, ev)?;
@@ -156,8 +163,46 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
 
 fn random_scid() -> [u8; 16] {
     let mut b = [0u8; 16];
-    getrandom::getrandom(&mut b).expect("system RNG");
+    // Best-effort; falls back to a time-seeded value so connect() never panics if
+    // the OS RNG is briefly unavailable (the SCID only needs to be unpredictable).
+    if getrandom::getrandom(&mut b).is_err() {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        b.copy_from_slice(&(seed as u128).to_le_bytes());
+    }
     b
+}
+
+/// Convert a JS number to a stream id. NaN / negative / non-finite values map to
+/// `u64::MAX`, which matches no real stream, so a malformed call is ignored
+/// instead of aliasing the CONNECT (session) stream id 0.
+fn to_stream_id(v: f64) -> u64 {
+    if v.is_finite() && v >= 0.0 {
+        v as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// Convert a JS number to a QUIC/WebTransport application code, clamped below the
+/// 62-bit varint ceiling so quiche's varint encoder can never panic.
+fn to_code(v: f64) -> u64 {
+    if v.is_finite() && v >= 0.0 {
+        (v as u64).min((1u64 << 62) - 1)
+    } else {
+        0
+    }
+}
+
+/// Convert a JS number to a request id (NaN / non-finite → 0).
+fn to_request_id(v: f64) -> u64 {
+    if v.is_finite() && v >= 0.0 {
+        v as u64
+    } else {
+        0
+    }
 }
 
 // ---- connect ----------------------------------------------------------------
@@ -269,10 +314,11 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     let sink: Box<dyn EventSink> = Box::new(NeonSink {
         channel: cx.channel(),
         callback: Arc::new(callback.root(&mut cx)),
+        shared: shared.clone(),
     });
 
     let shared_for_thread = shared.clone();
-    std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("rwt-driver".into())
         .spawn(move || {
             driver::run(
@@ -285,8 +331,10 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
                 sink,
                 shared_for_thread,
             );
-        })
-        .expect("spawn driver thread");
+        });
+    if let Err(e) = spawned {
+        return cx.throw_error(format!("failed to spawn driver thread: {e}"));
+    }
 
     Ok(cx.boxed(SessionHandle {
         tx: Mutex::new(Some(tx)),
@@ -300,16 +348,16 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
 fn open_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     let bidi = cx.argument::<JsBoolean>(1)?.value(&mut cx);
-    let request_id = cx.argument::<JsNumber>(2)?.value(&mut cx) as u64;
+    let request_id = to_request_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
     handle.send(Command::OpenStream { request_id, bidi });
     Ok(cx.undefined())
 }
 
 fn write_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let id = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
+    let id = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
     let data = cx.argument::<JsTypedArray<u8>>(2)?.as_slice(&cx).to_vec();
-    let request_id = cx.argument::<JsNumber>(3)?.value(&mut cx) as u64;
+    let request_id = to_request_id(cx.argument::<JsNumber>(3)?.value(&mut cx));
     handle.send(Command::Write {
         id,
         data,
@@ -320,30 +368,30 @@ fn write_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 
 fn fin_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let id = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
+    let id = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
     handle.send(Command::Fin { id });
     Ok(cx.undefined())
 }
 
 fn reset_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let id = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
-    let code = cx.argument::<JsNumber>(2)?.value(&mut cx) as u64;
+    let id = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let code = to_code(cx.argument::<JsNumber>(2)?.value(&mut cx));
     handle.send(Command::ResetStream { id, code });
     Ok(cx.undefined())
 }
 
 fn stop_sending(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let id = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
-    let code = cx.argument::<JsNumber>(2)?.value(&mut cx) as u64;
+    let id = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let code = to_code(cx.argument::<JsNumber>(2)?.value(&mut cx));
     handle.send(Command::StopSending { id, code });
     Ok(cx.undefined())
 }
 
 fn set_paused(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let id = cx.argument::<JsNumber>(1)?.value(&mut cx) as u64;
+    let id = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
     let paused = cx.argument::<JsBoolean>(2)?.value(&mut cx);
     handle.send(Command::SetPaused { id, paused });
     Ok(cx.undefined())
@@ -352,7 +400,7 @@ fn set_paused(mut cx: FunctionContext) -> JsResult<JsUndefined> {
 fn send_datagram(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     let data = cx.argument::<JsTypedArray<u8>>(1)?.as_slice(&cx).to_vec();
-    let request_id = cx.argument::<JsNumber>(2)?.value(&mut cx) as u64;
+    let request_id = to_request_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
     handle.send(Command::SendDatagram { data, request_id });
     Ok(cx.undefined())
 }
@@ -375,7 +423,7 @@ fn is_closed(mut cx: FunctionContext) -> JsResult<JsBoolean> {
 
 fn close_session(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
-    let code = cx.argument::<JsNumber>(1)?.value(&mut cx) as u32;
+    let code = to_code(cx.argument::<JsNumber>(1)?.value(&mut cx)) as u32;
     let reason = cx.argument::<JsTypedArray<u8>>(2)?.as_slice(&cx).to_vec();
     handle.send(Command::Close { code, reason });
     Ok(cx.undefined())

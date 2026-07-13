@@ -285,19 +285,36 @@ impl WtSession {
 
     // ---- reads ---------------------------------------------------------------
 
-    /// Process a readable QUIC stream.
-    pub fn on_readable(&mut self, conn: &mut quiche::Connection, id: u64, ev: &mut Vec<Ev>) {
+    /// Process a readable QUIC stream. `backpressured` is a global signal that
+    /// the JS thread is behind; when set, resolved WebTransport data streams are
+    /// left unread (flow-controlling the peer) while control-plane streams still
+    /// drain.
+    pub fn on_readable(
+        &mut self,
+        conn: &mut quiche::Connection,
+        id: u64,
+        backpressured: bool,
+        ev: &mut Vec<Ev>,
+    ) {
         self.streams.entry(id).or_insert_with(|| {
             let role = classify_new(id);
             Stream::new(role)
         });
 
-        // Respect read backpressure for resolved data streams.
-        let (paused, is_data) = {
+        // Respect per-stream and global read backpressure for resolved data
+        // streams (leave the bytes in quiche so the peer is flow-controlled).
+        let (paused, is_data, recv_dead) = {
             let st = &self.streams[&id];
-            (st.paused, matches!(st.role, Role::WtData { .. }))
+            (
+                st.paused,
+                matches!(st.role, Role::WtData { .. }),
+                st.recv_dead,
+            )
         };
-        if paused && is_data {
+        if recv_dead {
+            return;
+        }
+        if (paused || backpressured) && is_data {
             return;
         }
 
@@ -328,11 +345,23 @@ impl WtSession {
         }
 
         if let Some(code) = reset {
+            let role = self.streams.get(&id).map(|s| s.role);
             if let Some(st) = self.streams.get_mut(&id) {
                 st.recv_dead = true;
-                if matches!(st.role, Role::WtData { .. }) {
-                    ev.push(Ev::StreamReset { id, code });
+            }
+            match role {
+                Some(Role::WtData { .. }) => ev.push(Ev::StreamReset { id, code }),
+                Some(Role::Connect) if !self.closed => {
+                    // A reset of the session (CONNECT) stream ends the session;
+                    // if we swallowed it, ready/closed would hang forever.
+                    if !self.ready {
+                        ev.push(Ev::Error(format!(
+                            "server reset the WebTransport session stream (code {code})"
+                        )));
+                    }
+                    self.mark_closed(ev, code as u32, Vec::new(), true);
                 }
+                _ => {}
             }
             return;
         }
@@ -361,20 +390,46 @@ impl WtSession {
     ) {
         let role = self.streams.get(&id).map(|s| s.role);
         match role {
-            Some(Role::LocalControlPlane) | Some(Role::Ignored) | None => {
-                // discard
+            Some(Role::LocalControlPlane) | None => {
+                // Our send-only control-plane streams / unknown: discard reads.
+            }
+            Some(Role::Ignored) => {
+                // A drained peer stream (QPACK/push/unknown): mark it finished so
+                // it can be pruned, otherwise stream churn grows the map.
+                if fin {
+                    if let Some(st) = self.streams.get_mut(&id) {
+                        st.recv_dead = true;
+                    }
+                }
             }
             Some(Role::PeerControl) => {
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.frames.push(&chunk);
                 }
                 self.parse_control_frames(id);
+                // A malformed control stream is a fatal H3 error; stop reading it
+                // so a hostile server cannot keep us draining (and re-crediting)
+                // an oversized frame into an unbounded buffer.
+                if self.frame_error(id) {
+                    self.kill_recv(conn, id);
+                    if !self.closed {
+                        ev.push(Ev::Error("malformed HTTP/3 control stream".to_string()));
+                        self.mark_closed(ev, 0, Vec::new(), true);
+                        let _ = conn.close(true, 0, b"h3 control error");
+                    }
+                }
             }
             Some(Role::Connect) => {
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.frames.push(&chunk);
                 }
                 self.parse_connect_frames(conn, id, ev);
+                if self.frame_error(id) && !self.closed {
+                    self.kill_recv(conn, id);
+                    ev.push(Ev::Error("malformed HTTP/3 CONNECT stream".to_string()));
+                    self.mark_closed(ev, 0, Vec::new(), true);
+                    let _ = conn.close(true, 0, b"h3 connect error");
+                }
                 if fin && !self.closed {
                     self.mark_closed(ev, 0, Vec::new(), true);
                 }
@@ -497,7 +552,9 @@ impl WtSession {
         ev: &mut Vec<Ev>,
     ) {
         let buf = {
-            let st = self.streams.get_mut(&id).unwrap();
+            let Some(st) = self.streams.get_mut(&id) else {
+                return;
+            };
             st.class_buf.extend_from_slice(&chunk);
             st.class_buf.clone()
         };
@@ -507,14 +564,18 @@ impl WtSession {
         match ty {
             t if t == h3::H3_CONTROL_STREAM_TYPE => {
                 let rest = buf[n..].to_vec();
-                let st = self.streams.get_mut(&id).unwrap();
+                let Some(st) = self.streams.get_mut(&id) else {
+                    return;
+                };
                 st.role = Role::PeerControl;
                 st.class_buf.clear();
                 st.frames.push(&rest);
                 self.parse_control_frames(id);
             }
             t if t == h3::QPACK_ENCODER_STREAM_TYPE || t == h3::QPACK_DECODER_STREAM_TYPE => {
-                let st = self.streams.get_mut(&id).unwrap();
+                let Some(st) = self.streams.get_mut(&id) else {
+                    return;
+                };
                 st.role = Role::Ignored;
                 st.class_buf.clear();
             }
@@ -524,14 +585,18 @@ impl WtSession {
                 };
                 if session != CONNECT_ID {
                     let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                    let st = self.streams.get_mut(&id).unwrap();
+                    let Some(st) = self.streams.get_mut(&id) else {
+                        return;
+                    };
                     st.role = Role::Ignored;
                     st.class_buf.clear();
                     return;
                 }
                 let data = buf[n + n2..].to_vec();
                 {
-                    let st = self.streams.get_mut(&id).unwrap();
+                    let Some(st) = self.streams.get_mut(&id) else {
+                        return;
+                    };
                     st.role = Role::WtData { bidi: false };
                     st.class_buf.clear();
                 }
@@ -547,7 +612,9 @@ impl WtSession {
                 }
             }
             _ => {
-                let st = self.streams.get_mut(&id).unwrap();
+                let Some(st) = self.streams.get_mut(&id) else {
+                    return;
+                };
                 st.role = Role::Ignored;
                 st.class_buf.clear();
             }
@@ -563,7 +630,9 @@ impl WtSession {
         ev: &mut Vec<Ev>,
     ) {
         let buf = {
-            let st = self.streams.get_mut(&id).unwrap();
+            let Some(st) = self.streams.get_mut(&id) else {
+                return;
+            };
             st.class_buf.extend_from_slice(&chunk);
             st.class_buf.clone()
         };
@@ -572,7 +641,9 @@ impl WtSession {
         };
         if signal != h3::WT_BIDI_FRAME_TYPE {
             let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-            let st = self.streams.get_mut(&id).unwrap();
+            let Some(st) = self.streams.get_mut(&id) else {
+                return;
+            };
             st.role = Role::Ignored;
             st.class_buf.clear();
             return;
@@ -582,14 +653,18 @@ impl WtSession {
         };
         if session != CONNECT_ID {
             let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-            let st = self.streams.get_mut(&id).unwrap();
+            let Some(st) = self.streams.get_mut(&id) else {
+                return;
+            };
             st.role = Role::Ignored;
             st.class_buf.clear();
             return;
         }
         let data = buf[n + n2..].to_vec();
         {
-            let st = self.streams.get_mut(&id).unwrap();
+            let Some(st) = self.streams.get_mut(&id) else {
+                return;
+            };
             st.role = Role::WtData { bidi: true };
             st.class_buf.clear();
         }
@@ -759,6 +834,22 @@ impl WtSession {
             self.flush_stream(conn, id, ev);
         }
 
+        // Prune fully-terminated streams so a hostile server churning streams
+        // cannot grow the map without bound. Keep the CONNECT (session) stream
+        // and our send-only control-plane streams for the session's lifetime.
+        self.streams.retain(|&id, st| {
+            if id == CONNECT_ID || matches!(st.role, Role::LocalControlPlane) {
+                return true;
+            }
+            // can_recv: not a client-initiated (send-only) uni stream.
+            // can_send: not a server-initiated (recv-only) uni stream.
+            let can_recv = (id & 0x3) != 0x2;
+            let can_send = (id & 0x3) != 0x3;
+            let recv_done = !can_recv || st.recv_dead;
+            let send_done = !can_send || (st.fin_sent && st.out.is_empty());
+            !(recv_done && send_done)
+        });
+
         // Opens blocked on stream credit simply keep their WT-signal prefix queued
         // in `out`; `flush_stream` retries them on every loop until credit lands.
 
@@ -808,7 +899,13 @@ impl WtSession {
                 Err(quiche::Error::StreamLimit) => return, // no stream credit yet; retry next loop
                 Err(quiche::Error::StreamStopped(code)) => {
                     ev.push(Ev::StreamStopSending { id, code });
-                    st.out.clear();
+                    // Settle every queued write's promise so a stalled write()
+                    // (and its WritableStream) cannot hang forever.
+                    for chunk in st.out.drain(..) {
+                        if let Some(rid) = chunk.request_id {
+                            ev.push(Ev::WriteAck { request_id: rid });
+                        }
+                    }
                     st.fin_sent = true;
                     return;
                 }
@@ -841,6 +938,26 @@ impl WtSession {
 
     pub fn is_closed(&self) -> bool {
         self.closed
+    }
+
+    /// Whether a stream's HTTP/3 frame parser has latched a fatal error.
+    fn frame_error(&self, id: u64) -> bool {
+        self.streams
+            .get(&id)
+            .map(|s| s.frames.error)
+            .unwrap_or(false)
+    }
+
+    /// Stop reading a stream and release its receive buffers (used when a stream
+    /// is finished, reset, or has produced a fatal protocol error), so a hostile
+    /// server cannot keep us draining it into an unbounded buffer.
+    fn kill_recv(&mut self, conn: &mut quiche::Connection, id: u64) {
+        if let Some(st) = self.streams.get_mut(&id) {
+            st.recv_dead = true;
+            st.frames.buf = Vec::new();
+            st.class_buf = Vec::new();
+        }
+        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
     }
 }
 

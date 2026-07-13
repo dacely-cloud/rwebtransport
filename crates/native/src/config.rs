@@ -32,8 +32,10 @@ impl Default for ClientConfigParams {
             initial_max_stream_data: 1024 * 1024,
             initial_max_streams_bidi: 256,
             initial_max_streams_uni: 256,
-            dgram_recv_queue: 65_536,
-            dgram_send_queue: 65_536,
+            // Bounded so a hostile server flooding datagrams cannot balloon
+            // memory: quiche drops incoming datagrams once this queue is full.
+            dgram_recv_queue: 1024,
+            dgram_send_queue: 1024,
         }
     }
 }
