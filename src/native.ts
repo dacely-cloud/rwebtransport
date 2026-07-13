@@ -151,20 +151,20 @@ export class Session {
     // ---- outbound commands ----------------------------------------------------
 
     openStream(bidi: boolean): Promise<number> {
-        if (!this.handle) return Promise.reject(this.deadError());
+        if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<number>();
         this.opens.set(requestId, d);
-        this.native.openStream(this.handle, bidi, requestId);
+        this.native.openStream(this.handle!, bidi, requestId);
         return d.promise;
     }
 
     write(streamId: number, chunk: Uint8Array): Promise<void> {
-        if (!this.handle) return Promise.reject(this.deadError());
+        if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<void>();
         this.writes.set(requestId, d);
-        this.native.writeStream(this.handle, streamId, chunk, requestId);
+        this.native.writeStream(this.handle!, streamId, chunk, requestId);
         return d.promise;
     }
 
@@ -185,11 +185,11 @@ export class Session {
     }
 
     sendDatagram(chunk: Uint8Array): Promise<boolean> {
-        if (!this.handle) return Promise.resolve(false);
+        if (!this.usable()) return Promise.resolve(false);
         const requestId = this.nextId();
         const d = deferred<boolean>();
         this.datagramAcks.set(requestId, d);
-        this.native.sendDatagram(this.handle, chunk, requestId);
+        this.native.sendDatagram(this.handle!, chunk, requestId);
         return d.promise;
     }
 
@@ -206,8 +206,13 @@ export class Session {
         if (this.handle) this.native.shutdown(this.handle);
     }
 
+    /** Whether outbound operations can still be issued (handle live, not closed). */
+    private usable(): boolean {
+        return this.handle !== undefined && !this.closedState;
+    }
+
     private deadError(): WebTransportError {
-        return new WebTransportError('session is not connected', { source: 'session' });
+        return new WebTransportError('session is closed', { source: 'session' });
     }
 
     // ---- registration ---------------------------------------------------------

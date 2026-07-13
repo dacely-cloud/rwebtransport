@@ -22,6 +22,10 @@ export function certHash(): Uint8Array {
     return new Uint8Array(createHash('sha256').update(der).digest());
 }
 
+/** Adversarial server behaviours (see crates/echo-server --mode). */
+export type EchoServerMode =
+    'echo' | 'reject' | 'malformed-headers' | 'garbage' | 'reset' | 'close';
+
 export interface EchoServer {
     url: string;
     certHash: Uint8Array;
@@ -30,7 +34,7 @@ export interface EchoServer {
 }
 
 /** Spawn the echo server on an OS-assigned port and resolve once it is ready. */
-export async function startEchoServer(): Promise<EchoServer> {
+export async function startEchoServer(mode: EchoServerMode = 'echo'): Promise<EchoServer> {
     const bin = binPath();
     if (!existsSync(bin)) {
         throw new Error(
@@ -38,9 +42,11 @@ export async function startEchoServer(): Promise<EchoServer> {
         );
     }
 
-    const proc = spawn(bin, ['--cert', CERT, '--key', KEY, '--host', '127.0.0.1', '--port', '0'], {
-        stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    const proc = spawn(
+        bin,
+        ['--cert', CERT, '--key', KEY, '--host', '127.0.0.1', '--port', '0', '--mode', mode],
+        { stdio: ['ignore', 'pipe', 'pipe'] },
+    );
 
     const port = await new Promise<number>((resolve, reject) => {
         let buf = '';

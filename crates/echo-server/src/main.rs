@@ -21,6 +21,36 @@ use wtcore::h3;
 const LOCAL_CONN_ID_LEN: usize = 16;
 const SOCKET: Token = Token(0);
 
+/// Server behaviour, selectable via `--mode` for adversarial client tests.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    /// Echo everything (default).
+    Echo,
+    /// Reject the Extended CONNECT with `:status 404`.
+    Reject,
+    /// Answer CONNECT with a HEADERS frame carrying a malformed QPACK block.
+    MalformedHeaders,
+    /// After a normal CONNECT, dump random non-frame bytes on the CONNECT stream.
+    Garbage,
+    /// Echo bidi streams but RESET them instead of finishing cleanly.
+    ResetStreams,
+    /// Accept CONNECT, then immediately close the WebTransport session (FIN).
+    CloseSession,
+}
+
+impl Mode {
+    fn parse(s: &str) -> Mode {
+        match s {
+            "reject" => Mode::Reject,
+            "malformed-headers" => Mode::MalformedHeaders,
+            "garbage" => Mode::Garbage,
+            "reset" => Mode::ResetStreams,
+            "close" => Mode::CloseSession,
+            _ => Mode::Echo,
+        }
+    }
+}
+
 // ---- server-side WebTransport session state --------------------------------
 
 const CONNECT_ID: u64 = 0;
@@ -45,6 +75,7 @@ struct Stream {
     fin_queued: bool,
     fin_sent: bool,
     prefix_done: bool,
+    reset_queued: bool,
 }
 
 impl Stream {
@@ -58,6 +89,7 @@ impl Stream {
             fin_queued: false,
             fin_sent: false,
             prefix_done: false,
+            reset_queued: false,
         }
     }
     fn with_prefix(role: Role, prefix: Vec<u8>) -> Self {
@@ -102,10 +134,12 @@ struct Server {
     connected: bool,
     next_server_uni: u64,
     established_logged: bool,
+    mode: Mode,
+    adversary_done: bool,
 }
 
 impl Server {
-    fn new(conn: quiche::Connection) -> Self {
+    fn new(conn: quiche::Connection, mode: Mode) -> Self {
         Self {
             conn,
             streams: HashMap::new(),
@@ -113,6 +147,8 @@ impl Server {
             connected: false,
             next_server_uni: 15, // 3/7/11 are control/qpack; WT uni starts at 15
             established_logged: false,
+            mode,
+            adversary_done: false,
         }
     }
 
@@ -158,6 +194,7 @@ impl Server {
         for id in readable {
             self.on_readable(id);
         }
+        self.adversary();
         self.flush();
     }
 
@@ -206,12 +243,17 @@ impl Server {
             Some(Role::WtBidi) => {
                 // Strip the 0x41 + session prefix once, then echo the rest.
                 let data = self.strip_prefix(id, chunk, h3::WT_BIDI_FRAME_TYPE);
+                let reset = self.mode == Mode::ResetStreams;
                 if let Some(s) = self.streams.get_mut(&id) {
                     if !data.is_empty() {
                         s.queue(&data);
                     }
                     if fin {
-                        s.fin_queued = true;
+                        if reset {
+                            s.reset_queued = true;
+                        } else {
+                            s.fin_queued = true;
+                        }
                     }
                 }
             }
@@ -319,16 +361,30 @@ impl Server {
                 );
             }
             if ty == h3::FRAME_HEADERS {
-                let ok = match h3::decode_header_block(&payload) {
+                let valid = match h3::decode_header_block(&payload) {
                     Ok(headers) => headers
                         .iter()
                         .any(|hh| hh.name() == b":protocol" && hh.value() == b"webtransport"),
                     Err(_) => false,
                 };
-                if std::env::var("RWT_DEBUG").is_ok() {
-                    eprintln!("[echo] CONNECT webtransport ok={ok} -> responding");
+
+                // Adversarial: a deliberately malformed QPACK response block.
+                if self.mode == Mode::MalformedHeaders {
+                    let mut framed = Vec::new();
+                    h3::put_varint(h3::FRAME_HEADERS, &mut framed);
+                    let garbage = [0xffu8, 0xff, 0xff, 0xff, 0xff, 0xff];
+                    h3::put_varint(garbage.len() as u64, &mut framed);
+                    framed.extend_from_slice(&garbage);
+                    if let Some(s) = self.streams.get_mut(&id) {
+                        s.queue(&framed);
+                        s.fin_queued = true;
+                    }
+                    self.connected = false;
+                    continue;
                 }
-                let status: &[u8] = if ok { b"200" } else { b"400" };
+
+                let ok = valid && self.mode != Mode::Reject;
+                let status: &[u8] = if ok { b"200" } else { b"404" };
                 let resp = vec![quiche::h3::Header::new(b":status", status)];
                 if let Ok(frame) = h3::encode_headers_frame(&resp) {
                     if let Some(s) = self.streams.get_mut(&id) {
@@ -361,11 +417,42 @@ impl Server {
                     Err(_) => break,
                 }
             }
-            if s.out_off >= s.out.len() && s.fin_queued && !s.fin_sent {
+            if s.reset_queued && !s.fin_sent {
+                let _ = self.conn.stream_shutdown(id, quiche::Shutdown::Write, 7);
+                s.fin_sent = true;
+            } else if s.out_off >= s.out.len() && s.fin_queued && !s.fin_sent {
                 if self.conn.stream_send(id, &[], true).is_ok() {
                     s.fin_sent = true;
                 }
             }
+        }
+    }
+
+    /// Fire the mode-specific hostile action once, after CONNECT succeeds.
+    fn adversary(&mut self) {
+        if self.adversary_done || !self.connected {
+            return;
+        }
+        match self.mode {
+            Mode::Garbage => {
+                // Dump non-frame bytes on the CONNECT (session) stream. The client
+                // must survive this without crashing or hanging.
+                let garbage = [
+                    0xffu8, 0xff, 0xff, 0xff, 0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03,
+                ];
+                if let Some(s) = self.streams.get_mut(&CONNECT_ID) {
+                    s.queue(&garbage);
+                }
+                self.adversary_done = true;
+            }
+            Mode::CloseSession => {
+                // FIN the CONNECT stream: the WebTransport session ends.
+                if let Some(s) = self.streams.get_mut(&CONNECT_ID) {
+                    s.fin_queued = true;
+                }
+                self.adversary_done = true;
+            }
+            _ => {}
         }
     }
 }
@@ -393,6 +480,7 @@ fn main() {
     let mut key = String::new();
     let mut host = "127.0.0.1".to_string();
     let mut port: u16 = 0;
+    let mut mode = Mode::Echo;
 
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -401,6 +489,7 @@ fn main() {
             "--key" => key = args.next().unwrap_or_default(),
             "--host" => host = args.next().unwrap_or_else(|| "127.0.0.1".into()),
             "--port" => port = args.next().and_then(|p| p.parse().ok()).unwrap_or(0),
+            "--mode" => mode = Mode::parse(&args.next().unwrap_or_default()),
             _ => {}
         }
     }
@@ -467,7 +556,7 @@ fn main() {
                     let key = scid.to_vec();
                     routing.insert(hdr.dcid.to_vec(), key.clone());
                     routing.insert(key.clone(), key.clone());
-                    clients.insert(key.clone(), Server::new(conn));
+                    clients.insert(key.clone(), Server::new(conn, mode));
                     if debug {
                         eprintln!("[echo] new connection from {from} (type={:?})", hdr.ty);
                     }
