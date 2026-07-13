@@ -117,10 +117,10 @@ export class Session {
     private closedState = false;
     private readyState = false;
 
-    readonly ready = deferred<void>();
-    readonly closed = deferred<WebTransportCloseInfo>();
+    public readonly ready = deferred<void>();
+    public readonly closed = deferred<WebTransportCloseInfo>();
 
-    constructor(config: ConnectConfig) {
+    public constructor(config: ConnectConfig) {
         this.native = loadNative();
         // Swallow default unhandled-rejection warnings; the user observes these.
         void this.closed.promise.catch(() => {});
@@ -150,7 +150,7 @@ export class Session {
 
     // ---- outbound commands ----------------------------------------------------
 
-    openStream(bidi: boolean): Promise<number> {
+    public openStream(bidi: boolean): Promise<number> {
         if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<number>();
@@ -159,7 +159,7 @@ export class Session {
         return d.promise;
     }
 
-    write(streamId: number, chunk: Uint8Array): Promise<void> {
+    public write(streamId: number, chunk: Uint8Array): Promise<void> {
         if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<void>();
@@ -168,23 +168,23 @@ export class Session {
         return d.promise;
     }
 
-    finStream(streamId: number): void {
+    public finStream(streamId: number): void {
         if (this.handle) this.native.finStream(this.handle, streamId);
     }
 
-    resetStream(streamId: number, code: number): void {
+    public resetStream(streamId: number, code: number): void {
         if (this.handle) this.native.resetStream(this.handle, streamId, code >>> 0);
     }
 
-    stopSending(streamId: number, code: number): void {
+    public stopSending(streamId: number, code: number): void {
         if (this.handle) this.native.stopSending(this.handle, streamId, code >>> 0);
     }
 
-    setPaused(streamId: number, paused: boolean): void {
+    public setPaused(streamId: number, paused: boolean): void {
         if (this.handle) this.native.setPaused(this.handle, streamId, paused);
     }
 
-    sendDatagram(chunk: Uint8Array): Promise<boolean> {
+    public sendDatagram(chunk: Uint8Array): Promise<boolean> {
         if (!this.usable()) return Promise.resolve(false);
         const requestId = this.nextId();
         const d = deferred<boolean>();
@@ -193,16 +193,16 @@ export class Session {
         return d.promise;
     }
 
-    maxDatagramSize(): number {
+    public maxDatagramSize(): number {
         return this.handle ? this.native.maxDatagramSize(this.handle) : 0;
     }
 
-    close(code: number, reason: string): void {
+    public close(code: number, reason: string): void {
         if (this.closedState || !this.handle) return;
         this.native.closeSession(this.handle, code >>> 0, new TextEncoder().encode(reason));
     }
 
-    shutdown(): void {
+    public shutdown(): void {
         if (this.handle) this.native.shutdown(this.handle);
     }
 
@@ -217,22 +217,22 @@ export class Session {
 
     // ---- registration ---------------------------------------------------------
 
-    registerReceive(streamId: number, sink: ReceiveSink): void {
+    public registerReceive(streamId: number, sink: ReceiveSink): void {
         this.receives.set(streamId, sink);
     }
-    unregisterReceive(streamId: number): void {
+    public unregisterReceive(streamId: number): void {
         this.receives.delete(streamId);
     }
-    registerSend(streamId: number, sink: SendSink): void {
+    public registerSend(streamId: number, sink: SendSink): void {
         this.sends.set(streamId, sink);
     }
-    unregisterSend(streamId: number): void {
+    public unregisterSend(streamId: number): void {
         this.sends.delete(streamId);
     }
-    setIncomingHandler(handler: IncomingHandler): void {
+    public setIncomingHandler(handler: IncomingHandler): void {
         this.incoming = handler;
     }
-    setDatagramSink(sink: DatagramSink): void {
+    public setDatagramSink(sink: DatagramSink): void {
         this.datagramSink = sink;
     }
 
@@ -331,7 +331,7 @@ export class Session {
         if (this.handle) this.native.shutdown(this.handle);
     }
 
-    get isClosed(): boolean {
+    public get isClosed(): boolean {
         return this.closedState;
     }
 }

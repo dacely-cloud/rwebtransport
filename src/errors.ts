@@ -14,11 +14,11 @@ export interface WebTransportErrorOptions {
  */
 export class WebTransportError extends Error {
     /** Whether the error originated from a stream or the session as a whole. */
-    readonly source: WebTransportErrorSource;
+    public readonly source: WebTransportErrorSource;
     /** The application error code, if the error came from a stream reset. */
-    readonly streamErrorCode: number | null;
+    public readonly streamErrorCode: number | null;
 
-    constructor(message?: string, options: WebTransportErrorOptions = {}) {
+    public constructor(message?: string, options: WebTransportErrorOptions = {}) {
         super(message ?? 'WebTransport error');
         this.name = 'WebTransportError';
         this.source = options.source ?? 'session';

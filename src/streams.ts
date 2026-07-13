@@ -19,9 +19,10 @@ function errorCode(reason: unknown): number {
  * fills, the native side stops draining quiche, flow-controlling the peer.
  */
 export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
-    readonly #streamId: number;
+    /** The underlying QUIC stream id. */
+    public readonly streamId: number;
 
-    constructor(session: Session, streamId: number) {
+    public constructor(session: Session, streamId: number) {
         let controller!: ReadableStreamDefaultController<Uint8Array>;
         super(
             {
@@ -65,12 +66,7 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
             },
         });
 
-        this.#streamId = streamId;
-    }
-
-    /** The underlying QUIC stream id. */
-    get streamId(): number {
-        return this.#streamId;
+        this.streamId = streamId;
     }
 }
 
@@ -80,9 +76,10 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
  * backpressure gated by the peer's flow-control window.
  */
 export class WebTransportSendStream extends WritableStream<Uint8Array> {
-    readonly #streamId: number;
+    /** The underlying QUIC stream id. */
+    public readonly streamId: number;
 
-    constructor(session: Session, streamId: number) {
+    public constructor(session: Session, streamId: number) {
         let controller!: WritableStreamDefaultController;
         super(
             {
@@ -120,30 +117,17 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
             },
         });
 
-        this.#streamId = streamId;
-    }
-
-    /** The underlying QUIC stream id. */
-    get streamId(): number {
-        return this.#streamId;
+        this.streamId = streamId;
     }
 }
 
 /** A bidirectional WebTransport stream: a readable + a writable half. */
 export class WebTransportBidirectionalStream {
-    readonly #readable: WebTransportReceiveStream;
-    readonly #writable: WebTransportSendStream;
+    public readonly readable: WebTransportReceiveStream;
+    public readonly writable: WebTransportSendStream;
 
-    constructor(session: Session, streamId: number) {
-        this.#readable = new WebTransportReceiveStream(session, streamId);
-        this.#writable = new WebTransportSendStream(session, streamId);
-    }
-
-    get readable(): WebTransportReceiveStream {
-        return this.#readable;
-    }
-
-    get writable(): WebTransportSendStream {
-        return this.#writable;
+    public constructor(session: Session, streamId: number) {
+        this.readable = new WebTransportReceiveStream(session, streamId);
+        this.writable = new WebTransportSendStream(session, streamId);
     }
 }
