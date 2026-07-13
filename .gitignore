@@ -25,3 +25,6 @@ build-native.log
 
 # Local harness/session state
 .claude/
+
+# Example dev certificates (generate with examples/generate-cert.sh)
+examples/*.pem

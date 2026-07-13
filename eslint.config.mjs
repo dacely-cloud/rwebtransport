@@ -13,6 +13,8 @@ export default tseslint.config(
             'prebuilds/**',
             'node_modules/**',
             'scripts/**',
+            'examples/**',
+            'docs/**',
             '*.config.*',
             'eslint.config.mjs',
         ],
@@ -55,7 +57,12 @@ export default tseslint.config(
         },
     },
     {
-        files: ['**/*.js'],
+        files: ['**/*.js', '**/*.cjs', '**/*.mjs'],
         ...tseslint.configs.disableTypeChecked,
+        rules: {
+            ...tseslint.configs.disableTypeChecked.rules,
+            // Plain CommonJS / helper scripts legitimately use require().
+            '@typescript-eslint/no-require-imports': 'off',
+        },
     },
 );
