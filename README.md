@@ -51,8 +51,9 @@
 6. [How it works](#how-it-works)
 7. [Building from source](#building-from-source)
 8. [Testing](#testing)
-9. [Security &amp; the TLS profile](#security--the-tls-profile)
-10. [License](#license)
+9. [Robustness](#robustness)
+10. [Security &amp; the TLS profile](#security--the-tls-profile)
+11. [License](#license)
 
 </details>
 
@@ -296,7 +297,18 @@ End-to-end tests run the real client against a real WebTransport **echo server**
 npm test
 ```
 
-The suite exercises the QUIC handshake, Extended CONNECT, bidirectional echo, unidirectional streams, datagrams, backpressure, and graceful/error close paths.
+The suite exercises the QUIC handshake, Extended CONNECT, bidirectional echo, unidirectional streams, datagrams, backpressure, and graceful/error close paths — plus an **adversarial suite** that points a real client at a deliberately hostile server (rejected CONNECT, malformed QPACK, garbage frames, stream resets, mid-session close) and a careless caller (operations after close, oversized datagrams). All of it runs against a real quiche server, no mocks.
+
+---
+
+## Robustness
+
+The native core treats the server and the caller as untrusted:
+
+- **A panic can never crash Node.** The entire driver thread runs inside a panic boundary; a panic (or a fatal setup error) is surfaced as an `error` event that rejects `ready`/`closed` — it never aborts the process and never silently hangs the session.
+- **Bounded memory under flood.** A hostile server cannot grow memory without limit: event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), the datagram queue is bounded, HTTP/3 frame buffers are capped, and finished streams are pruned.
+- **No blocking on the event loop.** DNS resolution, the socket bind, and the QUIC handshake all run on the driver thread, so the constructor never blocks Node.
+- **Hostile input is fail-closed.** Malformed HTTP/3, bad QPACK, oversized frames, unexpected resets, and out-of-range numbers from JS are handled by rejecting/closing cleanly rather than panicking.
 
 ---
 
@@ -304,7 +316,7 @@ The suite exercises the QUIC handshake, Extended CONNECT, bidirectional echo, un
 
 By default the client advertises the **Google Chrome** TLS profile: Chrome's cipher-suite order, the `X25519 / P-256 / P-384` group preference, and Chrome's signature-algorithm list, negotiated as **TLS 1.3 only** (as QUIC requires). This makes the handshake indistinguishable from a browser's and maximizes compatibility with servers — including Cloudflare — that key behavior off the TLS ClientHello.
 
-Certificate verification follows the WebTransport model: full PKI validation by default, or explicit trust of a server certificate by its `sha-256` hash via `serverCertificateHashes`, exactly like the browser API.
+Certificate verification follows the WebTransport model: full PKI validation by default, or explicit trust of a server certificate by its `sha-256` hash via `serverCertificateHashes`, exactly like the browser API. The `insecure` option disables verification entirely and is intended for development only.
 
 ---
 

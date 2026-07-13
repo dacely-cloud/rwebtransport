@@ -177,14 +177,9 @@ impl Server {
         }
         // Datagrams: echo back verbatim.
         let mut dbuf = [0u8; 65_536];
-        loop {
-            match self.conn.dgram_recv(&mut dbuf) {
-                Ok(n) => {
-                    let data = dbuf[..n].to_vec();
-                    let _ = self.conn.dgram_send(&data);
-                }
-                Err(_) => break,
-            }
+        while let Ok(n) = self.conn.dgram_recv(&mut dbuf) {
+            let data = dbuf[..n].to_vec();
+            let _ = self.conn.dgram_send(&data);
         }
         // Readable streams.
         let readable: Vec<u64> = self.conn.readable().collect();
@@ -199,9 +194,7 @@ impl Server {
     }
 
     fn on_readable(&mut self, id: u64) {
-        if !self.streams.contains_key(&id) {
-            self.streams.insert(id, Stream::new(classify(id)));
-        }
+        self.streams.entry(id).or_insert_with(|| Stream::new(classify(id)));
         let mut chunk = Vec::new();
         let mut fin = false;
         let mut buf = [0u8; 16 * 1024];
@@ -335,13 +328,12 @@ impl Server {
     fn echo_uni(&mut self, data: &[u8], fin: bool) {
         // Open (or reuse) a server uni stream carrying the echoed bytes.
         let id = self.next_server_uni;
-        if !self.streams.contains_key(&id) {
+        self.streams.entry(id).or_insert_with(|| {
             let mut prefix = Vec::new();
             h3::put_varint(h3::WT_UNI_STREAM_TYPE, &mut prefix);
             h3::put_varint(CONNECT_ID, &mut prefix);
-            self.streams
-                .insert(id, Stream::with_prefix(Role::LocalControlPlane, prefix));
-        }
+            Stream::with_prefix(Role::LocalControlPlane, prefix)
+        });
         let s = self.streams.get_mut(&id).unwrap();
         s.queue(data);
         if fin {
@@ -420,11 +412,10 @@ impl Server {
             if s.reset_queued && !s.fin_sent {
                 let _ = self.conn.stream_shutdown(id, quiche::Shutdown::Write, 7);
                 s.fin_sent = true;
-            } else if s.out_off >= s.out.len() && s.fin_queued && !s.fin_sent {
-                if self.conn.stream_send(id, &[], true).is_ok() {
+            } else if s.out_off >= s.out.len() && s.fin_queued && !s.fin_sent
+                && self.conn.stream_send(id, &[], true).is_ok() {
                     s.fin_sent = true;
                 }
-            }
         }
     }
 
