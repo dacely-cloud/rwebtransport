@@ -151,11 +151,13 @@ export class WebTransportServer {
                 const err = new WebTransportError(ev.message, { source: 'session' });
                 this.readyD.reject(err);
                 this.closedD.reject(err);
+                this.finishAllSessions();
                 safeCloseController(this.incomingController);
                 return;
             }
             case 'serverClosed': {
                 this.closedD.resolve();
+                this.finishAllSessions();
                 safeCloseController(this.incomingController);
                 return;
             }
@@ -182,6 +184,17 @@ export class WebTransportServer {
         }
 
         this.sessions.get(sessionId)?.dispatch(ev);
+    }
+
+    /**
+     * Settle every live session when the server stops, so their `ready`/`closed`
+     * promises never hang and the session map does not leak.
+     */
+    private finishAllSessions(): void {
+        for (const core of this.sessions.values()) {
+            core.dispatch({ type: 'closed', code: 0, reason: new Uint8Array(), remote: false });
+        }
+        this.sessions.clear();
     }
 }
 

@@ -25,6 +25,10 @@ use crate::session::{Ev, WtSession};
 const LOCAL_CONN_ID_LEN: usize = 16;
 const MAX_INFLIGHT_BATCHES: i64 = 128;
 
+/// Hard cap on concurrent QUIC connections so a hostile client (or spoofed
+/// source addresses) cannot grow the connection table without bound.
+const MAX_CONNECTIONS: usize = 16_384;
+
 /// Everything the server thread needs to start listening.
 pub struct ServerSetup {
     pub host: String,
@@ -131,6 +135,32 @@ pub fn run(
     }
 }
 
+/// Mint a stateless Retry token binding the client's source address to the
+/// original destination connection id. A spoofed source never receives the
+/// Retry, so it cannot produce a valid token; this prevents both source-address
+/// spoofing (reflection) and per-connection state exhaustion from spoofed IPs.
+fn mint_token(orig_dcid: &[u8], src: &SocketAddr) -> Vec<u8> {
+    let mut token = Vec::with_capacity(4 + 16 + orig_dcid.len());
+    token.extend_from_slice(b"rwt1");
+    match src.ip() {
+        std::net::IpAddr::V4(a) => token.extend_from_slice(&a.octets()),
+        std::net::IpAddr::V6(a) => token.extend_from_slice(&a.octets()),
+    }
+    token.extend_from_slice(orig_dcid);
+    token
+}
+
+/// Validate a Retry token and recover the original destination connection id.
+fn validate_token<'a>(src: &SocketAddr, token: &'a [u8]) -> Option<quiche::ConnectionId<'a>> {
+    let rest = token.strip_prefix(b"rwt1")?;
+    let ip: Vec<u8> = match src.ip() {
+        std::net::IpAddr::V4(a) => a.octets().to_vec(),
+        std::net::IpAddr::V6(a) => a.octets().to_vec(),
+    };
+    let rest = rest.strip_prefix(ip.as_slice())?;
+    Some(quiche::ConnectionId::from_ref(rest))
+}
+
 fn random_scid() -> [u8; LOCAL_CONN_ID_LEN] {
     let mut b = [0u8; LOCAL_CONN_ID_LEN];
     if getrandom::getrandom(&mut b).is_err() {
@@ -228,16 +258,49 @@ fn run_inner(
                     if hdr.ty != quiche::Type::Initial {
                         continue;
                     }
-                    let scid_bytes = random_scid();
-                    let scid_id = quiche::ConnectionId::from_ref(&scid_bytes);
-                    let conn = match quiche::accept(&scid_id, None, local_addr, from, &mut config) {
-                        Ok(c) => c,
-                        Err(_) => continue,
+                    // Cap concurrent connections to bound memory under a flood.
+                    if clients.len() >= MAX_CONNECTIONS {
+                        continue;
+                    }
+
+                    let token = hdr.token.as_deref().unwrap_or(&[]);
+                    if token.is_empty() {
+                        // No address validation yet: reply with a stateless Retry.
+                        // We create no connection state (and do not amplify) for a
+                        // source that has not proven it owns its address.
+                        let new_scid = random_scid();
+                        let new_scid_id = quiche::ConnectionId::from_ref(&new_scid);
+                        let retry_token = mint_token(&hdr.dcid, &from);
+                        if let Ok(len) = quiche::retry(
+                            &hdr.scid,
+                            &hdr.dcid,
+                            &new_scid_id,
+                            &retry_token,
+                            hdr.version,
+                            &mut send_buf,
+                        ) {
+                            let _ = socket.send_to(&send_buf[..len], from);
+                        }
+                        continue;
+                    }
+
+                    // The client echoed a Retry token: validate it before we
+                    // allocate any connection state.
+                    let Some(odcid) = validate_token(&from, token) else {
+                        continue;
                     };
-                    let key = scid_bytes.to_vec();
+                    // Our Retry SCID, echoed back as this Initial's DCID.
+                    let scid_bytes = hdr.dcid.to_vec();
+                    let scid_id = quiche::ConnectionId::from_ref(&scid_bytes);
+                    let conn =
+                        match quiche::accept(&scid_id, Some(&odcid), local_addr, from, &mut config)
+                        {
+                            Ok(c) => c,
+                            Err(_) => continue,
+                        };
+                    let key = scid_bytes;
                     let session_id = next_session_id;
                     next_session_id += 1;
-                    routing.insert(hdr.dcid.to_vec(), key.clone());
                     routing.insert(key.clone(), key.clone());
                     sessions.insert(session_id, key.clone());
                     clients.insert(
@@ -262,11 +325,12 @@ fn run_inner(
             }
         }
 
-        // 2. Fire elapsed timeouts.
-        if !got_packet {
-            for server in clients.values_mut() {
-                server.conn.on_timeout();
-            }
+        // 2. Fire elapsed timeouts for every connection. quiche's on_timeout is a
+        // no-op unless a timer is actually due, and it must run even while packets
+        // keep arriving so idle/half-open connections are reaped under a flood.
+        let _ = got_packet;
+        for server in clients.values_mut() {
+            server.conn.on_timeout();
         }
 
         // 3. Drain commands.
@@ -303,6 +367,14 @@ fn run_inner(
                     .on_readable(&mut server.conn, id, backpressured, &mut evs);
             }
             server.session.flush(&mut server.conn, &mut evs);
+
+            // If the session ended (app close, or a rejected/malformed CONNECT),
+            // close the QUIC connection so it drains and gets reaped instead of
+            // lingering as a zombie until the idle timeout.
+            if server.session.is_closed() && !server.conn.is_closed() && !server.conn.is_draining()
+            {
+                let _ = server.conn.close(true, 0, b"session closed");
+            }
 
             if let Some(sz) = server.conn.dgram_max_writable_len() {
                 shared
