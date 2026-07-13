@@ -81,7 +81,12 @@ impl EventSink for NeonSink {
         // Count this batch as in flight to the JS loop; the driver reads this to
         // back off from pulling more data out of quiche when JS falls behind.
         self.shared.inflight.fetch_add(1, Ordering::Relaxed);
-        self.channel.send(move |mut cx| {
+        // `try_send`, not `send`: `send` panics if the callback cannot be
+        // scheduled (for example while the Node environment is shutting down),
+        // and that panic would unwind across the N-API C frame (undefined
+        // behaviour that aborts the process on some platforms). Failing the emit
+        // silently is the correct behaviour during teardown.
+        let result = self.channel.try_send(move |mut cx| {
             // Dequeued by the JS loop: no longer contributing to queue depth.
             shared.inflight.fetch_sub(1, Ordering::Relaxed);
             let f = cb.to_inner(&mut cx);
@@ -93,6 +98,10 @@ impl EventSink for NeonSink {
             }
             Ok(())
         });
+        if result.is_err() {
+            // The callback will never run, so undo the in-flight increment here.
+            self.shared.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -431,7 +440,9 @@ impl ServerEventSink for NeonServerSink {
         // Balance every emit (setup, teardown, and per-loop batches) so the
         // backpressure counter can never underflow and silently disable itself.
         self.shared.inflight.fetch_add(1, Ordering::Relaxed);
-        self.channel.send(move |mut cx| {
+        // `try_send`, not `send`: see NeonSink::emit. `send` would panic across
+        // the N-API boundary if the environment is shutting down.
+        let result = self.channel.try_send(move |mut cx| {
             shared.inflight.fetch_sub(1, Ordering::Relaxed);
             let f = cb.to_inner(&mut cx);
             for msg in &messages {
@@ -442,6 +453,9 @@ impl ServerEventSink for NeonServerSink {
             }
             Ok(())
         });
+        if result.is_err() {
+            self.shared.inflight.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 }
 
