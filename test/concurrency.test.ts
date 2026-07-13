@@ -48,8 +48,12 @@ function runWorker(server: EchoServer, message: string): Promise<WorkerResult> {
             },
         });
         worker.once('message', (m: WorkerResult) => {
-            void worker.terminate();
-            resolve(m);
+            // Wait for the worker (and its native driver thread) to fully exit
+            // before resolving, so no worker outlives the test into teardown.
+            worker.terminate().then(
+                () => resolve(m),
+                () => resolve(m),
+            );
         });
         worker.once('error', reject);
     });

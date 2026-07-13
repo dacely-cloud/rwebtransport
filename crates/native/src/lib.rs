@@ -47,6 +47,7 @@ struct SessionHandle {
     tx: Mutex<Option<Sender<Command>>>,
     waker: Arc<mio::Waker>,
     shared: Arc<DriverShared>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl SessionHandle {
@@ -62,8 +63,16 @@ impl SessionHandle {
 
 impl Finalize for SessionHandle {
     fn finalize<'a, C: Context<'a>>(self, _cx: &mut C) {
-        // Safety net if JS forgot to call shutdown() before GC.
+        // Tell the driver thread to stop, then JOIN it before returning. Finalize
+        // runs while the Node environment is still valid, so the thread drops its
+        // neon `Channel` and `Root` here rather than racing the environment's
+        // teardown from a detached thread (which crashes the process on Windows).
         self.send(Command::Shutdown);
+        if let Ok(mut guard) = self.thread.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -291,19 +300,20 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     };
 
     let shared_for_thread = shared.clone();
-    let spawned = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name("rwt-driver".into())
         .spawn(move || {
             driver::run(setup, poll, rx, sink, shared_for_thread);
-        });
-    if let Err(e) = spawned {
-        return cx.throw_error(format!("failed to spawn driver thread: {e}"));
-    }
+        }) {
+        Ok(h) => h,
+        Err(e) => return cx.throw_error(format!("failed to spawn driver thread: {e}")),
+    };
 
     Ok(cx.boxed(SessionHandle {
         tx: Mutex::new(Some(tx)),
         waker,
         shared,
+        thread: Mutex::new(Some(thread)),
     }))
 }
 
@@ -408,6 +418,7 @@ struct ServerHandle {
     tx: Mutex<Option<Sender<ServerCommand>>>,
     waker: Arc<mio::Waker>,
     shared: Arc<DriverShared>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl ServerHandle {
@@ -423,7 +434,15 @@ impl ServerHandle {
 
 impl Finalize for ServerHandle {
     fn finalize<'a, C: Context<'a>>(self, _cx: &mut C) {
+        // Stop and JOIN the server thread before finalize returns, so it never
+        // races the Node environment teardown from a detached thread. See
+        // SessionHandle::finalize.
         self.send(ServerCommand::Shutdown);
+        if let Ok(mut guard) = self.thread.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -493,19 +512,20 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
     };
 
     let shared_for_thread = shared.clone();
-    let spawned = std::thread::Builder::new()
+    let thread = match std::thread::Builder::new()
         .name("rwt-server".into())
         .spawn(move || {
             server::run(setup, poll, rx, sink, shared_for_thread);
-        });
-    if let Err(e) = spawned {
-        return cx.throw_error(format!("failed to spawn server thread: {e}"));
-    }
+        }) {
+        Ok(h) => h,
+        Err(e) => return cx.throw_error(format!("failed to spawn server thread: {e}")),
+    };
 
     Ok(cx.boxed(ServerHandle {
         tx: Mutex::new(Some(tx)),
         waker,
         shared,
+        thread: Mutex::new(Some(thread)),
     }))
 }
 
