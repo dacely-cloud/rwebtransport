@@ -342,7 +342,8 @@ fn run_inner(
         routing.retain(|_, scid| clients.contains_key(scid));
 
         if !out.is_empty() {
-            shared.inflight.fetch_add(1, Ordering::Relaxed);
+            // The sink increments `inflight` before scheduling and the JS
+            // callback decrements it, so every emit path stays balanced.
             sink.emit(out);
         }
     }

@@ -428,6 +428,9 @@ impl ServerEventSink for NeonServerSink {
     fn emit(&self, messages: Vec<ServerMsg>) {
         let cb = self.callback.clone();
         let shared = self.shared.clone();
+        // Balance every emit (setup, teardown, and per-loop batches) so the
+        // backpressure counter can never underflow and silently disable itself.
+        self.shared.inflight.fetch_add(1, Ordering::Relaxed);
         self.channel.send(move |mut cx| {
             shared.inflight.fetch_sub(1, Ordering::Relaxed);
             let f = cb.to_inner(&mut cx);

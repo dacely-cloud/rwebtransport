@@ -4,13 +4,13 @@
 
 ### WebTransport for Node.js. The real thing.
 
-#### A fully-compatible [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport) client **and server** for Node.js — the browser API, backed by Cloudflare **quiche** and **BoringSSL**, bound to Node through **neon**.
+#### A fully-compatible [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport) client **and** server for Node.js: the browser API, backed by Cloudflare **quiche** and **BoringSSL**, bound to Node through **neon**.
 
 <br/>
 
 **⚡ Native QUIC/HTTP-3.** Cloudflare's `quiche` transport, the engine that serves a large slice of the internet, linked straight into your Node process.
 
-**⚡ The standard API.** The same `WebTransport` class you use in Chrome — bidirectional and unidirectional streams as WHATWG streams, plus unreliable datagrams, over one multiplexed QUIC connection.
+**⚡ The standard API.** The same `WebTransport` class you use in Chrome: bidirectional and unidirectional streams as WHATWG streams, plus unreliable datagrams, over one multiplexed QUIC connection. And a matching server.
 
 <br/>
 
@@ -41,32 +41,34 @@
 1. [Why](#why)
 2. [Install](#install)
 3. [Quick start](#quick-start)
-4. [The API](#the-api)
+4. [The client API](#the-client-api)
    - [Connecting](#connecting)
    - [Bidirectional streams](#bidirectional-streams)
    - [Unidirectional streams](#unidirectional-streams)
    - [Datagrams](#datagrams)
    - [Closing](#closing)
-5. [Server](#server)
-6. [Requirements](#requirements)
-6. [How it works](#how-it-works)
-7. [Building from source](#building-from-source)
-8. [Testing](#testing)
-9. [Robustness](#robustness)
-10. [Security &amp; the TLS profile](#security--the-tls-profile)
-11. [License](#license)
+5. [The server API](#the-server-api)
+6. [Threading, workers, and cluster](#threading-workers-and-cluster)
+7. [Docs and examples](#docs-and-examples)
+8. [Requirements](#requirements)
+9. [How it works](#how-it-works)
+10. [Building from source](#building-from-source)
+11. [Testing](#testing)
+12. [Robustness](#robustness)
+13. [Security and the TLS profile](#security-and-the-tls-profile)
+14. [License](#license)
 
 </details>
 
 ---
 
-**WebTransport is the modern transport for realtime apps** — lower latency than WebSocket, multiple independent streams over one connection with no head-of-line blocking, and unreliable datagrams for the data you would rather drop than delay. Browsers have shipped it for years. Node.js has not.
+**WebTransport is the modern transport for realtime apps:** lower latency than WebSocket, multiple independent streams over one connection with no head-of-line blocking, and unreliable datagrams for the data you would rather drop than delay. Browsers have shipped it for years. Node.js has not.
 
-`rwebtransport` closes that gap. It is not an emulation over HTTP/2 or a WebSocket shim — it is a genuine HTTP/3 client speaking QUIC on UDP/443, built on the same [Cloudflare quiche](https://github.com/cloudflare/quiche) engine that powers WebTransport at scale, exposed through the exact `WebTransport` API you already know from the browser.
+`rwebtransport` closes that gap. It is not an emulation over HTTP/2 or a WebSocket shim. It is a genuine HTTP/3 endpoint speaking QUIC over UDP, built on the same [Cloudflare quiche](https://github.com/cloudflare/quiche) engine that powers WebTransport at scale, exposed through the exact `WebTransport` API you already know from the browser, plus a matching `WebTransportServer`.
 
-QUIC + HTTP/3 + WebTransport, implemented natively in Rust. It ships with prebuilt binaries — no QUIC server round-trips through a browser, no polyfills, no HTTP/2 emulation, just an actual HTTP/3 datagram on the wire. And it provides the full standard surface: `WebTransport`, `WebTransportBidirectionalStream`, `WebTransportSendStream` / `ReceiveStream` as WHATWG streams, and `WebTransportDatagramDuplexStream`, all matching the [W3C spec](https://w3c.github.io/webtransport/).
+QUIC + HTTP/3 + WebTransport, implemented natively in Rust. It ships with prebuilt binaries. No round-trips through a browser, no polyfills, no HTTP/2 emulation, just an actual HTTP/3 datagram on the wire. And it provides the full standard surface: `WebTransport`, `WebTransportBidirectionalStream`, `WebTransportSendStream` and `WebTransportReceiveStream` as WHATWG streams, and `WebTransportDatagramDuplexStream`, all matching the [W3C spec](https://w3c.github.io/webtransport/).
 
-By default the client also puts **Chrome on the wire**: the TLS profile advertises Google Chrome's cipher suites, curve preferences, and signature algorithms, so your handshake looks like a browser's — see [Security &amp; the TLS profile](#security--the-tls-profile).
+By default the client also puts **Chrome on the wire**: the TLS profile advertises Google Chrome's cipher suites, curve preferences, and signature algorithms, so your handshake looks like a browser's. See [Security and the TLS profile](#security-and-the-tls-profile).
 
 ```bash
 npm install rwebtransport
@@ -84,7 +86,7 @@ await writer.write(new TextEncoder().encode('hello over QUIC'));
 await writer.close();
 
 const { value } = await stream.readable.getReader().read();
-console.log(new TextDecoder().decode(value)); // -> "hello over QUIC"
+console.log(new TextDecoder().decode(value)); // "hello over QUIC"
 ```
 
 ---
@@ -97,10 +99,10 @@ console.log(new TextDecoder().decode(value)); // -> "hello over QUIC"
 | Head-of-line blocking | Yes, one stream | **No**, independent streams |
 | Multiple streams | One per connection | **Many**, multiplexed |
 | Unreliable messages | ✗ | **Datagrams** ✓ |
-| 0-RTT / fast reconnect | ✗ | On the roadmap |
+| Client and server | ✗ (server only) | **Both**, one package |
 | Browser-identical API | ✗ | **✓ WHATWG `WebTransport`** |
 
-If you are building game netcode, live media, collaborative editing, financial tick feeds, or anything where a stalled TCP segment must not freeze every other message, this is the transport you want — and now you can share client code between the browser and the server.
+If you are building game netcode, live media, collaborative editing, financial tick feeds, or anything where a stalled TCP segment must not freeze every other message, this is the transport you want, and now you can share client code between the browser and Node.
 
 ---
 
@@ -114,7 +116,7 @@ pnpm add rwebtransport
 yarn add rwebtransport
 ```
 
-Prebuilt native binaries are shipped for **Node 24 and Node 26** on **Linux, macOS, and Windows** (x64 + arm64). If a matching prebuilt binary is not found for your platform, the package **compiles the Rust core automatically** at install time — this needs a [Rust toolchain](https://rustup.rs), `cmake`, and a C/C++ compiler (BoringSSL is built from source). See [Building from source](#building-from-source).
+Prebuilt native binaries are shipped for **Node 24 and Node 26** on **Linux, macOS, and Windows** (x64 and arm64). If a matching prebuilt binary is not found for your platform, the package **compiles the Rust core automatically** at install time. That needs a [Rust toolchain](https://rustup.rs), `cmake`, and a C/C++ compiler (BoringSSL is built from source). See [Building from source](#building-from-source).
 
 ---
 
@@ -123,7 +125,7 @@ Prebuilt native binaries are shipped for **Node 24 and Node 26** on **Linux, mac
 ```ts
 import { WebTransport } from 'rwebtransport';
 
-// 1. Open a session (QUIC handshake + HTTP/3 Extended CONNECT).
+// 1. Open a session (QUIC handshake plus HTTP/3 Extended CONNECT).
 const wt = new WebTransport('https://localhost:4433/chat', {
   // Trust a specific self-signed cert by its SHA-256, exactly like the browser API:
   serverCertificateHashes: [{ algorithm: 'sha-256', value: certHashBytes }],
@@ -135,18 +137,22 @@ const dgramWriter = wt.datagrams.writable.getWriter();
 await dgramWriter.write(new Uint8Array([1, 2, 3]));
 
 // 3. Accept streams the server opens.
-for await (const receive of readable(wt.incomingUnidirectionalStreams)) {
-  const bytes = await drain(receive);
-  console.log('server pushed', bytes.length, 'bytes');
+const reader = wt.incomingUnidirectionalStreams.getReader();
+const { value: receive } = await reader.read();
+if (receive) {
+  const { value: bytes } = await receive.getReader().read();
+  console.log('server pushed', bytes?.length ?? 0, 'bytes');
 }
 
 // 4. Close.
 wt.close({ closeCode: 0, reason: 'bye' });
 ```
 
+Runnable versions of these live in [`examples/`](./examples).
+
 ---
 
-## The API
+## The client API
 
 `rwebtransport` implements the [W3C WebTransport](https://w3c.github.io/webtransport/) interface. If you have used it in a browser, you already know this library.
 
@@ -154,33 +160,36 @@ wt.close({ closeCode: 0, reason: 'bye' });
 
 ```ts
 const wt = new WebTransport(url, options?);
-await wt.ready;                 // resolves when the session is established
-await wt.closed;                // resolves/rejects when the session ends
+await wt.ready;   // resolves when the session is established, rejects if it fails
+await wt.closed;  // resolves when the session ends cleanly, rejects on abnormal close
 ```
 
 | Option | Type | Meaning |
 |---|---|---|
-| `serverCertificateHashes` | `{ algorithm: 'sha-256', value: BufferSource }[]` | Accept a server cert by hash (self-signed / pinned). |
-| `allowPooling` | `boolean` | Allow reusing a pooled QUIC connection. |
-| `congestionControl` | `'default' \| 'throughput' \| 'low-latency'` | Hint for the congestion controller. |
-| `requireUnreliable` | `boolean` | Fail if datagrams are unavailable. |
+| `serverCertificateHashes` | `{ algorithm: 'sha-256', value: BufferSource }[]` | Accept a server cert by its SHA-256 fingerprint (self-signed or pinned). Bypasses CA and hostname checks for the matching cert, exactly like the browser. |
+| `insecure` | `boolean` | Node extension. Disable **all** certificate verification. Development only. |
+| `headers` | `Record<string, string>` | Node extension. Extra request headers on the Extended CONNECT. |
+| `origin` | `string` | Node extension. Value for the `Origin` request header. |
+| `allowPooling`, `requireUnreliable`, `congestionControl` | | Accepted for spec parity; currently informational. |
+
+When neither `serverCertificateHashes` nor `insecure` is set, the client performs full PKI validation against the system trust store with hostname checking.
 
 ### Bidirectional streams
 
 ```ts
 const stream = await wt.createBidirectionalStream();
-// stream.readable  : WebTransportReceiveStream (ReadableStream<Uint8Array>)
-// stream.writable  : WebTransportSendStream    (WritableStream<Uint8Array>)
+// stream.readable : WebTransportReceiveStream (a ReadableStream<Uint8Array>)
+// stream.writable : WebTransportSendStream    (a WritableStream<Uint8Array>)
 
-for await (const stream of readable(wt.incomingBidirectionalStreams)) {
-  // handle a stream the peer opened
-}
+// Streams the peer opens:
+const reader = wt.incomingBidirectionalStreams.getReader();
+const { value: peerStream } = await reader.read();
 ```
 
 ### Unidirectional streams
 
 ```ts
-const send = await wt.createUnidirectionalStream(); // WritableStream<Uint8Array>
+const send = await wt.createUnidirectionalStream(); // a WritableStream<Uint8Array>
 const writer = send.getWriter();
 await writer.write(payload);
 await writer.close();
@@ -193,9 +202,9 @@ const writer = wt.datagrams.writable.getWriter();
 await writer.write(new Uint8Array([0xde, 0xad]));
 
 const reader = wt.datagrams.readable.getReader();
-const { value } = await reader.read(); // Uint8Array | undefined
+const { value } = await reader.read(); // Uint8Array or undefined
 
-wt.datagrams.maxDatagramSize; // largest payload that will fit in one packet
+wt.datagrams.maxDatagramSize; // largest payload that fits in one packet
 ```
 
 ### Closing
@@ -207,9 +216,9 @@ await wt.closed;
 
 ---
 
-## Server
+## The server API
 
-The same package ships a **WebTransport server**. Bind a UDP port with a certificate, then consume `incomingSessions` — each is a `WebTransportServerSession` with the exact same stream and datagram surface as the client `WebTransport`.
+The same package ships a **WebTransport server**. Bind a UDP port with a certificate, then consume `incomingSessions`. Each is a `WebTransportServerSession` with the exact same stream and datagram surface as the client `WebTransport`.
 
 ```ts
 import { WebTransportServer } from 'rwebtransport';
@@ -217,8 +226,8 @@ import { WebTransportServer } from 'rwebtransport';
 const server = new WebTransportServer({
   port: 4433,
   host: '0.0.0.0',
-  cert: '/path/to/cert.pem', // PEM certificate chain
-  key: '/path/to/key.pem', // PEM private key
+  cert: '/path/to/cert.pem', // PEM certificate chain (file path)
+  key: '/path/to/key.pem',   // PEM private key (file path)
 });
 await server.ready;
 console.log('listening on', server.port);
@@ -240,19 +249,34 @@ for (;;) {
     }
   })();
 
-  // Open a stream / send a datagram from the server side:
+  // Open a stream or send a datagram from the server side:
   const outbound = await session.createUnidirectionalStream();
   await outbound.getWriter().write(new TextEncoder().encode('welcome'));
 }
 ```
 
-`WebTransportServerSession` exposes `ready`, `closed`, `datagrams`, `createBidirectionalStream()`, `createUnidirectionalStream()`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, and `close()` — identical to the client — plus the request metadata (`authority`, `path`, `origin`, `headers`). The server is powered by the same quiche engine and inherits the same panic containment and hostile-peer hardening as the client.
+`WebTransportServerSession` exposes `ready`, `closed`, `datagrams`, `createBidirectionalStream()`, `createUnidirectionalStream()`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, and `close()`, identical to the client, plus the request metadata (`authority`, `path`, `origin`, `headers`). The server runs on the same quiche engine and inherits the same panic containment and hostile-peer hardening as the client.
+
+---
+
+## Threading, workers, and cluster
+
+- **Threading.** Each session runs its QUIC/HTTP-3 work on its own background thread and talks to the JS event loop through neon's `Channel`. Every hand-off is non-blocking (an unbounded command channel, a non-blocking event channel, atomics), so the library never deadlocks internally; it only ever applies backpressure. The one way to wedge a stream is the universal one: writing a large bidirectional stream without concurrently reading it. Read while you write.
+- **`worker_threads`.** Fully supported. The addon is context-aware, so a client or server can be created inside any Worker and each Worker gets its own instance bound to its own event loop. Multiple Workers run concurrently.
+- **`cluster`.** Clients work as-is (each process is independent). A server binds a UDP socket without `SO_REUSEPORT`, so multiple cluster workers cannot currently share a single listening port; run one server per port, or put a UDP load balancer in front.
+
+---
+
+## Docs and examples
+
+- **[`docs/`](./docs)** is the full guide: getting started, the client and server APIs in depth, streams and backpressure, datagrams, certificates and TLS, error handling, threading, building, and troubleshooting.
+- **[`examples/`](./examples)** has runnable client and server programs and a one-file end-to-end demo.
 
 ---
 
 ## Requirements
 
-- **Node.js 24.x or 26.x.** No other versions are supported — the native ABI is built and tested against exactly these.
+- **Node.js 24.x or 26.x.** No other versions are supported; the native ABI is built and tested against exactly these.
 - **Linux, macOS, or Windows** (x64 or arm64).
 - To build from source: **Rust** (stable), **cmake**, and a **C/C++ toolchain** (plus **NASM** on Windows) for BoringSSL.
 
@@ -267,29 +291,29 @@ flowchart TB
     classDef net fill:#0c1a14,stroke:#10b981,stroke-width:2px,color:#c8f5e2;
 
     subgraph APP["your code"]
-      YOU["import { WebTransport } from 'rwebtransport'"]
+      YOU["import { WebTransport, WebTransportServer } from 'rwebtransport'"]
     end
 
-    subgraph TS["TypeScript layer — WHATWG surface"]
+    subgraph TS["TypeScript layer, the WHATWG surface"]
       direction TB
-      WTAPI["WebTransport / streams / datagrams<br/>ReadableStream + WritableStream + backpressure<br/>ready / closed promises"]
+      WTAPI["WebTransport / WebTransportServer / streams / datagrams<br/>ReadableStream + WritableStream + backpressure<br/>ready / closed promises"]
       LOADER["loader: pick prebuilt .node<br/>else compile via cargo"]
     end
 
-    subgraph NATIVE["native addon — Rust (neon / N-API)"]
+    subgraph NATIVE["native addon in Rust (neon / N-API)"]
       direction TB
       BIND["neon bindings<br/>commands in, events out (Channel)"]
       DRIVER["driver thread<br/>UDP socket + quiche recv/send/timeout loop"]
-      H3WT["H3 + WebTransport<br/>control streams · SETTINGS · Extended CONNECT<br/>QPACK · 0x54/0x41 stream signals · datagram quarter-id"]
-      TLS["TLS config<br/>Chrome cipher suites · X25519/P-256/P-384 · TLS 1.3"]
+      H3WT["H3 + WebTransport (dual-role)<br/>control streams, SETTINGS, Extended CONNECT<br/>QPACK, 0x54/0x41 stream signals, datagram quarter-id"]
+      TLS["TLS config<br/>Chrome cipher suites, X25519/P-256/P-384, TLS 1.3"]
     end
 
     subgraph ENGINE["vendored engine"]
-      QUICHE["Cloudflare quiche 0.29 — QUIC transport + HTTP/3"]
-      BSSL["BoringSSL — TLS 1.3 handshake"]
+      QUICHE["Cloudflare quiche 0.29, QUIC transport and HTTP/3"]
+      BSSL["BoringSSL for the TLS 1.3 handshake"]
     end
 
-    WIRE["UDP / 443 — QUIC · HTTP/3 · WebTransport"]
+    WIRE["UDP, QUIC, HTTP/3, WebTransport"]
 
     YOU --> WTAPI
     WTAPI --> LOADER
@@ -306,10 +330,10 @@ flowchart TB
     class QUICHE,BSSL,WIRE net;
 ```
 
-1. **The TypeScript layer** presents the exact browser `WebTransport` API and maps it onto WHATWG `ReadableStream`/`WritableStream`, wiring up backpressure both ways.
+1. **The TypeScript layer** presents the browser `WebTransport` API (and `WebTransportServer`) and maps it onto WHATWG `ReadableStream`/`WritableStream`, wiring up backpressure both ways.
 2. **The neon binding** turns JS calls into commands for a dedicated **driver thread** and delivers asynchronous events (stream data, datagrams, session state) back to the event loop.
 3. **The driver thread** owns a UDP socket and runs the **quiche** connection: reading packets, writing packets, arming timers.
-4. **The H3/WebTransport layer** — since quiche does not itself speak WebTransport — implements the HTTP/3 control streams, the `SETTINGS` exchange, QPACK-encoded **Extended CONNECT**, the `0x54`/`0x41` stream signals, and the RFC 9297 quarter-stream-id datagram framing, all on top of quiche's raw QUIC streams.
+4. **The H3/WebTransport layer**, since quiche does not itself speak WebTransport, implements the HTTP/3 control streams, the `SETTINGS` exchange, QPACK-encoded **Extended CONNECT** (sent by the client, answered by the server), the `0x54`/`0x41` stream signals, and the RFC 9297 quarter-stream-id datagram framing, all on top of quiche's raw QUIC streams. The state machine is dual-role, so client and server share one hardened implementation.
 5. **BoringSSL**, configured with a Chrome-like TLS profile, performs the TLS 1.3 handshake inside QUIC.
 
 ---
@@ -320,10 +344,10 @@ flowchart TB
 git clone https://github.com/dacely-cloud/rwebtransport
 cd rwebtransport
 npm install
-npm run build         # cargo build + copy .node + bundle TS
+npm run build         # cargo build, copy .node, bundle TS
 ```
 
-The native crate lives in `crates/native`, the QUIC engine is vendored under `vendor/quiche`, and the compiled addon is written to `prebuilds/<platform>-<arch>/rwebtransport.node`.
+The native crates live in `crates/`, the QUIC engine is vendored under `vendor/quiche`, and the compiled addon is written to `prebuilds/<platform>-<arch>/rwebtransport.node`.
 
 ```bash
 npm run build:rust        # release build of the native addon
@@ -335,30 +359,34 @@ npm run build:ts          # bundle the TypeScript layer
 
 ## Testing
 
-End-to-end tests run the real client against a real WebTransport **echo server** (also built on quiche, in `crates/echo-server`) spawned by the test harness — no mocks.
+End-to-end tests run the real client and the real server against each other and against a dedicated quiche echo-server fixture. No mocks.
 
 ```bash
 npm test
 ```
 
-The suite exercises the QUIC handshake, Extended CONNECT, bidirectional echo, unidirectional streams, datagrams, backpressure, and graceful/error close paths — plus an **adversarial suite** that points a real client at a deliberately hostile server (rejected CONNECT, malformed QPACK, garbage frames, stream resets, mid-session close) and a careless caller (operations after close, oversized datagrams). All of it runs against a real quiche server, no mocks.
+The suite covers the QUIC handshake, Extended CONNECT, bidirectional and unidirectional streams, datagrams, backpressure, and graceful and error close paths. It also includes:
+
+- an **adversarial suite** that points a real client at a deliberately hostile server (rejected CONNECT, malformed QPACK, garbage frames, stream resets, mid-session close) and a careless caller (operations after close, oversized datagrams);
+- **server** tests where our own client drives our own server (bidi echo, large payloads, unidirectional echo, datagrams, concurrent sessions);
+- **`worker_threads`** tests (a client running inside a Worker, multiple Workers concurrently) and a **deadlock-freedom** test (a payload larger than every flow-control window echoed with concurrent read and write).
 
 ---
 
 ## Robustness
 
-The native core treats the server and the caller as untrusted:
+The native core treats the peer and the caller as untrusted, on both the client and the server:
 
-- **A panic can never crash Node.** The entire driver thread runs inside a panic boundary; a panic (or a fatal setup error) is surfaced as an `error` event that rejects `ready`/`closed` — it never aborts the process and never silently hangs the session.
-- **Bounded memory under flood.** A hostile server cannot grow memory without limit: event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), the datagram queue is bounded, HTTP/3 frame buffers are capped, and finished streams are pruned.
+- **A panic can never crash Node.** The entire driver thread runs inside a panic boundary; a panic (or a fatal setup error) is surfaced as an `error` event that rejects `ready`/`closed`. It never aborts the process and never silently hangs the session.
+- **Bounded memory under flood.** A hostile peer cannot grow memory without limit: event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), the datagram queue is bounded, HTTP/3 frame buffers are capped, and finished streams are pruned.
 - **No blocking on the event loop.** DNS resolution, the socket bind, and the QUIC handshake all run on the driver thread, so the constructor never blocks Node.
-- **Hostile input is fail-closed.** Malformed HTTP/3, bad QPACK, oversized frames, unexpected resets, and out-of-range numbers from JS are handled by rejecting/closing cleanly rather than panicking.
+- **Hostile input is fail-closed.** Malformed HTTP/3, bad QPACK, oversized frames, unexpected resets, and out-of-range numbers from JS are handled by rejecting or closing cleanly rather than panicking.
 
 ---
 
-## Security & the TLS profile
+## Security and the TLS profile
 
-By default the client advertises the **Google Chrome** TLS profile: Chrome's cipher-suite order, the `X25519 / P-256 / P-384` group preference, and Chrome's signature-algorithm list, negotiated as **TLS 1.3 only** (as QUIC requires). This makes the handshake indistinguishable from a browser's and maximizes compatibility with servers — including Cloudflare — that key behavior off the TLS ClientHello.
+By default the client advertises the **Google Chrome** TLS profile: Chrome's cipher-suite order, the `X25519 / P-256 / P-384` group preference, and Chrome's signature-algorithm list, negotiated as **TLS 1.3 only** (as QUIC requires). This makes the handshake indistinguishable from a browser's and maximizes compatibility with servers (including Cloudflare) that key behavior off the TLS ClientHello.
 
 Certificate verification follows the WebTransport model: full PKI validation by default, or explicit trust of a server certificate by its `sha-256` hash via `serverCertificateHashes`, exactly like the browser API. The `insecure` option disables verification entirely and is intended for development only.
 
@@ -366,7 +394,7 @@ Certificate verification follows the WebTransport model: full PKI validation by 
 
 ## License
 
-[Apache-2.0](./LICENSE). Vendored components (Cloudflare quiche, BoringSSL, neon) remain under their own licenses — see [NOTICE](./NOTICE).
+[Apache-2.0](./LICENSE). Vendored components (Cloudflare quiche, BoringSSL, neon) remain under their own licenses. See [NOTICE](./NOTICE).
 
 <div align="center">
 <sub>Built by <a href="https://github.com/dacely-cloud">Dacely Cloud</a>.</sub>

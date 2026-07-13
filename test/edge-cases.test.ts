@@ -85,6 +85,22 @@ describe('Connection setup', () => {
     });
 });
 
+describe('Datagram stream lifecycle', () => {
+    it('closes the inbound datagram stream when the session closes (no hang)', async () => {
+        const server = await echoServer();
+        const wt = new WebTransport(server.url, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: server.certHash }],
+        });
+        await wt.ready;
+        const reader = wt.datagrams.readable.getReader();
+        wt.close();
+        await wt.closed.catch(() => undefined);
+        // Must resolve `done`, not hang (a hang would fail via the test timeout).
+        const { done } = await reader.read();
+        expect(done).toBe(true);
+    });
+});
+
 describe('Datagram flood resilience', () => {
     it('stays responsive while receiving a large datagram burst', async () => {
         const server = await echoServer();

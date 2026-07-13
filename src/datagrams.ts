@@ -41,6 +41,25 @@ export class WebTransportDatagramDuplexStream {
             }
         });
 
+        // Close the inbound datagram stream when the session ends, otherwise a
+        // reader awaiting read() would hang forever after close.
+        void session.closed.promise.then(
+            () => {
+                try {
+                    rController.close();
+                } catch {
+                    // already closed
+                }
+            },
+            () => {
+                try {
+                    rController.close();
+                } catch {
+                    // already closed
+                }
+            },
+        );
+
         this.writable = new WritableStream<Uint8Array>(
             {
                 write: (chunk) => session.sendDatagram(chunk).then(() => undefined),
