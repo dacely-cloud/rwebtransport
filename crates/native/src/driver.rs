@@ -1,0 +1,253 @@
+// SPDX-License-Identifier: Apache-2.0
+//! The per-session driver thread: a mio event loop that owns the UDP socket and
+//! the quiche connection, feeds packets to [`crate::session::WtSession`], and
+//! ferries commands in and events out.
+
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::Receiver;
+use std::sync::Arc;
+use std::time::Instant;
+
+use mio::net::UdpSocket;
+use mio::{Events, Poll, Token};
+
+use crate::session::{Ev, WtSession};
+
+pub const SOCKET_TOKEN: Token = Token(0);
+pub const WAKE_TOKEN: Token = Token(1);
+
+/// State shared between the driver thread and the JS-facing handle so that
+/// synchronous property reads (e.g. `datagrams.maxDatagramSize`) don't require a
+/// round trip through the command channel.
+#[derive(Default)]
+pub struct DriverShared {
+    pub max_datagram_size: AtomicUsize,
+    pub ready: AtomicBool,
+    pub closed: AtomicBool,
+}
+
+/// Commands sent from JS (via the neon layer) into the driver thread.
+pub enum Command {
+    OpenStream { request_id: u64, bidi: bool },
+    Write { id: u64, data: Vec<u8>, request_id: u64 },
+    Fin { id: u64 },
+    ResetStream { id: u64, code: u64 },
+    StopSending { id: u64, code: u64 },
+    SetPaused { id: u64, paused: bool },
+    SendDatagram { data: Vec<u8>, request_id: u64 },
+    Close { code: u32, reason: Vec<u8> },
+    /// Tear the driver down (the JS handle was closed/GC'd).
+    Shutdown,
+}
+
+/// Sink for events produced by the driver. Implemented by the neon layer using a
+/// `neon::event::Channel`.
+pub trait EventSink: Send {
+    fn emit(&self, events: Vec<Ev>);
+}
+
+/// Run the driver loop until the connection closes or a fatal error occurs.
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    mut poll: Poll,
+    mut socket: UdpSocket,
+    local_addr: std::net::SocketAddr,
+    mut conn: quiche::Connection,
+    mut session: WtSession,
+    rx: Receiver<Command>,
+    sink: Box<dyn EventSink>,
+    shared: Arc<DriverShared>,
+) {
+    if let Err(e) = poll
+        .registry()
+        .register(&mut socket, SOCKET_TOKEN, mio::Interest::READABLE)
+    {
+        sink.emit(vec![Ev::Error(format!("failed to register socket: {e}"))]);
+        return;
+    }
+
+    let mut events = Events::with_capacity(1024);
+    let mut recv_buf = vec![0u8; 65_535];
+    let mut send_buf = vec![0u8; 1350];
+
+    let debug = std::env::var("RWT_DEBUG").is_ok();
+    let mut established_logged = false;
+    if debug {
+        eprintln!("[rwt-driver] start local={local_addr}");
+    }
+
+    // Prime the handshake (send the client Initial).
+    flush_send(&mut conn, &socket, &mut send_buf, debug);
+
+    loop {
+        let timeout = conn.timeout();
+        if let Err(e) = poll.poll(&mut events, timeout) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            sink.emit(vec![Ev::Error(format!("poll error: {e}"))]);
+            return;
+        }
+
+        let mut evs: Vec<Ev> = Vec::new();
+        let mut shutdown = false;
+
+        // 1. Read all datagrams the socket has.
+        let mut got_packet = false;
+        loop {
+            match socket.recv_from(&mut recv_buf) {
+                Ok((len, from)) => {
+                    got_packet = true;
+                    if debug {
+                        eprintln!("[rwt-driver] recv {len} bytes from {from}");
+                    }
+                    let info = quiche::RecvInfo {
+                        from,
+                        to: local_addr,
+                    };
+                    match conn.recv(&mut recv_buf[..len], info) {
+                        Ok(_) => {}
+                        Err(quiche::Error::Done) => {}
+                        Err(e) => {
+                            if debug {
+                                eprintln!("[rwt-driver] recv err {e:?}");
+                            }
+                            evs.push(Ev::Error(format!("quic recv: {e:?}")));
+                        }
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    evs.push(Ev::Error(format!("socket recv: {e}")));
+                    break;
+                }
+            }
+        }
+
+        // 2. Fire the timeout if nothing else woke us.
+        if !got_packet && events.is_empty() {
+            conn.on_timeout();
+        }
+
+        // 3. Drain commands.
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                Command::OpenStream { request_id, bidi } => {
+                    session.open_stream(bidi, request_id, &mut evs)
+                }
+                Command::Write { id, data, request_id } => {
+                    session.stream_write(id, data, request_id, &mut evs)
+                }
+                Command::Fin { id } => session.stream_fin(id),
+                Command::ResetStream { id, code } => {
+                    session.stream_reset(&mut conn, id, code)
+                }
+                Command::StopSending { id, code } => {
+                    session.stream_stop_sending(&mut conn, id, code)
+                }
+                Command::SetPaused { id, paused } => session.set_paused(id, paused),
+                Command::SendDatagram { data, request_id } => {
+                    session.send_datagram(&mut conn, &data, request_id, &mut evs)
+                }
+                Command::Close { code, reason } => session.close(code, reason),
+                Command::Shutdown => {
+                    shutdown = true;
+                    break;
+                }
+            }
+        }
+
+        if shutdown {
+            let _ = conn.close(true, 0, b"");
+            flush_send(&mut conn, &socket, &mut send_buf, debug);
+            return;
+        }
+
+        // 4. Drive the session forward.
+        if conn.is_established() {
+            if debug && !established_logged {
+                established_logged = true;
+                eprintln!("[rwt-driver] QUIC established, alpn={:?}", conn.application_proto());
+            }
+            session.on_established(&mut evs);
+        }
+        session.on_datagrams(&mut conn, &mut evs);
+
+        let readable: Vec<u64> = conn.readable().collect();
+        for id in readable {
+            session.on_readable(&mut conn, id, &mut evs);
+        }
+
+        session.flush(&mut conn, &mut evs);
+
+        // 5. Send everything queued.
+        flush_send(&mut conn, &socket, &mut send_buf, debug);
+
+        // Publish synchronously-readable state.
+        shared
+            .max_datagram_size
+            .store(session.max_datagram_size(&conn), Ordering::Relaxed);
+        shared.ready.store(session.is_ready(), Ordering::Relaxed);
+
+        // 6. Terminal state?
+        if conn.is_closed() {
+            if !session.is_closed() {
+                let (code, reason, remote) = closure_info(&conn);
+                session.mark_closed(&mut evs, code, reason, remote);
+            }
+            shared.closed.store(true, Ordering::Relaxed);
+            if !evs.is_empty() {
+                sink.emit(evs);
+            }
+            return;
+        }
+
+        if !evs.is_empty() {
+            sink.emit(evs);
+        }
+    }
+}
+
+/// Drain quiche's send queue to the socket.
+fn flush_send(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8], debug: bool) {
+    loop {
+        match conn.send(out) {
+            Ok((write, info)) => {
+                // Ignore pacing (`info.at`); send immediately.
+                let _ = info.at;
+                if debug {
+                    eprintln!("[rwt-driver] send {write} bytes to {}", info.to);
+                }
+                if let Err(e) = socket.send_to(&out[..write], info.to) {
+                    if debug {
+                        eprintln!("[rwt-driver] send_to err {e}");
+                    }
+                    if e.kind() == std::io::ErrorKind::WouldBlock {
+                        // Socket buffer full; try again on the next wake.
+                        return;
+                    }
+                }
+            }
+            Err(quiche::Error::Done) => return,
+            Err(e) => {
+                if debug {
+                    eprintln!("[rwt-driver] send err {e:?}");
+                }
+                return;
+            }
+        }
+    }
+}
+
+/// Extract a close code/reason from a terminated connection.
+fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool) {
+    if let Some(err) = conn.peer_error() {
+        return (err.error_code as u32, err.reason.clone(), true);
+    }
+    if let Some(err) = conn.local_error() {
+        return (err.error_code as u32, err.reason.clone(), false);
+    }
+    // Idle timeout / no explicit error.
+    let _ = Instant::now();
+    (0, Vec::new(), true)
+}

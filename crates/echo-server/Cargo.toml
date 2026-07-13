@@ -11,6 +11,7 @@ name = "wt-echo-server"
 path = "src/main.rs"
 
 [dependencies]
+wtcore.workspace = true
 quiche.workspace = true
 boring.workspace = true
 boring-sys.workspace = true

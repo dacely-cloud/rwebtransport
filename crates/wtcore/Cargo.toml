@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "rwebtransport-wtcore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "wtcore"
+path = "src/lib.rs"
+
+[dependencies]
+quiche.workspace = true
+octets.workspace = true

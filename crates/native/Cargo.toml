@@ -12,8 +12,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 neon = { version = "1", default-features = false, features = ["napi-8"] }
+wtcore.workspace = true
 quiche.workspace = true
 boring.workspace = true
 boring-sys.workspace = true
 octets.workspace = true
 log.workspace = true
+mio.workspace = true
+getrandom.workspace = true

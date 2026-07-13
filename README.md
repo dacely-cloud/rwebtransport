@@ -6,17 +6,11 @@
 
 #### A fully-compatible [WebTransport](https://developer.mozilla.org/en-US/docs/Web/API/WebTransport) client for Node.js — the browser API, backed by Cloudflare **quiche** and **BoringSSL**, bound to Node through **neon**.
 
-<sub>QUIC + HTTP/3 + WebTransport, implemented natively in Rust. The same <code>WebTransport</code> class you use in Chrome, running in Node — bidirectional streams, unidirectional streams, and unreliable datagrams over a single multiplexed QUIC connection.</sub>
-
-<sub>Ships with prebuilt binaries. No QUIC server round-trips through a browser, no polyfills, no HTTP/2 emulation — an actual HTTP/3 datagram on the wire.</sub>
-
 <br/>
 
 **⚡ Native QUIC/HTTP-3.** Cloudflare's `quiche` transport, the engine that serves a large slice of the internet, linked straight into your Node process.
 
-**⚡ Chrome on the wire by default.** The default TLS profile advertises Google Chrome's cipher suites, curve preferences, and signature algorithms, so your handshake looks like a browser's.
-
-**⚡ The standard API.** `WebTransport`, `WebTransportBidirectionalStream`, `WebTransportSendStream` / `ReceiveStream` as WHATWG streams, and `WebTransportDatagramDuplexStream` — matching the [W3C spec](https://w3c.github.io/webtransport/).
+**⚡ The standard API.** The same `WebTransport` class you use in Chrome — bidirectional and unidirectional streams as WHATWG streams, plus unreliable datagrams, over one multiplexed QUIC connection.
 
 <br/>
 
@@ -66,6 +60,10 @@
 **WebTransport is the modern transport for realtime apps** — lower latency than WebSocket, multiple independent streams over one connection with no head-of-line blocking, and unreliable datagrams for the data you would rather drop than delay. Browsers have shipped it for years. Node.js has not.
 
 `rwebtransport` closes that gap. It is not an emulation over HTTP/2 or a WebSocket shim — it is a genuine HTTP/3 client speaking QUIC on UDP/443, built on the same [Cloudflare quiche](https://github.com/cloudflare/quiche) engine that powers WebTransport at scale, exposed through the exact `WebTransport` API you already know from the browser.
+
+QUIC + HTTP/3 + WebTransport, implemented natively in Rust. It ships with prebuilt binaries — no QUIC server round-trips through a browser, no polyfills, no HTTP/2 emulation, just an actual HTTP/3 datagram on the wire. And it provides the full standard surface: `WebTransport`, `WebTransportBidirectionalStream`, `WebTransportSendStream` / `ReceiveStream` as WHATWG streams, and `WebTransportDatagramDuplexStream`, all matching the [W3C spec](https://w3c.github.io/webtransport/).
+
+By default the client also puts **Chrome on the wire**: the TLS profile advertises Google Chrome's cipher suites, curve preferences, and signature algorithms, so your handshake looks like a browser's — see [Security &amp; the TLS profile](#security--the-tls-profile).
 
 ```bash
 npm install rwebtransport

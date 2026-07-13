@@ -450,6 +450,7 @@ dependencies = [
  "mio",
  "octets",
  "quiche",
+ "rwebtransport-wtcore",
 ]
 
 [[package]]
@@ -458,8 +459,19 @@ version = "0.1.0"
 dependencies = [
  "boring",
  "boring-sys",
+ "getrandom",
  "log",
+ "mio",
  "neon",
+ "octets",
+ "quiche",
+ "rwebtransport-wtcore",
+]
+
+[[package]]
+name = "rwebtransport-wtcore"
+version = "0.1.0"
+dependencies = [
  "octets",
  "quiche",
 ]
