@@ -95,10 +95,20 @@ export class WebTransport {
 
         this.session.setIncomingHandler({
             onBidi: (id) => {
-                bidiController.enqueue(new WebTransportBidirectionalStream(this.session, id));
+                // Guard: enqueue throws if the consumer already cancelled the
+                // reader — that must not escape the native event dispatch.
+                try {
+                    bidiController.enqueue(new WebTransportBidirectionalStream(this.session, id));
+                } catch {
+                    // consumer no longer reading incoming bidi streams
+                }
             },
             onUni: (id) => {
-                uniController.enqueue(new WebTransportReceiveStream(this.session, id));
+                try {
+                    uniController.enqueue(new WebTransportReceiveStream(this.session, id));
+                } catch {
+                    // consumer no longer reading incoming uni streams
+                }
             },
         });
 

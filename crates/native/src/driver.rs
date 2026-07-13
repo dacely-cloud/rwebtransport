@@ -3,6 +3,7 @@
 //! the quiche connection, feeds packets to [`crate::session::WtSession`], and
 //! ferries commands in and events out.
 
+use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
@@ -11,6 +12,7 @@ use std::time::Instant;
 use mio::net::UdpSocket;
 use mio::{Events, Poll, Token};
 
+use crate::config::{build_config, ClientConfigParams};
 use crate::session::{Ev, WtSession};
 
 pub const SOCKET_TOKEN: Token = Token(0);
@@ -81,32 +83,35 @@ pub trait EventSink: Send {
     fn emit(&self, events: Vec<Ev>);
 }
 
-/// Entry point for the driver thread. Wraps the event loop in `catch_unwind` so
-/// that a panic anywhere in the driver (or in quiche) can NEVER crash the Node
-/// process and can NEVER silently hang the session: on panic we emit an `error`
-/// event followed by `closed`, so the JS `ready`/`closed` promises reject.
-#[allow(clippy::too_many_arguments)]
+/// Everything the driver thread needs to establish a session. DNS resolution,
+/// socket bind, TLS/QUIC config, and the quiche handshake all happen on the
+/// driver thread (never on the JS event loop).
+pub struct SessionSetup {
+    pub host: String,
+    pub port: u16,
+    /// SNI / verification host (None for IP literals).
+    pub sni: Option<String>,
+    pub authority: String,
+    pub path: String,
+    pub origin: Option<String>,
+    pub extra_headers: Vec<(String, String)>,
+    pub config: ClientConfigParams,
+}
+
+/// Entry point for the driver thread. Wraps setup + the event loop in
+/// `catch_unwind` so that a panic anywhere (DNS, bind, quiche, the loop) can
+/// NEVER crash the Node process and can NEVER silently hang the session: on
+/// panic (or a setup failure) we emit an `error` event followed by `closed`, so
+/// the JS `ready`/`closed` promises reject.
 pub fn run(
+    setup: SessionSetup,
     poll: Poll,
-    socket: UdpSocket,
-    local_addr: std::net::SocketAddr,
-    conn: quiche::Connection,
-    session: WtSession,
     rx: Receiver<Command>,
     sink: Box<dyn EventSink>,
     shared: Arc<DriverShared>,
 ) {
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_inner(
-            poll,
-            socket,
-            local_addr,
-            conn,
-            session,
-            rx,
-            sink.as_ref(),
-            &shared,
-        );
+        setup_and_run(setup, poll, rx, sink.as_ref(), &shared);
     }));
     if let Err(payload) = result {
         let msg = payload
@@ -124,6 +129,106 @@ pub fn run(
             },
         ]);
     }
+}
+
+/// Emit a fatal setup error to JS and mark the session closed.
+fn emit_fatal(sink: &dyn EventSink, shared: &Arc<DriverShared>, message: String) {
+    shared.closed.store(true, Ordering::Relaxed);
+    sink.emit(vec![
+        Ev::Error(message),
+        Ev::Closed {
+            code: 0,
+            reason: b"setup failed".to_vec(),
+            remote: false,
+        },
+    ]);
+}
+
+fn random_scid() -> [u8; 16] {
+    let mut b = [0u8; 16];
+    if getrandom::getrandom(&mut b).is_err() {
+        let seed: u128 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        b.copy_from_slice(&seed.to_le_bytes());
+    }
+    b
+}
+
+/// Resolve DNS, bind the UDP socket, build the QUIC config, perform the handshake
+/// handshake, then run the event loop. Any setup failure is surfaced to JS.
+fn setup_and_run(
+    setup: SessionSetup,
+    poll: Poll,
+    rx: Receiver<Command>,
+    sink: &dyn EventSink,
+    shared: &Arc<DriverShared>,
+) {
+    // DNS resolution — potentially blocking, so it runs here (driver thread),
+    // never on the JS event loop.
+    let peer = match (setup.host.as_str(), setup.port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    {
+        Some(p) => p,
+        None => {
+            emit_fatal(
+                sink,
+                shared,
+                format!("failed to resolve {}:{}", setup.host, setup.port),
+            );
+            return;
+        }
+    };
+
+    let bind: SocketAddr = if peer.is_ipv4() {
+        "0.0.0.0:0".parse().unwrap()
+    } else {
+        "[::]:0".parse().unwrap()
+    };
+    let socket = match UdpSocket::bind(bind) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_fatal(sink, shared, format!("failed to bind UDP socket: {e}"));
+            return;
+        }
+    };
+    let local_addr = match socket.local_addr() {
+        Ok(a) => a,
+        Err(e) => {
+            emit_fatal(sink, shared, format!("failed to read local addr: {e}"));
+            return;
+        }
+    };
+
+    let mut config = match build_config(&setup.config) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_fatal(sink, shared, e);
+            return;
+        }
+    };
+
+    let scid = random_scid();
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let conn = match quiche::connect(setup.sni.as_deref(), &scid, local_addr, peer, &mut config) {
+        Ok(c) => c,
+        Err(e) => {
+            emit_fatal(sink, shared, format!("quiche connect: {e:?}"));
+            return;
+        }
+    };
+
+    let session = WtSession::new(
+        setup.authority,
+        setup.path,
+        setup.origin,
+        setup.extra_headers,
+    );
+
+    run_inner(poll, socket, local_addr, conn, session, rx, sink, shared);
 }
 
 /// The actual event loop. Runs until the connection closes or a fatal error

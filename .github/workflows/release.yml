@@ -63,6 +63,10 @@ jobs:
     name: publish
     needs: prebuild
     runs-on: ubuntu-24.04
+    # Expose the npm token as a job-level env so step `if:` can gate on it
+    # (the `secrets` context is not usable directly in `if`).
+    env:
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -106,7 +110,7 @@ jobs:
           fail_on_unmatched_files: true
 
       - name: Publish to npm
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        if: ${{ env.NPM_TOKEN != '' }}
         run: npm publish --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

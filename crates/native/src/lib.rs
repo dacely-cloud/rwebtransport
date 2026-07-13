@@ -28,7 +28,7 @@ mod driver;
 mod session;
 mod tls;
 
-use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::net::IpAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
@@ -36,9 +36,9 @@ use std::sync::{Arc, Mutex};
 use neon::prelude::*;
 use neon::types::buffer::TypedArray;
 
-use config::{build_config, ClientConfigParams};
+use config::ClientConfigParams;
 use driver::{Command, DriverShared, EventSink};
-use session::{Ev, WtSession};
+use session::Ev;
 use tls::CertVerification;
 
 /// JS-facing session handle (a `JsBox`).
@@ -98,13 +98,16 @@ impl EventSink for NeonSink {
 // ---- URL parsing ------------------------------------------------------------
 
 struct ParsedUrl {
-    peer: SocketAddr,
+    host: String,
+    port: u16,
     /// SNI / verification host (None for IP literals).
     sni: Option<String>,
     authority: String,
     path: String,
 }
 
+/// Parse a WebTransport URL WITHOUT resolving DNS (resolution is deferred to the
+/// driver thread so it never blocks the JS event loop).
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
     let rest = url
         .strip_prefix("https://")
@@ -141,38 +144,19 @@ fn parse_url(url: &str) -> Result<ParsedUrl, String> {
         (authority.to_string(), 443)
     };
 
-    let peer = (host.as_str(), port)
-        .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("no addresses resolved for {host}"))?;
-
     let sni = if host.parse::<IpAddr>().is_ok() {
         None
     } else {
-        Some(host)
+        Some(host.clone())
     };
 
     Ok(ParsedUrl {
-        peer,
+        host,
+        port,
         sni,
         authority: authority.to_string(),
         path,
     })
-}
-
-fn random_scid() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    // Best-effort; falls back to a time-seeded value so connect() never panics if
-    // the OS RNG is briefly unavailable (the SCID only needs to be unpredictable).
-    if getrandom::getrandom(&mut b).is_err() {
-        let seed = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        b.copy_from_slice(&(seed as u128).to_le_bytes());
-    }
-    b
 }
 
 /// Convert a JS number to a stream id. NaN / negative / non-finite values map to
@@ -264,42 +248,10 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         verify,
         ..ClientConfigParams::default()
     };
-    let mut quic_config = match build_config(&params) {
-        Ok(c) => c,
-        Err(e) => return cx.throw_error(e),
-    };
 
-    // UDP socket bound to the matching family.
-    let bind: SocketAddr = if parsed.peer.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let socket = match mio::net::UdpSocket::bind(bind) {
-        Ok(s) => s,
-        Err(e) => return cx.throw_error(format!("failed to bind UDP socket: {e}")),
-    };
-    let local_addr = match socket.local_addr() {
-        Ok(a) => a,
-        Err(e) => return cx.throw_error(format!("failed to read local addr: {e}")),
-    };
-
-    let scid = random_scid();
-    let scid = quiche::ConnectionId::from_ref(&scid);
-    let conn = match quiche::connect(
-        parsed.sni.as_deref(),
-        &scid,
-        local_addr,
-        parsed.peer,
-        &mut quic_config,
-    ) {
-        Ok(c) => c,
-        Err(e) => return cx.throw_error(format!("quiche connect: {e:?}")),
-    };
-
-    let session = WtSession::new(parsed.authority, parsed.path, origin, extra_headers);
-
-    // Event loop plumbing.
+    // Event-loop plumbing (created here so the poll registry can back the waker
+    // stored in the handle). DNS resolution, socket bind, TLS/QUIC config, and
+    // the handshake all run on the driver thread — see `driver::SessionSetup`.
     let poll = match mio::Poll::new() {
         Ok(p) => p,
         Err(e) => return cx.throw_error(format!("mio poll: {e}")),
@@ -317,20 +269,22 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         shared: shared.clone(),
     });
 
+    let setup = driver::SessionSetup {
+        host: parsed.host,
+        port: parsed.port,
+        sni: parsed.sni,
+        authority: parsed.authority,
+        path: parsed.path,
+        origin,
+        extra_headers,
+        config: params,
+    };
+
     let shared_for_thread = shared.clone();
     let spawned = std::thread::Builder::new()
         .name("rwt-driver".into())
         .spawn(move || {
-            driver::run(
-                poll,
-                socket,
-                local_addr,
-                conn,
-                session,
-                rx,
-                sink,
-                shared_for_thread,
-            );
+            driver::run(setup, poll, rx, sink, shared_for_thread);
         });
     if let Err(e) = spawned {
         return cx.throw_error(format!("failed to spawn driver thread: {e}"));

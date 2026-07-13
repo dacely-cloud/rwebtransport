@@ -303,17 +303,22 @@ export class Session {
         if (this.closedState) return;
         this.closedState = true;
 
-        if (error) {
-            if (!this.readyState) this.ready.reject(error);
+        if (!this.readyState) {
+            // The session never established: both `ready` and `closed` reject
+            // (a session that closes before it is ready has failed to connect).
+            const err =
+                error ??
+                new WebTransportError('session closed before it was established', {
+                    source: 'session',
+                });
+            this.ready.reject(err);
+            this.closed.reject(err);
+        } else if (error) {
+            // Established, then terminated abnormally.
             this.closed.reject(error);
         } else {
-            const closeInfo = info ?? { closeCode: 0, reason: '' };
-            if (!this.readyState) {
-                this.ready.reject(
-                    new WebTransportError('session closed before ready', { source: 'session' }),
-                );
-            }
-            this.closed.resolve(closeInfo);
+            // Established, then closed cleanly.
+            this.closed.resolve(info ?? { closeCode: 0, reason: '' });
         }
 
         const err = error ?? new WebTransportError('session closed', { source: 'session' });
