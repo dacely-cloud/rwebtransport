@@ -15,6 +15,7 @@
 <br/>
 
 [![npm](https://img.shields.io/npm/v/rwebtransport.svg?color=2563ff&label=npm&labelColor=0e1520)](https://www.npmjs.com/package/rwebtransport)
+[![ci](https://github.com/dacely-cloud/rwebtransport/actions/workflows/ci.yml/badge.svg)](https://github.com/dacely-cloud/rwebtransport/actions/workflows/ci.yml)
 [![node](https://img.shields.io/badge/node-24%20%7C%2026-22e3ab.svg?labelColor=0e1520)](#requirements)
 [![types](https://img.shields.io/badge/types-included-2563ff.svg?labelColor=0e1520)](https://www.typescriptlang.org/)
 [![quic](https://img.shields.io/badge/QUIC-quiche%200.29-7c3aed.svg?labelColor=0e1520)](https://github.com/cloudflare/quiche)

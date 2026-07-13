@@ -28,14 +28,38 @@ pub struct DriverShared {
 
 /// Commands sent from JS (via the neon layer) into the driver thread.
 pub enum Command {
-    OpenStream { request_id: u64, bidi: bool },
-    Write { id: u64, data: Vec<u8>, request_id: u64 },
-    Fin { id: u64 },
-    ResetStream { id: u64, code: u64 },
-    StopSending { id: u64, code: u64 },
-    SetPaused { id: u64, paused: bool },
-    SendDatagram { data: Vec<u8>, request_id: u64 },
-    Close { code: u32, reason: Vec<u8> },
+    OpenStream {
+        request_id: u64,
+        bidi: bool,
+    },
+    Write {
+        id: u64,
+        data: Vec<u8>,
+        request_id: u64,
+    },
+    Fin {
+        id: u64,
+    },
+    ResetStream {
+        id: u64,
+        code: u64,
+    },
+    StopSending {
+        id: u64,
+        code: u64,
+    },
+    SetPaused {
+        id: u64,
+        paused: bool,
+    },
+    SendDatagram {
+        data: Vec<u8>,
+        request_id: u64,
+    },
+    Close {
+        code: u32,
+        reason: Vec<u8>,
+    },
     /// Tear the driver down (the JS handle was closed/GC'd).
     Shutdown,
 }
@@ -135,13 +159,13 @@ pub fn run(
                 Command::OpenStream { request_id, bidi } => {
                     session.open_stream(bidi, request_id, &mut evs)
                 }
-                Command::Write { id, data, request_id } => {
-                    session.stream_write(id, data, request_id, &mut evs)
-                }
+                Command::Write {
+                    id,
+                    data,
+                    request_id,
+                } => session.stream_write(id, data, request_id, &mut evs),
                 Command::Fin { id } => session.stream_fin(id),
-                Command::ResetStream { id, code } => {
-                    session.stream_reset(&mut conn, id, code)
-                }
+                Command::ResetStream { id, code } => session.stream_reset(&mut conn, id, code),
                 Command::StopSending { id, code } => {
                     session.stream_stop_sending(&mut conn, id, code)
                 }
@@ -167,7 +191,10 @@ pub fn run(
         if conn.is_established() {
             if debug && !established_logged {
                 established_logged = true;
-                eprintln!("[rwt-driver] QUIC established, alpn={:?}", conn.application_proto());
+                eprintln!(
+                    "[rwt-driver] QUIC established, alpn={:?}",
+                    conn.application_proto()
+                );
             }
             session.on_established(&mut evs);
         }

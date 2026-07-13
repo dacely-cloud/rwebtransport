@@ -155,7 +155,9 @@ impl PeerSettings {
 pub fn parse_settings(mut payload: &[u8]) -> PeerSettings {
     let mut s = PeerSettings::default();
     while !payload.is_empty() {
-        let Some((id, n1)) = read_varint(payload) else { break };
+        let Some((id, n1)) = read_varint(payload) else {
+            break;
+        };
         let Some((val, n2)) = read_varint(&payload[n1..]) else {
             break;
         };

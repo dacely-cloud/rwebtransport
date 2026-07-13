@@ -1,0 +1,112 @@
+# SPDX-License-Identifier: Apache-2.0
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  prebuild:
+    name: prebuild ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: linux-x64
+          - os: ubuntu-24.04-arm
+            target: linux-arm64
+          - os: macos-13
+            target: darwin-x64
+          - os: macos-14
+            target: darwin-arm64
+          - os: windows-2022
+            target: win32-x64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+
+      - if: runner.os == 'Windows'
+        uses: ilammy/setup-nasm@v1
+
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - if: runner.os == 'macOS'
+        run: brew install cmake ninja
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+
+      - name: Build native addon
+        run: node scripts/build.js
+
+      - name: Upload prebuilt
+        uses: actions/upload-artifact@v4
+        with:
+          name: prebuild-${{ matrix.target }}
+          path: prebuilds/${{ matrix.target }}/rwebtransport.node
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: prebuild
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 26
+          registry-url: https://registry.npmjs.org
+
+      - name: Install deps
+        run: npm ci
+        env:
+          RWEBTRANSPORT_SKIP_POSTINSTALL: '1'
+
+      - name: Download all prebuilds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: prebuild-*
+          path: artifacts
+
+      - name: Assemble prebuilds/
+        run: |
+          set -e
+          mkdir -p prebuilds
+          for dir in artifacts/prebuild-*; do
+            target="${dir#artifacts/prebuild-}"
+            mkdir -p "prebuilds/$target"
+            cp "$dir/rwebtransport.node" "prebuilds/$target/rwebtransport.node"
+          done
+          ls -R prebuilds
+
+      - name: Build TypeScript
+        run: npm run build:ts
+
+      - name: Package prebuilds tarball
+        run: tar czf rwebtransport-prebuilds.tar.gz prebuilds
+
+      - name: Attach prebuilds to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: rwebtransport-prebuilds.tar.gz
+          fail_on_unmatched_files: true
+
+      - name: Publish to npm
+        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        run: npm publish --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

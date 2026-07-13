@@ -8,9 +8,9 @@ export default defineConfig({
         include: ['test/**/*.test.ts', 'test/**/*.spec.ts'],
         exclude: [...configDefaults.exclude],
         // The native driver spawns background threads and a real UDP server; keep
-        // the suite in a single fork so ports/handles don't contend.
+        // the suite serial so ports/handles don't contend.
         pool: 'forks',
-        poolOptions: { forks: { singleFork: true } },
+        fileParallelism: false,
         testTimeout: 30_000,
         hookTimeout: 30_000,
         coverage: {

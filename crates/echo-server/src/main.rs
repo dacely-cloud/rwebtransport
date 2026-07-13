@@ -121,8 +121,10 @@ impl Server {
             return;
         }
         self.setup_done = true;
-        self.streams
-            .insert(3, Stream::with_prefix(Role::LocalControlPlane, h3::control_stream_prefix()));
+        self.streams.insert(
+            3,
+            Stream::with_prefix(Role::LocalControlPlane, h3::control_stream_prefix()),
+        );
         let mut enc = Vec::new();
         h3::put_varint(h3::QPACK_ENCODER_STREAM_TYPE, &mut enc);
         self.streams
@@ -191,7 +193,9 @@ impl Server {
     fn process(&mut self, id: u64, chunk: Vec<u8>, fin: bool) {
         let role = self.streams.get(&id).map(|s| s.role);
         match role {
-            Some(Role::PeerControlPlane) | Some(Role::LocalControlPlane) | Some(Role::Ignored)
+            Some(Role::PeerControlPlane)
+            | Some(Role::LocalControlPlane)
+            | Some(Role::Ignored)
             | None => {}
             Some(Role::Connect) => {
                 if let Some(s) = self.streams.get_mut(&id) {
@@ -293,7 +297,8 @@ impl Server {
             let mut prefix = Vec::new();
             h3::put_varint(h3::WT_UNI_STREAM_TYPE, &mut prefix);
             h3::put_varint(CONNECT_ID, &mut prefix);
-            self.streams.insert(id, Stream::with_prefix(Role::LocalControlPlane, prefix));
+            self.streams
+                .insert(id, Stream::with_prefix(Role::LocalControlPlane, prefix));
         }
         let s = self.streams.get_mut(&id).unwrap();
         s.queue(data);
@@ -308,13 +313,16 @@ impl Server {
             let frame = self.streams.get_mut(&id).and_then(|s| s.frames.next());
             let Some((ty, payload)) = frame else { break };
             if std::env::var("RWT_DEBUG").is_ok() {
-                eprintln!("[echo] connect stream {id} frame ty={ty} len={}", payload.len());
+                eprintln!(
+                    "[echo] connect stream {id} frame ty={ty} len={}",
+                    payload.len()
+                );
             }
             if ty == h3::FRAME_HEADERS {
                 let ok = match h3::decode_header_block(&payload) {
-                    Ok(headers) => headers.iter().any(|hh| {
-                        hh.name() == b":protocol" && hh.value() == b"webtransport"
-                    }),
+                    Ok(headers) => headers
+                        .iter()
+                        .any(|hh| hh.name() == b":protocol" && hh.value() == b"webtransport"),
                     Err(_) => false,
                 };
                 if std::env::var("RWT_DEBUG").is_ok() {
@@ -569,7 +577,9 @@ fn getrandom_fill(buf: &mut [u8]) {
         .unwrap()
         .as_nanos() as u64;
     for b in buf.iter_mut() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         *b = (seed >> 33) as u8;
     }
 }

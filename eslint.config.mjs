@@ -14,7 +14,7 @@ export default tseslint.config(
             'node_modules/**',
             'scripts/**',
             '*.config.*',
-            'eslint.config.js',
+            'eslint.config.mjs',
         ],
     },
     eslint.configs.recommended,
@@ -48,6 +48,10 @@ export default tseslint.config(
             'no-useless-assignment': 'off',
             '@typescript-eslint/no-unnecessary-type-arguments': 'off',
             '@typescript-eslint/no-unnecessary-type-assertion': 'off',
+            // Deferred<void> is a legitimate pattern; test non-null assertions
+            // after explicit checks are fine.
+            '@typescript-eslint/no-invalid-void-type': 'off',
+            '@typescript-eslint/no-non-null-assertion': 'off',
         },
     },
     {

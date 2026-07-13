@@ -11,89 +11,89 @@ export type NativeHandle = { readonly __brand: 'rwt-session' };
 
 /** Events delivered by the native addon to the `onEvent` callback. */
 export type NativeEvent =
-  | { type: 'ready' }
-  | { type: 'closed'; code: number; reason: Uint8Array; remote: boolean }
-  | { type: 'error'; message: string }
-  | { type: 'datagram'; data: Uint8Array }
-  | { type: 'stream'; streamId: number; bidi: boolean }
-  | { type: 'streamData'; streamId: number; data: Uint8Array }
-  | { type: 'streamFin'; streamId: number }
-  | { type: 'streamReset'; streamId: number; code: number }
-  | { type: 'streamStopSending'; streamId: number; code: number }
-  | { type: 'streamOpened'; requestId: number; streamId: number }
-  | { type: 'writeAck'; requestId: number }
-  | { type: 'datagramAck'; requestId: number; sent: boolean };
+    | { type: 'ready' }
+    | { type: 'closed'; code: number; reason: Uint8Array; remote: boolean }
+    | { type: 'error'; message: string }
+    | { type: 'datagram'; data: Uint8Array }
+    | { type: 'stream'; streamId: number; bidi: boolean }
+    | { type: 'streamData'; streamId: number; data: Uint8Array }
+    | { type: 'streamFin'; streamId: number }
+    | { type: 'streamReset'; streamId: number; code: number }
+    | { type: 'streamStopSending'; streamId: number; code: number }
+    | { type: 'streamOpened'; requestId: number; streamId: number }
+    | { type: 'writeAck'; requestId: number }
+    | { type: 'datagramAck'; requestId: number; sent: boolean };
 
 /** The raw function surface exported by `rwebtransport.node`. */
 export interface NativeAddon {
-  connect(
-    url: string,
-    hashes: Uint8Array[],
-    insecure: boolean,
-    origin: string | null,
-    headerNames: string[],
-    headerValues: string[],
-    onEvent: (ev: NativeEvent) => void,
-  ): NativeHandle;
-  openStream(handle: NativeHandle, bidi: boolean, requestId: number): void;
-  writeStream(handle: NativeHandle, streamId: number, bytes: Uint8Array, requestId: number): void;
-  finStream(handle: NativeHandle, streamId: number): void;
-  resetStream(handle: NativeHandle, streamId: number, code: number): void;
-  stopSending(handle: NativeHandle, streamId: number, code: number): void;
-  setPaused(handle: NativeHandle, streamId: number, paused: boolean): void;
-  sendDatagram(handle: NativeHandle, bytes: Uint8Array, requestId: number): void;
-  maxDatagramSize(handle: NativeHandle): number;
-  isReady(handle: NativeHandle): boolean;
-  isClosed(handle: NativeHandle): boolean;
-  closeSession(handle: NativeHandle, code: number, reason: Uint8Array): void;
-  shutdown(handle: NativeHandle): void;
+    connect(
+        url: string,
+        hashes: Uint8Array[],
+        insecure: boolean,
+        origin: string | null,
+        headerNames: string[],
+        headerValues: string[],
+        onEvent: (ev: NativeEvent) => void,
+    ): NativeHandle;
+    openStream(handle: NativeHandle, bidi: boolean, requestId: number): void;
+    writeStream(handle: NativeHandle, streamId: number, bytes: Uint8Array, requestId: number): void;
+    finStream(handle: NativeHandle, streamId: number): void;
+    resetStream(handle: NativeHandle, streamId: number, code: number): void;
+    stopSending(handle: NativeHandle, streamId: number, code: number): void;
+    setPaused(handle: NativeHandle, streamId: number, paused: boolean): void;
+    sendDatagram(handle: NativeHandle, bytes: Uint8Array, requestId: number): void;
+    maxDatagramSize(handle: NativeHandle): number;
+    isReady(handle: NativeHandle): boolean;
+    isClosed(handle: NativeHandle): boolean;
+    closeSession(handle: NativeHandle, code: number, reason: Uint8Array): void;
+    shutdown(handle: NativeHandle): void;
 }
 
 /** Normalized inputs for opening a session. */
 export interface ConnectConfig {
-  url: string;
-  hashes: Uint8Array[];
-  insecure: boolean;
-  origin: string | null;
-  headerNames: string[];
-  headerValues: string[];
+    url: string;
+    hashes: Uint8Array[];
+    insecure: boolean;
+    origin: string | null;
+    headerNames: string[];
+    headerValues: string[];
 }
 
 /** Consumer of a receive stream's inbound events. */
 export interface ReceiveSink {
-  onData(chunk: Uint8Array): void;
-  onFin(): void;
-  onReset(code: number): void;
+    onData(chunk: Uint8Array): void;
+    onFin(): void;
+    onReset(code: number): void;
 }
 
 /** Consumer of a send stream's control events. */
 export interface SendSink {
-  onStopSending(code: number): void;
+    onStopSending(code: number): void;
 }
 
 /** Consumer of peer-initiated streams. */
 export interface IncomingHandler {
-  onBidi(streamId: number): void;
-  onUni(streamId: number): void;
+    onBidi(streamId: number): void;
+    onUni(streamId: number): void;
 }
 
 /** Consumer of inbound datagrams. */
 export type DatagramSink = (data: Uint8Array) => void;
 
 interface Deferred<T> {
-  promise: Promise<T>;
-  resolve: (value: T) => void;
-  reject: (reason: unknown) => void;
+    promise: Promise<T>;
+    resolve: (value: T) => void;
+    reject: (reason: unknown) => void;
 }
 
 function deferred<T>(): Deferred<T> {
-  let resolve!: (value: T) => void;
-  let reject!: (reason: unknown) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
+    let resolve!: (value: T) => void;
+    let reject!: (reason: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
 }
 
 /**
@@ -101,228 +101,232 @@ function deferred<T>(): Deferred<T> {
  * Exactly one `Session` backs one `WebTransport` object.
  */
 export class Session {
-  private readonly native: NativeAddon;
-  private handle: NativeHandle | undefined;
+    private readonly native: NativeAddon;
+    private handle: NativeHandle | undefined;
 
-  private nextRequestId = 1;
-  private readonly opens = new Map<number, Deferred<number>>();
-  private readonly writes = new Map<number, Deferred<void>>();
-  private readonly datagramAcks = new Map<number, Deferred<boolean>>();
-  private readonly receives = new Map<number, ReceiveSink>();
-  private readonly sends = new Map<number, SendSink>();
+    private nextRequestId = 1;
+    private readonly opens = new Map<number, Deferred<number>>();
+    private readonly writes = new Map<number, Deferred<void>>();
+    private readonly datagramAcks = new Map<number, Deferred<boolean>>();
+    private readonly receives = new Map<number, ReceiveSink>();
+    private readonly sends = new Map<number, SendSink>();
 
-  private incoming: IncomingHandler | undefined;
-  private datagramSink: DatagramSink | undefined;
+    private incoming: IncomingHandler | undefined;
+    private datagramSink: DatagramSink | undefined;
 
-  private closedState = false;
-  private readyState = false;
+    private closedState = false;
+    private readyState = false;
 
-  readonly ready = deferred<void>();
-  readonly closed = deferred<WebTransportCloseInfo>();
+    readonly ready = deferred<void>();
+    readonly closed = deferred<WebTransportCloseInfo>();
 
-  constructor(config: ConnectConfig) {
-    this.native = loadNative();
-    // Swallow default unhandled-rejection warnings; the user observes these.
-    void this.closed.promise.catch(() => {});
-    void this.ready.promise.catch(() => {});
-    try {
-      this.handle = this.native.connect(
-        config.url,
-        config.hashes,
-        config.insecure,
-        config.origin,
-        config.headerNames,
-        config.headerValues,
-        (ev) => this.dispatch(ev),
-      );
-    } catch (e) {
-      const message = e instanceof Error ? e.message : String(e);
-      // Defer so the caller can attach `.ready`/`.closed` handlers first.
-      queueMicrotask(() => this.finish(null, new WebTransportError(message, { source: 'session' })));
-    }
-  }
-
-  private nextId(): number {
-    return this.nextRequestId++;
-  }
-
-  // ---- outbound commands ----------------------------------------------------
-
-  openStream(bidi: boolean): Promise<number> {
-    if (!this.handle) return Promise.reject(this.deadError());
-    const requestId = this.nextId();
-    const d = deferred<number>();
-    this.opens.set(requestId, d);
-    this.native.openStream(this.handle, bidi, requestId);
-    return d.promise;
-  }
-
-  write(streamId: number, chunk: Uint8Array): Promise<void> {
-    if (!this.handle) return Promise.reject(this.deadError());
-    const requestId = this.nextId();
-    const d = deferred<void>();
-    this.writes.set(requestId, d);
-    this.native.writeStream(this.handle, streamId, chunk, requestId);
-    return d.promise;
-  }
-
-  finStream(streamId: number): void {
-    if (this.handle) this.native.finStream(this.handle, streamId);
-  }
-
-  resetStream(streamId: number, code: number): void {
-    if (this.handle) this.native.resetStream(this.handle, streamId, code >>> 0);
-  }
-
-  stopSending(streamId: number, code: number): void {
-    if (this.handle) this.native.stopSending(this.handle, streamId, code >>> 0);
-  }
-
-  setPaused(streamId: number, paused: boolean): void {
-    if (this.handle) this.native.setPaused(this.handle, streamId, paused);
-  }
-
-  sendDatagram(chunk: Uint8Array): Promise<boolean> {
-    if (!this.handle) return Promise.resolve(false);
-    const requestId = this.nextId();
-    const d = deferred<boolean>();
-    this.datagramAcks.set(requestId, d);
-    this.native.sendDatagram(this.handle, chunk, requestId);
-    return d.promise;
-  }
-
-  maxDatagramSize(): number {
-    return this.handle ? this.native.maxDatagramSize(this.handle) : 0;
-  }
-
-  close(code: number, reason: string): void {
-    if (this.closedState || !this.handle) return;
-    this.native.closeSession(this.handle, code >>> 0, new TextEncoder().encode(reason));
-  }
-
-  shutdown(): void {
-    if (this.handle) this.native.shutdown(this.handle);
-  }
-
-  private deadError(): WebTransportError {
-    return new WebTransportError('session is not connected', { source: 'session' });
-  }
-
-  // ---- registration ---------------------------------------------------------
-
-  registerReceive(streamId: number, sink: ReceiveSink): void {
-    this.receives.set(streamId, sink);
-  }
-  unregisterReceive(streamId: number): void {
-    this.receives.delete(streamId);
-  }
-  registerSend(streamId: number, sink: SendSink): void {
-    this.sends.set(streamId, sink);
-  }
-  unregisterSend(streamId: number): void {
-    this.sends.delete(streamId);
-  }
-  setIncomingHandler(handler: IncomingHandler): void {
-    this.incoming = handler;
-  }
-  setDatagramSink(sink: DatagramSink): void {
-    this.datagramSink = sink;
-  }
-
-  // ---- event dispatch -------------------------------------------------------
-
-  private dispatch(ev: NativeEvent): void {
-    switch (ev.type) {
-      case 'ready': {
-        this.readyState = true;
-        this.ready.resolve();
-        break;
-      }
-      case 'closed': {
-        const reason = new TextDecoder().decode(ev.reason);
-        this.finish({ closeCode: ev.code, reason }, undefined);
-        break;
-      }
-      case 'error': {
-        const err = new WebTransportError(ev.message, { source: 'session' });
-        this.finish(null, err);
-        break;
-      }
-      case 'datagram': {
-        this.datagramSink?.(ev.data);
-        break;
-      }
-      case 'stream': {
-        if (ev.bidi) this.incoming?.onBidi(ev.streamId);
-        else this.incoming?.onUni(ev.streamId);
-        break;
-      }
-      case 'streamData': {
-        this.receives.get(ev.streamId)?.onData(ev.data);
-        break;
-      }
-      case 'streamFin': {
-        this.receives.get(ev.streamId)?.onFin();
-        break;
-      }
-      case 'streamReset': {
-        this.receives.get(ev.streamId)?.onReset(ev.code);
-        break;
-      }
-      case 'streamStopSending': {
-        this.sends.get(ev.streamId)?.onStopSending(ev.code);
-        break;
-      }
-      case 'streamOpened': {
-        this.opens.get(ev.requestId)?.resolve(ev.streamId);
-        this.opens.delete(ev.requestId);
-        break;
-      }
-      case 'writeAck': {
-        this.writes.get(ev.requestId)?.resolve();
-        this.writes.delete(ev.requestId);
-        break;
-      }
-      case 'datagramAck': {
-        this.datagramAcks.get(ev.requestId)?.resolve(ev.sent);
-        this.datagramAcks.delete(ev.requestId);
-        break;
-      }
-    }
-  }
-
-  /** Terminal transition: resolve/reject everything and tear down. */
-  private finish(info: WebTransportCloseInfo | null, error: WebTransportError | undefined): void {
-    if (this.closedState) return;
-    this.closedState = true;
-
-    if (error) {
-      if (!this.readyState) this.ready.reject(error);
-      this.closed.reject(error);
-    } else {
-      const closeInfo = info ?? { closeCode: 0, reason: '' };
-      if (!this.readyState) {
-        this.ready.reject(new WebTransportError('session closed before ready', { source: 'session' }));
-      }
-      this.closed.resolve(closeInfo);
+    constructor(config: ConnectConfig) {
+        this.native = loadNative();
+        // Swallow default unhandled-rejection warnings; the user observes these.
+        void this.closed.promise.catch(() => {});
+        void this.ready.promise.catch(() => {});
+        try {
+            this.handle = this.native.connect(
+                config.url,
+                config.hashes,
+                config.insecure,
+                config.origin,
+                config.headerNames,
+                config.headerValues,
+                (ev) => this.dispatch(ev),
+            );
+        } catch (e) {
+            const message = e instanceof Error ? e.message : String(e);
+            // Defer so the caller can attach `.ready`/`.closed` handlers first.
+            queueMicrotask(() =>
+                this.finish(null, new WebTransportError(message, { source: 'session' })),
+            );
+        }
     }
 
-    const err = error ?? new WebTransportError('session closed', { source: 'session' });
-    for (const d of this.opens.values()) d.reject(err);
-    for (const d of this.writes.values()) d.reject(err);
-    for (const d of this.datagramAcks.values()) d.resolve(false);
-    for (const sink of this.receives.values()) sink.onReset(0);
-    for (const sink of this.sends.values()) sink.onStopSending(0);
-    this.opens.clear();
-    this.writes.clear();
-    this.datagramAcks.clear();
-    this.receives.clear();
-    this.sends.clear();
+    private nextId(): number {
+        return this.nextRequestId++;
+    }
 
-    if (this.handle) this.native.shutdown(this.handle);
-  }
+    // ---- outbound commands ----------------------------------------------------
 
-  get isClosed(): boolean {
-    return this.closedState;
-  }
+    openStream(bidi: boolean): Promise<number> {
+        if (!this.handle) return Promise.reject(this.deadError());
+        const requestId = this.nextId();
+        const d = deferred<number>();
+        this.opens.set(requestId, d);
+        this.native.openStream(this.handle, bidi, requestId);
+        return d.promise;
+    }
+
+    write(streamId: number, chunk: Uint8Array): Promise<void> {
+        if (!this.handle) return Promise.reject(this.deadError());
+        const requestId = this.nextId();
+        const d = deferred<void>();
+        this.writes.set(requestId, d);
+        this.native.writeStream(this.handle, streamId, chunk, requestId);
+        return d.promise;
+    }
+
+    finStream(streamId: number): void {
+        if (this.handle) this.native.finStream(this.handle, streamId);
+    }
+
+    resetStream(streamId: number, code: number): void {
+        if (this.handle) this.native.resetStream(this.handle, streamId, code >>> 0);
+    }
+
+    stopSending(streamId: number, code: number): void {
+        if (this.handle) this.native.stopSending(this.handle, streamId, code >>> 0);
+    }
+
+    setPaused(streamId: number, paused: boolean): void {
+        if (this.handle) this.native.setPaused(this.handle, streamId, paused);
+    }
+
+    sendDatagram(chunk: Uint8Array): Promise<boolean> {
+        if (!this.handle) return Promise.resolve(false);
+        const requestId = this.nextId();
+        const d = deferred<boolean>();
+        this.datagramAcks.set(requestId, d);
+        this.native.sendDatagram(this.handle, chunk, requestId);
+        return d.promise;
+    }
+
+    maxDatagramSize(): number {
+        return this.handle ? this.native.maxDatagramSize(this.handle) : 0;
+    }
+
+    close(code: number, reason: string): void {
+        if (this.closedState || !this.handle) return;
+        this.native.closeSession(this.handle, code >>> 0, new TextEncoder().encode(reason));
+    }
+
+    shutdown(): void {
+        if (this.handle) this.native.shutdown(this.handle);
+    }
+
+    private deadError(): WebTransportError {
+        return new WebTransportError('session is not connected', { source: 'session' });
+    }
+
+    // ---- registration ---------------------------------------------------------
+
+    registerReceive(streamId: number, sink: ReceiveSink): void {
+        this.receives.set(streamId, sink);
+    }
+    unregisterReceive(streamId: number): void {
+        this.receives.delete(streamId);
+    }
+    registerSend(streamId: number, sink: SendSink): void {
+        this.sends.set(streamId, sink);
+    }
+    unregisterSend(streamId: number): void {
+        this.sends.delete(streamId);
+    }
+    setIncomingHandler(handler: IncomingHandler): void {
+        this.incoming = handler;
+    }
+    setDatagramSink(sink: DatagramSink): void {
+        this.datagramSink = sink;
+    }
+
+    // ---- event dispatch -------------------------------------------------------
+
+    private dispatch(ev: NativeEvent): void {
+        switch (ev.type) {
+            case 'ready': {
+                this.readyState = true;
+                this.ready.resolve();
+                break;
+            }
+            case 'closed': {
+                const reason = new TextDecoder().decode(ev.reason);
+                this.finish({ closeCode: ev.code, reason }, undefined);
+                break;
+            }
+            case 'error': {
+                const err = new WebTransportError(ev.message, { source: 'session' });
+                this.finish(null, err);
+                break;
+            }
+            case 'datagram': {
+                this.datagramSink?.(ev.data);
+                break;
+            }
+            case 'stream': {
+                if (ev.bidi) this.incoming?.onBidi(ev.streamId);
+                else this.incoming?.onUni(ev.streamId);
+                break;
+            }
+            case 'streamData': {
+                this.receives.get(ev.streamId)?.onData(ev.data);
+                break;
+            }
+            case 'streamFin': {
+                this.receives.get(ev.streamId)?.onFin();
+                break;
+            }
+            case 'streamReset': {
+                this.receives.get(ev.streamId)?.onReset(ev.code);
+                break;
+            }
+            case 'streamStopSending': {
+                this.sends.get(ev.streamId)?.onStopSending(ev.code);
+                break;
+            }
+            case 'streamOpened': {
+                this.opens.get(ev.requestId)?.resolve(ev.streamId);
+                this.opens.delete(ev.requestId);
+                break;
+            }
+            case 'writeAck': {
+                this.writes.get(ev.requestId)?.resolve();
+                this.writes.delete(ev.requestId);
+                break;
+            }
+            case 'datagramAck': {
+                this.datagramAcks.get(ev.requestId)?.resolve(ev.sent);
+                this.datagramAcks.delete(ev.requestId);
+                break;
+            }
+        }
+    }
+
+    /** Terminal transition: resolve/reject everything and tear down. */
+    private finish(info: WebTransportCloseInfo | null, error: WebTransportError | undefined): void {
+        if (this.closedState) return;
+        this.closedState = true;
+
+        if (error) {
+            if (!this.readyState) this.ready.reject(error);
+            this.closed.reject(error);
+        } else {
+            const closeInfo = info ?? { closeCode: 0, reason: '' };
+            if (!this.readyState) {
+                this.ready.reject(
+                    new WebTransportError('session closed before ready', { source: 'session' }),
+                );
+            }
+            this.closed.resolve(closeInfo);
+        }
+
+        const err = error ?? new WebTransportError('session closed', { source: 'session' });
+        for (const d of this.opens.values()) d.reject(err);
+        for (const d of this.writes.values()) d.reject(err);
+        for (const d of this.datagramAcks.values()) d.resolve(false);
+        for (const sink of this.receives.values()) sink.onReset(0);
+        for (const sink of this.sends.values()) sink.onStopSending(0);
+        this.opens.clear();
+        this.writes.clear();
+        this.datagramAcks.clear();
+        this.receives.clear();
+        this.sends.clear();
+
+        if (this.handle) this.native.shutdown(this.handle);
+    }
+
+    get isClosed(): boolean {
+        return this.closedState;
+    }
 }

@@ -17,7 +17,9 @@ use std::collections::{HashMap, VecDeque};
 use wtcore::h3;
 
 fn dbg_on() -> bool {
-    std::env::var("RWT_DEBUG").is_ok()
+    use std::sync::OnceLock;
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("RWT_DEBUG").is_ok())
 }
 
 /// The session id / CONNECT stream id.
@@ -285,10 +287,10 @@ impl WtSession {
 
     /// Process a readable QUIC stream.
     pub fn on_readable(&mut self, conn: &mut quiche::Connection, id: u64, ev: &mut Vec<Ev>) {
-        if !self.streams.contains_key(&id) {
+        self.streams.entry(id).or_insert_with(|| {
             let role = classify_new(id);
-            self.streams.insert(id, Stream::new(role));
-        }
+            Stream::new(role)
+        });
 
         // Respect read backpressure for resolved data streams.
         let (paused, is_data) = {
@@ -336,7 +338,11 @@ impl WtSession {
         }
 
         if dbg_on() {
-            let role = self.streams.get(&id).map(|s| role_name(s.role)).unwrap_or("?");
+            let role = self
+                .streams
+                .get(&id)
+                .map(|s| role_name(s.role))
+                .unwrap_or("?");
             eprintln!(
                 "[rwt-session] readable id={id} role={role} chunk={} fin={fin}",
                 chunk.len()
@@ -395,7 +401,10 @@ impl WtSession {
 
     fn parse_control_frames(&mut self, id: u64) {
         loop {
-            let frame = self.streams.get_mut(&id).and_then(|s| s.frames.next_frame());
+            let frame = self
+                .streams
+                .get_mut(&id)
+                .and_then(|s| s.frames.next_frame());
             let Some((ty, payload)) = frame else { break };
             if ty == h3::FRAME_SETTINGS {
                 self.peer_settings = Some(h3::parse_settings(&payload));
@@ -807,11 +816,10 @@ impl WtSession {
             }
         }
 
-        if st.out.is_empty() && st.fin_queued && !st.fin_sent {
-            if conn.stream_send(id, &[], true).is_ok() {
+        if st.out.is_empty() && st.fin_queued && !st.fin_sent
+            && conn.stream_send(id, &[], true).is_ok() {
                 st.fin_sent = true;
             }
-        }
     }
 
     // ---- lifecycle -----------------------------------------------------------

@@ -10,17 +10,17 @@
 export { WebTransport } from './webtransport.js';
 export { WebTransportError } from './errors.js';
 export {
-  WebTransportBidirectionalStream,
-  WebTransportReceiveStream,
-  WebTransportSendStream,
+    WebTransportBidirectionalStream,
+    WebTransportReceiveStream,
+    WebTransportSendStream,
 } from './streams.js';
 export { WebTransportDatagramDuplexStream } from './datagrams.js';
 
 export type {
-  WebTransportOptions,
-  WebTransportHash,
-  WebTransportCongestionControl,
-  WebTransportCloseInfo,
-  WebTransportCloseOptions,
+    WebTransportOptions,
+    WebTransportHash,
+    WebTransportCongestionControl,
+    WebTransportCloseInfo,
+    WebTransportCloseOptions,
 } from './types.js';
 export type { WebTransportErrorSource, WebTransportErrorOptions } from './errors.js';

@@ -2,9 +2,9 @@
 //! rwebtransport native addon: a WebTransport **client** for Node.js.
 //!
 //! This crate binds a native QUIC/HTTP-3/WebTransport client (Cloudflare quiche
-//! + BoringSSL) to Node through neon (N-API). The public surface is intentionally
-//! low-level and event-driven; the WHATWG `WebTransport` API is layered on top in
-//! TypeScript. See `NATIVE_ABI` (module docs below) for the JS↔native contract.
+//! with BoringSSL) to Node through neon (N-API). The public surface is
+//! intentionally low-level and event-driven; the WHATWG `WebTransport` API is
+//! layered on top in TypeScript. See the JS↔native contract below.
 //!
 //! ## JS-visible functions
 //! * `connect(url, hashes[], insecure, origin|null, hdrNames[], hdrVals[], onEvent) -> handle`
@@ -215,8 +215,10 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         CertVerification::PkiDefault
     };
 
-    let mut params = ClientConfigParams::default();
-    params.verify = verify;
+    let params = ClientConfigParams {
+        verify,
+        ..ClientConfigParams::default()
+    };
     let mut quic_config = match build_config(&params) {
         Ok(c) => c,
         Err(e) => return cx.throw_error(e),

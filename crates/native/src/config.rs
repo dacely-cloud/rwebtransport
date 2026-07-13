@@ -41,9 +41,8 @@ impl Default for ClientConfigParams {
 /// Build a ready-to-use quiche client [`quiche::Config`].
 pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
     let builder = build_client_tls(&p.verify)?;
-    let mut config =
-        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
-            .map_err(|e| format!("quiche config: {e:?}"))?;
+    let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
+        .map_err(|e| format!("quiche config: {e:?}"))?;
 
     config
         .set_application_protos(&[H3_ALPN])

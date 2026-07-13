@@ -4,8 +4,8 @@
 export type WebTransportErrorSource = 'stream' | 'session';
 
 export interface WebTransportErrorOptions {
-  source?: WebTransportErrorSource;
-  streamErrorCode?: number | null;
+    source?: WebTransportErrorSource;
+    streamErrorCode?: number | null;
 }
 
 /**
@@ -13,16 +13,16 @@ export interface WebTransportErrorOptions {
  * `WebTransportError`.
  */
 export class WebTransportError extends Error {
-  /** Whether the error originated from a stream or the session as a whole. */
-  readonly source: WebTransportErrorSource;
-  /** The application error code, if the error came from a stream reset. */
-  readonly streamErrorCode: number | null;
+    /** Whether the error originated from a stream or the session as a whole. */
+    readonly source: WebTransportErrorSource;
+    /** The application error code, if the error came from a stream reset. */
+    readonly streamErrorCode: number | null;
 
-  constructor(message?: string, options: WebTransportErrorOptions = {}) {
-    super(message ?? 'WebTransport error');
-    this.name = 'WebTransportError';
-    this.source = options.source ?? 'session';
-    this.streamErrorCode = options.streamErrorCode ?? null;
-    Object.setPrototypeOf(this, WebTransportError.prototype);
-  }
+    constructor(message?: string, options: WebTransportErrorOptions = {}) {
+        super(message ?? 'WebTransport error');
+        this.name = 'WebTransportError';
+        this.source = options.source ?? 'session';
+        this.streamErrorCode = options.streamErrorCode ?? null;
+        Object.setPrototypeOf(this, WebTransportError.prototype);
+    }
 }
