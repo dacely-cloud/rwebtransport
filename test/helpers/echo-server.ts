@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Test helper: spawn the Rust WebTransport echo server and derive its cert hash.
 
-import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { X509Certificate, createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
@@ -38,7 +38,7 @@ export async function startEchoServer(): Promise<EchoServer> {
         );
     }
 
-    const proc: ChildProcessWithoutNullStreams = spawn(
+    const proc = spawn(
         bin,
         ['--cert', CERT, '--key', KEY, '--host', '127.0.0.1', '--port', '0'],
         { stdio: ['ignore', 'pipe', 'pipe'] },

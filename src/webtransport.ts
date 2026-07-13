@@ -10,12 +10,13 @@ import {
     WebTransportSendStream,
 } from './streams.js';
 import type {
+    BinarySource,
     WebTransportCloseInfo,
     WebTransportCloseOptions,
     WebTransportOptions,
 } from './types.js';
 
-function toBytes(src: BufferSource): Uint8Array {
+function toBytes(src: BinarySource): Uint8Array {
     if (src instanceof ArrayBuffer) return new Uint8Array(src);
     return new Uint8Array(src.buffer, src.byteOffset, src.byteLength);
 }

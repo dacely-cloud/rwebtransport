@@ -22,5 +22,6 @@ export type {
     WebTransportCongestionControl,
     WebTransportCloseInfo,
     WebTransportCloseOptions,
+    BinarySource,
 } from './types.js';
 export type { WebTransportErrorSource, WebTransportErrorOptions } from './errors.js';

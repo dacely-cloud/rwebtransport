@@ -2,10 +2,17 @@
 //! Public option and info types, mirroring the W3C WebTransport interface plus a
 //! few Node-specific extensions.
 
+/**
+ * Any byte source accepted by the API: a typed array / DataView, or a raw
+ * `ArrayBuffer`. Broader than the DOM `BufferSource` so ordinary Node `Buffer`s
+ * and `Uint8Array`s (backed by `ArrayBufferLike`) are accepted without casting.
+ */
+export type BinarySource = ArrayBufferView | ArrayBuffer;
+
 /** A pinned server-certificate hash (currently only `sha-256`). */
 export interface WebTransportHash {
     algorithm: string;
-    value: BufferSource;
+    value: BinarySource;
 }
 
 /** Congestion-control tuning hint. */
