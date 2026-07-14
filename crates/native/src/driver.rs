@@ -108,6 +108,8 @@ pub struct SessionSetup {
     pub path: String,
     pub origin: Option<String>,
     pub extra_headers: Vec<(String, String)>,
+    /// WebTransport subprotocols the client offers (preference order).
+    pub protocols: Vec<String>,
     pub config: ClientConfigParams,
 }
 
@@ -239,6 +241,7 @@ fn setup_and_run(
         setup.path,
         setup.origin,
         setup.extra_headers,
+        setup.protocols,
     );
 
     run_inner(poll, socket, local_addr, conn, session, rx, sink, shared);

@@ -7,7 +7,7 @@
 //! layered on top in TypeScript. See the JS↔native contract below.
 //!
 //! ## JS-visible functions
-//! * `connect(url, hashes[], insecure, origin|null, hdrNames[], hdrVals[], onEvent) -> handle`
+//! * `connect(url, hashes[], insecure, origin|null, hdrNames[], hdrVals[], protocols[], onEvent) -> handle`
 //! * `openStream(handle, bidi, requestId)`
 //! * `writeStream(handle, streamId, bytes, requestId)`
 //! * `finStream(handle, streamId)`
@@ -220,7 +220,8 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     };
     let names_arr = cx.argument::<JsArray>(4)?;
     let vals_arr = cx.argument::<JsArray>(5)?;
-    let callback = cx.argument::<JsFunction>(6)?;
+    let protocols_arr = cx.argument::<JsArray>(6)?;
+    let callback = cx.argument::<JsFunction>(7)?;
 
     // Certificate hashes.
     let mut hashes: Vec<[u8; 32]> = Vec::new();
@@ -244,6 +245,17 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         let k = names_arr.get::<JsString, _, _>(&mut cx, i)?.value(&mut cx);
         let v = vals_arr.get::<JsString, _, _>(&mut cx, i)?.value(&mut cx);
         extra_headers.push((k, v));
+    }
+
+    // Offered WebTransport subprotocols.
+    let mut protocols: Vec<String> = Vec::new();
+    let plen = protocols_arr.len(&mut cx);
+    for i in 0..plen {
+        protocols.push(
+            protocols_arr
+                .get::<JsString, _, _>(&mut cx, i)?
+                .value(&mut cx),
+        );
     }
 
     let parsed = match parse_url(&url) {
@@ -292,6 +304,7 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         path: parsed.path,
         origin,
         extra_headers,
+        protocols,
         config: params,
     };
 
@@ -504,7 +517,42 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
     let host = cx.argument::<JsString>(2)?.value(&mut cx);
     let port = cx.argument::<JsNumber>(3)?.value(&mut cx) as u16;
     let reuse_port = cx.argument::<JsBoolean>(4)?.value(&mut cx);
-    let callback = cx.argument::<JsFunction>(5)?;
+    let supported_arr = cx.argument::<JsArray>(5)?;
+    let origins_val = cx.argument::<JsValue>(6)?;
+    let resp_names = cx.argument::<JsArray>(7)?;
+    let resp_vals = cx.argument::<JsArray>(8)?;
+    let callback = cx.argument::<JsFunction>(9)?;
+
+    let mut supported_protocols: Vec<String> = Vec::new();
+    let slen = supported_arr.len(&mut cx);
+    for i in 0..slen {
+        supported_protocols.push(
+            supported_arr
+                .get::<JsString, _, _>(&mut cx, i)?
+                .value(&mut cx),
+        );
+    }
+
+    // `allowedOrigins` is an array (allowlist) or null (allow any).
+    let allowed_origins: Option<Vec<String>> = if origins_val.is_a::<JsArray, _>(&mut cx) {
+        let arr = origins_val.downcast_or_throw::<JsArray, _>(&mut cx)?;
+        let olen = arr.len(&mut cx);
+        let mut v = Vec::with_capacity(olen as usize);
+        for i in 0..olen {
+            v.push(arr.get::<JsString, _, _>(&mut cx, i)?.value(&mut cx));
+        }
+        Some(v)
+    } else {
+        None
+    };
+
+    let mut response_headers: Vec<(String, String)> = Vec::new();
+    let rlen = resp_names.len(&mut cx).min(resp_vals.len(&mut cx));
+    for i in 0..rlen {
+        let k = resp_names.get::<JsString, _, _>(&mut cx, i)?.value(&mut cx);
+        let v = resp_vals.get::<JsString, _, _>(&mut cx, i)?.value(&mut cx);
+        response_headers.push((k, v));
+    }
 
     let poll = match mio::Poll::new() {
         Ok(p) => p,
@@ -529,6 +577,9 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
         cert_path,
         key_path,
         reuse_port,
+        supported_protocols,
+        allowed_origins,
+        response_headers,
     };
 
     let shared_for_thread = shared.clone();
@@ -719,8 +770,27 @@ fn server_msg_to_js<'a>(cx: &mut TaskContext<'a>, msg: &ServerMsg) -> JsResult<'
 fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
     let obj = cx.empty_object();
     match ev {
-        Ev::Ready => {
+        Ev::Ready { protocol, headers } => {
             set_str(cx, &obj, "type", "ready")?;
+            match protocol {
+                Some(p) => set_str(cx, &obj, "protocol", p)?,
+                None => {
+                    let n = cx.null();
+                    obj.set(cx, "protocol", n)?;
+                }
+            }
+            // Ordered [name, value] pairs so the TS layer can build a Headers
+            // without collapsing duplicate header names.
+            let arr = cx.empty_array();
+            for (i, (k, v)) in headers.iter().enumerate() {
+                let pair = cx.empty_array();
+                let kn = cx.string(k);
+                let vn = cx.string(v);
+                pair.set(cx, 0, kn)?;
+                pair.set(cx, 1, vn)?;
+                arr.set(cx, i as u32, pair)?;
+            }
+            obj.set(cx, "responseHeaders", arr)?;
         }
         Ev::Draining => {
             set_str(cx, &obj, "type", "draining")?;
@@ -752,6 +822,8 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
             path,
             origin,
             headers,
+            requested_protocols,
+            protocol,
             remote_addr,
             remote_port,
         } => {
@@ -770,6 +842,19 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
                 set_str(cx, &hobj, k, v)?;
             }
             obj.set(cx, "headers", hobj)?;
+            let parr = cx.empty_array();
+            for (i, p) in requested_protocols.iter().enumerate() {
+                let s = cx.string(p);
+                parr.set(cx, i as u32, s)?;
+            }
+            obj.set(cx, "requestedProtocols", parr)?;
+            match protocol {
+                Some(p) => set_str(cx, &obj, "protocol", p)?,
+                None => {
+                    let n = cx.null();
+                    obj.set(cx, "protocol", n)?;
+                }
+            }
             set_str(cx, &obj, "remoteAddress", remote_addr)?;
             set_num(cx, &obj, "remotePort", *remote_port as f64)?;
         }

@@ -91,6 +91,7 @@ function buildConfig(url: string, options: WebTransportOptions): ConnectConfig {
         origin: options.origin ?? null,
         headerNames,
         headerValues,
+        protocols: options.protocols ?? [],
     };
 }
 
@@ -249,6 +250,15 @@ export class WebTransportSession {
     }
 
     /**
+     * The negotiated WebTransport subprotocol, or the empty string when none was
+     * negotiated (or before the session is established). Matches the W3C
+     * `WebTransport.protocol` attribute.
+     */
+    public get protocol(): string {
+        return this.core.protocol;
+    }
+
+    /**
      * Open a new outbound bidirectional stream.
      *
      * @returns A promise resolving to a {@link WebTransportBidirectionalStream}
@@ -385,6 +395,15 @@ export class WebTransport extends WebTransportSession {
      */
     public constructor(url: string, options: WebTransportOptions = {}) {
         super(createClientSession(buildConfig(url, options)));
+    }
+
+    /**
+     * The headers from the server's Extended CONNECT `2xx` response, as a
+     * `Headers` object (empty until the session is established). Matches the W3C
+     * `WebTransport.responseHeaders` attribute.
+     */
+    public get responseHeaders(): Headers {
+        return new Headers(this.core.responseHeaders);
     }
 }
 

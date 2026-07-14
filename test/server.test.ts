@@ -272,6 +272,97 @@ describe('WebTransportServer', () => {
         expect(uni.sendGroup).toBeNull();
     });
 
+    it('negotiates a subprotocol both ends support', async () => {
+        const server = new WebTransportServer({
+            port: 0,
+            host: '127.0.0.1',
+            cert: CERT,
+            key: KEY,
+            supportedProtocols: ['b'],
+        });
+        servers.push(server);
+        await server.ready;
+        const serverSessionP = (async () => {
+            const reader = server.incomingSessions.getReader();
+            return (await reader.read()).value!;
+        })();
+
+        const wt = new WebTransport(`https://127.0.0.1:${server.port}/`, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash() }],
+            protocols: ['a', 'b'],
+        });
+        clients.push(wt);
+        await wt.ready;
+        const s = await serverSessionP;
+
+        expect(wt.protocol).toBe('b');
+        expect(s.protocol).toBe('b');
+        expect(s.requestedProtocols).toEqual(['a', 'b']);
+    });
+
+    it('leaves protocol empty when the offer and support sets do not intersect', async () => {
+        const server = new WebTransportServer({
+            port: 0,
+            host: '127.0.0.1',
+            cert: CERT,
+            key: KEY,
+            supportedProtocols: ['y'],
+        });
+        servers.push(server);
+        await server.ready;
+        const wt = new WebTransport(`https://127.0.0.1:${server.port}/`, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash() }],
+            protocols: ['x'],
+        });
+        clients.push(wt);
+        await wt.ready;
+        expect(wt.protocol).toBe('');
+    });
+
+    it('exposes the server CONNECT response headers to the client', async () => {
+        const server = new WebTransportServer({
+            port: 0,
+            host: '127.0.0.1',
+            cert: CERT,
+            key: KEY,
+            responseHeaders: { 'x-server': 'rwt-1' },
+        });
+        servers.push(server);
+        await server.ready;
+        const wt = new WebTransport(`https://127.0.0.1:${server.port}/`, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash() }],
+        });
+        clients.push(wt);
+        await wt.ready;
+        expect(wt.responseHeaders.get('x-server')).toBe('rwt-1');
+    });
+
+    it('rejects a CONNECT whose origin is not in allowedOrigins', async () => {
+        const server = new WebTransportServer({
+            port: 0,
+            host: '127.0.0.1',
+            cert: CERT,
+            key: KEY,
+            allowedOrigins: ['https://good.example'],
+        });
+        servers.push(server);
+        await server.ready;
+
+        const ok = new WebTransport(`https://127.0.0.1:${server.port}/`, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash() }],
+            origin: 'https://good.example',
+        });
+        clients.push(ok);
+        await expect(ok.ready).resolves.toBeUndefined();
+
+        const bad = new WebTransport(`https://127.0.0.1:${server.port}/`, {
+            serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash() }],
+            origin: 'https://evil.example',
+        });
+        clients.push(bad);
+        await expect(bad.ready).rejects.toBeDefined();
+    });
+
     it('getStats reports connection statistics', async () => {
         const url = await echoServer();
         const wt = connect(url);

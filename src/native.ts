@@ -90,6 +90,10 @@ export enum NativeEventType {
 export interface NativeReadyEvent {
     /** Discriminant. */
     type: NativeEventType.Ready;
+    /** The negotiated subprotocol (from `wt-protocol`), or `null` if none. */
+    protocol: string | null;
+    /** The CONNECT 2xx response headers, as ordered `[name, value]` pairs. */
+    responseHeaders: [string, string][];
 }
 
 /**
@@ -117,6 +121,10 @@ export interface NativeServerReadyEvent {
     origin: string | null;
     /** Any additional (non-pseudo) request headers, keyed by header name. */
     headers: Record<string, string>;
+    /** The subprotocols the client offered (from `wt-available-protocols`). */
+    requestedProtocols: string[];
+    /** The subprotocol the server selected (echoed in `wt-protocol`), or `null`. */
+    protocol: string | null;
     /** The client's remote IP address at session establishment. */
     remoteAddress: string;
     /** The client's remote UDP port at session establishment. */
@@ -375,6 +383,7 @@ export interface NativeAddon {
         origin: string | null,
         headerNames: string[],
         headerValues: string[],
+        protocols: string[],
         onEvent: (ev: NativeEvent) => void,
     ): NativeHandle;
     /**
@@ -512,6 +521,10 @@ export interface NativeAddon {
         host: string,
         port: number,
         reusePort: boolean,
+        supportedProtocols: string[],
+        allowedOrigins: string[] | null,
+        responseHeaderNames: string[],
+        responseHeaderValues: string[],
         onEvent: (ev: ServerNativeEvent) => void,
     ): NativeServerHandle;
     /**
@@ -719,6 +732,8 @@ export interface ConnectConfig {
     headerNames: string[];
     /** Additional request header values, parallel to {@link ConnectConfig.headerNames}. */
     headerValues: string[];
+    /** WebTransport subprotocols to offer (preference order); empty for none. */
+    protocols: string[];
 }
 
 /**
@@ -991,6 +1006,10 @@ export class SessionCore {
     private failedState = false;
     /** The most recent stats reported by the native layer, cached for {@link SessionCore.getStats}. */
     private lastStats: WebTransportConnectionStats | undefined;
+    /** The negotiated subprotocol, cached from the ready event (`''` if none). */
+    private cachedProtocol = '';
+    /** The CONNECT response headers, cached from the client ready event. */
+    private cachedResponseHeaders: [string, string][] = [];
 
     /**
      * Resolves when the session is established, rejects if it fails before then.
@@ -1298,9 +1317,16 @@ export class SessionCore {
      */
     public dispatch(ev: NativeEvent): void {
         switch (ev.type) {
-            case NativeEventType.Ready:
+            case NativeEventType.Ready: {
+                this.readyState = true;
+                this.cachedProtocol = ev.protocol ?? '';
+                this.cachedResponseHeaders = ev.responseHeaders;
+                this.ready.resolve();
+                break;
+            }
             case NativeEventType.ServerReady: {
                 this.readyState = true;
+                this.cachedProtocol = ev.protocol ?? '';
                 this.ready.resolve();
                 break;
             }
@@ -1469,6 +1495,16 @@ export class SessionCore {
     public get isReady(): boolean {
         return this.readyState;
     }
+
+    /** @returns The negotiated subprotocol, or `''` if none was negotiated. */
+    public get protocol(): string {
+        return this.cachedProtocol;
+    }
+
+    /** @returns The CONNECT response headers as ordered `[name, value]` pairs. */
+    public get responseHeaders(): [string, string][] {
+        return this.cachedResponseHeaders;
+    }
 }
 
 /**
@@ -1593,6 +1629,7 @@ export function createClientSession(config: ConnectConfig): SessionCore {
             config.origin,
             config.headerNames,
             config.headerValues,
+            config.protocols,
             (ev) => core.dispatch(ev),
         );
         core.attach(new ClientTransport(native, handle));

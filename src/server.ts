@@ -73,6 +73,24 @@ export interface WebTransportServerOptions {
      * @defaultValue `false`
      */
     reusePort?: boolean;
+    /**
+     * WebTransport subprotocols this server supports, in preference order. For
+     * each CONNECT, the first supported protocol that the client also offered is
+     * selected and echoed back (exposed as {@link WebTransportServerSession.protocol}).
+     */
+    supportedProtocols?: string[];
+    /**
+     * If set, only Extended CONNECTs whose `origin` header is in this list are
+     * accepted; all others are rejected with a `403`. When omitted, any origin is
+     * accepted (the application can still inspect {@link WebTransportSessionRequest.origin}).
+     */
+    allowedOrigins?: string[];
+    /**
+     * Extra headers to include on every `200` CONNECT response, for example a
+     * server version or capability token, exposed to the client as
+     * {@link WebTransport.responseHeaders}.
+     */
+    responseHeaders?: Record<string, string>;
 }
 
 /**
@@ -88,6 +106,10 @@ export interface WebTransportSessionRequest {
     origin: string | null;
     /** Any additional (non-pseudo) request headers, keyed by header name. */
     headers: Record<string, string>;
+    /** The subprotocols the client offered in `wt-available-protocols`. */
+    requestedProtocols: string[];
+    /** The subprotocol the server selected for this session, or `null` if none. */
+    protocol: string | null;
     /** The client's remote IP address at session establishment. */
     remoteAddress: string;
     /** The client's remote UDP port at session establishment. */
@@ -108,6 +130,8 @@ export class WebTransportServerSession extends WebTransportSession {
     public readonly origin: string | null;
     /** Any additional (non-pseudo) request headers, keyed by header name. */
     public readonly headers: Record<string, string>;
+    /** The subprotocols the client offered in `wt-available-protocols`. */
+    public readonly requestedProtocols: string[];
     /**
      * The client's remote IP address, as reported by the transport when the
      * session was established. The same for every stream and datagram on this
@@ -133,6 +157,7 @@ export class WebTransportServerSession extends WebTransportSession {
         this.path = request.path;
         this.origin = request.origin;
         this.headers = request.headers;
+        this.requestedProtocols = request.requestedProtocols;
         this.remoteAddress = request.remoteAddress;
         this.remotePort = request.remotePort;
     }
@@ -205,12 +230,23 @@ export class WebTransportServer {
             },
         });
 
+        const responseHeaderNames: string[] = [];
+        const responseHeaderValues: string[] = [];
+        for (const [name, value] of Object.entries(options.responseHeaders ?? {})) {
+            responseHeaderNames.push(name);
+            responseHeaderValues.push(value);
+        }
+
         this.handle = this.native.serverListen(
             options.cert,
             options.key,
             options.host ?? '0.0.0.0',
             options.port,
             options.reusePort ?? false,
+            options.supportedProtocols ?? [],
+            options.allowedOrigins ?? null,
+            responseHeaderNames,
+            responseHeaderValues,
             (ev) => this.onEvent(ev),
         );
     }
@@ -299,6 +335,8 @@ export class WebTransportServer {
                 path: ev.path,
                 origin: ev.origin,
                 headers: ev.headers,
+                requestedProtocols: ev.requestedProtocols,
+                protocol: ev.protocol,
                 remoteAddress: ev.remoteAddress,
                 remotePort: ev.remotePort,
             });

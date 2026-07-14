@@ -46,6 +46,13 @@ pub struct ServerSetup {
     /// workers) can share one listening port and have the kernel load-balance
     /// connections across them.
     pub reuse_port: bool,
+    /// WebTransport subprotocols the server supports (preference order).
+    pub supported_protocols: Vec<String>,
+    /// If `Some`, only Extended CONNECTs whose `origin` is in this list are
+    /// accepted; others are rejected with 403. `None` allows any origin.
+    pub allowed_origins: Option<Vec<String>>,
+    /// Extra headers to add to every 200 CONNECT response.
+    pub response_headers: Vec<(String, String)>,
 }
 
 /// Bind a non-blocking UDP socket, optionally with `SO_REUSEPORT` for clustering.
@@ -448,7 +455,12 @@ fn run_inner(
                         key.clone(),
                         ServerConn {
                             conn,
-                            session: WtSession::new_server(from),
+                            session: WtSession::new_server(
+                                from,
+                                setup.supported_protocols.clone(),
+                                setup.allowed_origins.clone(),
+                                setup.response_headers.clone(),
+                            ),
                             session_id,
                             closed_emitted: false,
                         },

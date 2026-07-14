@@ -96,6 +96,12 @@ export interface WebTransportOptions {
      */
     serverCertificateHashes?: WebTransportHash[];
     /**
+     * WebTransport subprotocols to offer, in preference order. Sent to the server
+     * in the `wt-available-protocols` header; the server's selection is exposed as
+     * {@link WebTransport.protocol}.
+     */
+    protocols?: string[];
+    /**
      * Allow reusing a pooled QUIC connection (best-effort; currently
      * informational).
      *

@@ -249,12 +249,20 @@ pub fn parse_settings(mut payload: &[u8]) -> PeerSettings {
     s
 }
 
+/// Request header carrying the client's offered WebTransport subprotocols
+/// (draft-ietf-webtrans-http3), an RFC 9651 Structured-Field List of Strings.
+pub const WT_AVAILABLE_PROTOCOLS: &[u8] = b"wt-available-protocols";
+/// Response header carrying the server's selected subprotocol, an RFC 9651
+/// Structured-Field Item String.
+pub const WT_PROTOCOL: &[u8] = b"wt-protocol";
+
 /// Build the Extended CONNECT request header list for a WebTransport session.
 pub fn connect_headers(
     authority: &str,
     path: &str,
     origin: Option<&str>,
     extra: &[(String, String)],
+    protocols: &[String],
 ) -> Vec<Header> {
     let mut h = vec![
         Header::new(b":method", b"CONNECT"),
@@ -266,10 +274,101 @@ pub fn connect_headers(
     if let Some(o) = origin {
         h.push(Header::new(b"origin", o.as_bytes()));
     }
+    if !protocols.is_empty() {
+        h.push(Header::new(
+            WT_AVAILABLE_PROTOCOLS,
+            serialize_sf_string_list(protocols).as_bytes(),
+        ));
+    }
     for (k, v) in extra {
         h.push(Header::new(k.as_bytes(), v.as_bytes()));
     }
     h
+}
+
+/// Serialize one token as an RFC 9651 Structured-Field String (double-quoted,
+/// with `"` and `\` backslash-escaped).
+pub fn serialize_sf_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        if c == '"' || c == '\\' {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
+}
+
+/// Serialize a list of tokens as an RFC 9651 Structured-Field List of Strings.
+pub fn serialize_sf_string_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|s| serialize_sf_string(s))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Parse a single RFC 9651 Structured-Field String item (a double-quoted,
+/// backslash-escaped token). Returns `None` if it is not a well-formed sf-string.
+pub fn parse_sf_string_item(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i += 1;
+                match bytes.get(i) {
+                    Some(&e) if e == b'"' || e == b'\\' => out.push(e as char),
+                    _ => return None,
+                }
+            }
+            b'"' => return (i == bytes.len() - 1).then_some(out),
+            b @ 0x20..=0x7e => out.push(b as char),
+            _ => return None,
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Parse an RFC 9651 Structured-Field List of Strings into tokens, tolerating
+/// surrounding whitespace and skipping malformed items.
+pub fn parse_sf_string_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .filter_map(|part| parse_sf_string_item(part.trim()))
+        .collect()
+}
+
+/// Find the first header value for a (lowercase) name.
+pub fn header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]> {
+    headers.iter().find(|h| h.name() == name).map(|h| h.value())
+}
+
+/// Parse the `wt-protocol` response header into the selected subprotocol token.
+pub fn wt_protocol_of(headers: &[Header]) -> Option<String> {
+    let v = header_value(headers, WT_PROTOCOL)?;
+    parse_sf_string_item(std::str::from_utf8(v).ok()?.trim())
+}
+
+/// Collect the non-pseudo response headers as owned UTF-8 (name, value) pairs,
+/// skipping any header whose name or value is not valid UTF-8.
+pub fn response_headers(headers: &[Header]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|h| !h.name().starts_with(b":"))
+        .filter_map(|h| {
+            let n = std::str::from_utf8(h.name()).ok()?;
+            let v = std::str::from_utf8(h.value()).ok()?;
+            Some((n.to_string(), v.to_string()))
+        })
+        .collect()
 }
 
 /// QPACK-encode a header list and wrap it in an HTTP/3 HEADERS frame.
@@ -383,5 +482,47 @@ mod tests {
         assert_eq!(s.wt_initial_max_data, WT_INITIAL_MAX_DATA);
         assert_eq!(s.wt_initial_max_streams_bidi, WT_INITIAL_MAX_STREAMS);
         assert_eq!(s.wt_initial_max_streams_uni, WT_INITIAL_MAX_STREAMS);
+    }
+
+    #[test]
+    fn sf_string_list_roundtrips() {
+        let items = vec!["chat".to_string(), "chat-v2".to_string()];
+        let ser = serialize_sf_string_list(&items);
+        assert_eq!(ser, "\"chat\", \"chat-v2\"");
+        assert_eq!(parse_sf_string_list(&ser), items);
+        // Empty list serializes to empty and parses back to empty.
+        assert_eq!(serialize_sf_string_list(&[]), "");
+        assert!(parse_sf_string_list("").is_empty());
+    }
+
+    #[test]
+    fn sf_string_escapes_quote_and_backslash() {
+        let items = vec!["a\"b\\c".to_string()];
+        let ser = serialize_sf_string_list(&items);
+        assert_eq!(ser, "\"a\\\"b\\\\c\"");
+        assert_eq!(parse_sf_string_list(&ser), items);
+    }
+
+    #[test]
+    fn sf_string_item_rejects_malformed() {
+        assert_eq!(parse_sf_string_item("chat"), None); // unquoted
+        assert_eq!(parse_sf_string_item("\"chat"), None); // no closing quote
+        assert_eq!(parse_sf_string_item("\"a\"b\""), None); // trailing junk
+        assert_eq!(parse_sf_string_item("\"a\\x\""), None); // bad escape
+        assert_eq!(parse_sf_string_item("\"ok\""), Some("ok".to_string()));
+    }
+
+    #[test]
+    fn wt_protocol_and_response_headers_from_list() {
+        let headers = vec![
+            Header::new(b":status", b"200"),
+            Header::new(WT_PROTOCOL, b"\"chat-v2\""),
+            Header::new(b"x-app", b"hello"),
+        ];
+        assert_eq!(wt_protocol_of(&headers), Some("chat-v2".to_string()));
+        let rh = response_headers(&headers);
+        assert!(rh.contains(&("wt-protocol".to_string(), "\"chat-v2\"".to_string())));
+        assert!(rh.contains(&("x-app".to_string(), "hello".to_string())));
+        assert!(!rh.iter().any(|(n, _)| n == ":status"));
     }
 }

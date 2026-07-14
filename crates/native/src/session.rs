@@ -54,7 +54,11 @@ const WT_GRANT_MAX_STREAMS: u64 = 1 << 20;
 #[derive(Debug)]
 pub enum Ev {
     /// The WebTransport session is established (client role: CONNECT got a 2xx).
-    Ready,
+    /// Carries the negotiated subprotocol (if any) and the response headers.
+    Ready {
+        protocol: Option<String>,
+        headers: Vec<(String, String)>,
+    },
     /// The peer sent DRAIN_WEBTRANSPORT_SESSION: it intends to close soon, but
     /// the session and its streams stay usable until an actual close.
     Draining,
@@ -65,6 +69,10 @@ pub enum Ev {
         path: String,
         origin: Option<String>,
         headers: Vec<(String, String)>,
+        /// The subprotocols the client offered (in `wt-available-protocols`).
+        requested_protocols: Vec<String>,
+        /// The subprotocol the server selected (echoed in `wt-protocol`), if any.
+        protocol: Option<String>,
         /// The client's remote IP (as a string) at session establishment.
         remote_addr: String,
         /// The client's remote UDP port at session establishment.
@@ -283,6 +291,16 @@ pub struct WtSession {
     path: String,
     origin: Option<String>,
     extra_headers: Vec<(String, String)>,
+    /// Client role: WebTransport subprotocols we offer (preference order).
+    protocols: Vec<String>,
+    /// Server role: subprotocols we support (preference order); the first that
+    /// the client also offers is selected. Empty means no negotiation.
+    supported_protocols: Vec<String>,
+    /// Server role: if `Some`, only Extended CONNECTs whose `origin` is in this
+    /// list are accepted (others are rejected with 403). `None` allows any.
+    allowed_origins: Option<Vec<String>>,
+    /// Server role: extra headers to add to the 200 CONNECT response.
+    response_headers: Vec<(String, String)>,
 
     next_bidi: u64,
     next_uni: u64,
@@ -339,6 +357,7 @@ impl WtSession {
         path: String,
         origin: Option<String>,
         extra_headers: Vec<(String, String)>,
+        protocols: Vec<String>,
     ) -> Self {
         Self {
             is_server: false,
@@ -346,6 +365,10 @@ impl WtSession {
             path,
             origin,
             extra_headers,
+            protocols,
+            supported_protocols: Vec::new(),
+            allowed_origins: None,
+            response_headers: Vec::new(),
             next_bidi: CLIENT_FIRST_WT_BIDI_ID,
             next_uni: CLIENT_FIRST_WT_UNI_ID,
             setup_sent: false,
@@ -372,13 +395,22 @@ impl WtSession {
     /// A server-role session that will accept an incoming Extended CONNECT.
     /// `remote` is the client's address, surfaced to the application via the
     /// `serverReady` event.
-    pub fn new_server(remote: std::net::SocketAddr) -> Self {
+    pub fn new_server(
+        remote: std::net::SocketAddr,
+        supported_protocols: Vec<String>,
+        allowed_origins: Option<Vec<String>>,
+        response_headers: Vec<(String, String)>,
+    ) -> Self {
         Self {
             is_server: true,
             authority: String::new(),
             path: String::new(),
             origin: None,
             extra_headers: Vec::new(),
+            protocols: Vec::new(),
+            supported_protocols,
+            allowed_origins,
+            response_headers,
             next_bidi: SERVER_FIRST_WT_BIDI_ID,
             next_uni: SERVER_FIRST_WT_UNI_ID,
             setup_sent: false,
@@ -680,6 +712,7 @@ impl WtSession {
             &self.path,
             self.origin.as_deref(),
             &self.extra_headers,
+            &self.protocols,
         );
         match h3::encode_headers_frame(&headers) {
             Ok(frame) => {
@@ -716,7 +749,12 @@ impl WtSession {
                         if (200..300).contains(&status) {
                             if !self.ready {
                                 self.ready = true;
-                                ev.push(Ev::Ready);
+                                let protocol = h3::wt_protocol_of(&headers);
+                                let resp_headers = h3::response_headers(&headers);
+                                ev.push(Ev::Ready {
+                                    protocol,
+                                    headers: resp_headers,
+                                });
                             }
                         } else {
                             ev.push(Ev::Error(format!(
@@ -839,6 +877,7 @@ impl WtSession {
         let mut authority = String::new();
         let mut path = String::from("/");
         let mut origin: Option<String> = None;
+        let mut requested_protocols: Vec<String> = Vec::new();
         let mut extra: Vec<(String, String)> = Vec::new();
         for h in headers {
             let name = h.name();
@@ -849,6 +888,9 @@ impl WtSession {
                 b":authority" => authority = String::from_utf8_lossy(value).into_owned(),
                 b":path" => path = String::from_utf8_lossy(value).into_owned(),
                 b"origin" => origin = Some(String::from_utf8_lossy(value).into_owned()),
+                _ if name == h3::WT_AVAILABLE_PROTOCOLS => {
+                    requested_protocols = h3::parse_sf_string_list(&String::from_utf8_lossy(value));
+                }
                 _ if name.starts_with(b":") => {} // other pseudo-headers
                 _ => extra.push((
                     String::from_utf8_lossy(name).into_owned(),
@@ -863,8 +905,41 @@ impl WtSession {
             return;
         }
 
-        let resp = vec![quiche::h3::Header::new(b":status", b"200")];
-        match h3::encode_headers_frame(&resp) {
+        // Origin verification (draft-ietf-webtrans-http3 3.3): if an allowlist is
+        // configured, the request's origin must be present in it.
+        if let Some(allowed) = &self.allowed_origins {
+            let permitted = origin
+                .as_deref()
+                .map(|o| allowed.iter().any(|a| a == o))
+                .unwrap_or(false);
+            if !permitted {
+                self.reject_connect(conn, id, 403, ev);
+                return;
+            }
+        }
+
+        // Select the first supported subprotocol that the client also offered.
+        let selected: Option<String> = self
+            .supported_protocols
+            .iter()
+            .find(|p| requested_protocols.iter().any(|r| r == *p))
+            .cloned();
+
+        // Build the 200 response: :status, the selected wt-protocol (if any), and
+        // any configured static response headers. Scoped so the borrows of
+        // `self.response_headers` and `selected` end before the stream mutation.
+        let selected_ser = selected.as_ref().map(|p| h3::serialize_sf_string(p));
+        let encoded = {
+            let mut resp = vec![quiche::h3::Header::new(b":status", b"200")];
+            if let Some(val) = &selected_ser {
+                resp.push(quiche::h3::Header::new(h3::WT_PROTOCOL, val.as_bytes()));
+            }
+            for (k, v) in &self.response_headers {
+                resp.push(quiche::h3::Header::new(k.as_bytes(), v.as_bytes()));
+            }
+            h3::encode_headers_frame(&resp)
+        };
+        match encoded {
             Ok(frame) => {
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.out.push_back(OutChunk {
@@ -883,6 +958,8 @@ impl WtSession {
                     path,
                     origin,
                     headers: extra,
+                    requested_protocols,
+                    protocol: selected,
                     remote_addr,
                     remote_port,
                 });
