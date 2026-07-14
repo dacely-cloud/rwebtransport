@@ -591,6 +591,12 @@ impl WtSession {
                         self.mark_closed(ev, 0, b"webtransport not supported".to_vec(), false);
                     }
                 }
+            } else if ty == h3::FRAME_GOAWAY && !self.drain_emitted {
+                // The peer is gracefully shutting down the HTTP/3 connection.
+                // Exactly one WebTransport session rides it, so surface GOAWAY as
+                // the session draining (going away soon, still usable).
+                self.drain_emitted = true;
+                ev.push(Ev::Draining);
             }
         }
     }

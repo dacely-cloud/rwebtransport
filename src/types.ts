@@ -115,6 +115,16 @@ export interface WebTransportOptions {
      * Accepted for spec parity; not currently applied by the transport.
      */
     congestionControl?: WebTransportCongestionControl;
+    /**
+     * Hint for how many incoming unidirectional streams to anticipate, used to
+     * pre-grant flow-control credit. Accepted for spec parity; informational.
+     */
+    anticipatedConcurrentIncomingUnidirectionalStreams?: number | null;
+    /**
+     * Hint for how many incoming bidirectional streams to anticipate. Accepted
+     * for spec parity; informational.
+     */
+    anticipatedConcurrentIncomingBidirectionalStreams?: number | null;
 
     /**
      * Disable ALL certificate verification. Development only, never use against a
