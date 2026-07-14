@@ -2,7 +2,7 @@
 
 `WebTransportServer` is the accepting side of `rwebtransport`: it binds a UDP port with a TLS certificate, speaks HTTP/3 and the WebTransport Extended CONNECT handshake, and hands you one `WebTransportServerSession` per client connection. A server session has the exact same stream and datagram surface as the client `WebTransport` (see [client.md](./client.md)), plus the request metadata from the client's CONNECT (`authority`, `path`, `origin`, `headers`).
 
-One WebTransport session maps to one QUIC connection. The server auto-accepts any valid WebTransport CONNECT and answers `200`, so a session is already established by the time you receive it. To turn a client away, you close the session right after it is surfaced (see [Accepting and rejecting sessions](#accepting-and-rejecting-sessions)).
+One WebTransport session maps to one QUIC connection. The server auto-accepts any valid WebTransport CONNECT and answers `200`, so a session is already established by the time you receive it. The one built-in exception is [`allowedOrigins`](#webtransportserveroptions): if you set it, a CONNECT whose `Origin` is not on the list is rejected with HTTP `403` before the session is ever surfaced. For every other check you turn a client away by closing the session right after it is surfaced (see [Accepting and rejecting sessions](#accepting-and-rejecting-sessions)).
 
 ```ts
 import { WebTransportServer } from 'rwebtransport';
@@ -52,6 +52,9 @@ interface WebTransportServerOptions {
     cert: string; // path to the PEM certificate-chain file
     key: string; // path to the PEM private-key file
     reusePort?: boolean; // share the port across processes (Unix), default false
+    supportedProtocols?: string[]; // subprotocols the server supports, preference order
+    allowedOrigins?: string[]; // if set, reject any CONNECT whose Origin is not listed (HTTP 403)
+    responseHeaders?: Record<string, string>; // extra headers added to every 200 CONNECT response
 }
 ```
 
@@ -62,6 +65,9 @@ interface WebTransportServerOptions {
 | `cert`      | `string`  | yes      | Filesystem path to a PEM file containing the server certificate chain (leaf first). This is a path, not the PEM text.                                                                                                                                                      |
 | `key`       | `string`  | yes      | Filesystem path to a PEM file containing the private key for `cert`. This is a path, not the PEM text.                                                                                                                                                                     |
 | `reusePort` | `boolean` | no       | Bind with `SO_REUSEPORT` so multiple processes (for example Node `cluster` workers) can share one listening port and have the kernel load-balance connections across them. Defaults to `false`. Unix-only; ignored on Windows. See [threading.md](./threading.md#cluster). |
+| `supportedProtocols` | `string[]` | no | WebTransport subprotocols the server supports, in preference order. For each CONNECT the server selects the first supported protocol the client also offered and echoes it (`wt-protocol`); the choice is exposed as [`session.protocol`](#webtransportserversession). When omitted or empty, no subprotocol is negotiated. |
+| `allowedOrigins` | `string[]` | no | If set, a CONNECT whose `Origin` header is not in this list is rejected with HTTP `403` before the session is surfaced (the client's `ready` rejects). When omitted, any origin is accepted and the app can still inspect [`session.origin`](#webtransportserversession). See [Accepting and rejecting sessions](#accepting-and-rejecting-sessions). |
+| `responseHeaders` | `Record<string, string>` | no | Static extra headers added to every `200` CONNECT response. The client reads them back as `WebTransport.responseHeaders` (see [client.md](./client.md)). |
 
 Both `cert` and `key` are file paths that the native layer reads at bind time. A missing file, an unreadable key, or a cert and key that do not match are fatal: `ready` (and `closed`) reject with a `WebTransportError`.
 
@@ -127,6 +133,7 @@ Shared surface (identical to the client, documented in [client.md](./client.md),
 | `createBidirectionalStream()`   | `Promise<WebTransportBidirectionalStream>`        | Open a bidi stream from the server.                                                                            |
 | `createUnidirectionalStream()`  | `Promise<WebTransportSendStream>`                 | Open a send-only stream from the server.                                                                       |
 | `close(closeInfo?)`             | `void`                                            | Close this session. `closeInfo` is `{ closeCode?: number; reason?: string }`.                                  |
+| `exportKeyingMaterial(label, context, length)` | `Promise<Uint8Array>`              | Export RFC 5705 TLS keying material bound to this session, for channel binding. Both endpoints of the same session derive identical bytes for the same `label`/`context`/`length`, and nobody outside the TLS session can. Rejects if the session is closed or unusable, or the TLS export fails (for example before the handshake). `label` and `context` are required (`context` may be an empty buffer). |
 
 Request metadata (only on `WebTransportServerSession`):
 
@@ -136,6 +143,8 @@ Request metadata (only on `WebTransportServerSession`):
 | `path`      | `string`                 | The `:path` of the client's CONNECT, taken from the URL the client connected to (for example `/chat/room1`). |
 | `origin`    | `string \| null`         | The `origin` request header, or `null` if the client sent none.                                              |
 | `headers`   | `Record<string, string>` | Any additional (non-pseudo) request headers the client sent.                                                 |
+| `requestedProtocols` | `string[]`      | The WebTransport subprotocols the client offered in its CONNECT, in the client's preference order.           |
+| `protocol`  | `string`                 | The subprotocol selected for this session from [`supportedProtocols`](#webtransportserveroptions), or `''` if none was negotiated.                          |
 
 Use `path`, `origin`, and `headers` to route and authorize each session, as shown next.
 
@@ -143,7 +152,9 @@ Use `path`, `origin`, and `headers` to route and authorize each session, as show
 
 There is no explicit accept call. The server has already answered the CONNECT with `200` by the time a `WebTransportServerSession` reaches `incomingSessions`, so simply keeping the session (and starting to read its streams and datagrams) is how you accept it.
 
-To reject a client, close the session as soon as you see it. You can decide based on `path`, `origin`, `headers`, or anything else. Closing a freshly surfaced session tears it down right away; the client observes its own `session.closed` settling. Passing a `closeCode` and `reason` lets you communicate why:
+One rejection is built in and happens earlier. If you set [`allowedOrigins`](#webtransportserveroptions), the server checks the CONNECT's `Origin` header against that list and answers HTTP `403` (so the client's `ready` rejects) before the session is ever surfaced, so those clients never reach `incomingSessions` at all. This is an origin gate complementary to the close-based rejection below; the auto-accept-then-close model still applies to every other check. When `allowedOrigins` is omitted, any origin is accepted and you can still inspect `session.origin` yourself.
+
+To reject a client on any other criterion, close the session as soon as you see it. You can decide based on `path`, `origin`, `headers`, or anything else. Closing a freshly surfaced session tears it down right away; the client observes its own `session.closed` settling. Passing a `closeCode` and `reason` lets you communicate why:
 
 ```ts
 function handleSession(session: WebTransportServerSession): void {

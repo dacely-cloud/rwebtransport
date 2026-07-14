@@ -44,6 +44,7 @@
 4. [Reliable streams and unreliable datagrams](#reliable-streams-and-unreliable-datagrams)
 5. [The client API](#the-client-api)
     - [Connecting](#connecting)
+    - [Subprotocols, response headers, and keying material](#subprotocols-response-headers-and-keying-material)
     - [Bidirectional streams](#bidirectional-streams)
     - [Unidirectional streams](#unidirectional-streams)
     - [Datagrams](#datagrams)
@@ -307,9 +308,33 @@ await wt.closed;  // resolves when the session ends cleanly, rejects on abnormal
 | `insecure`                                               | `boolean`                                         | Node extension. Disable **all** certificate verification. Development only.                                                                               |
 | `headers`                                                | `Record<string, string>`                          | Node extension. Extra request headers on the Extended CONNECT.                                                                                            |
 | `origin`                                                 | `string`                                          | Node extension. Value for the `Origin` request header.                                                                                                    |
+| `protocols`                                              | `string[]`                                        | WebTransport subprotocols to offer, in preference order. Sent in the Extended CONNECT `wt-available-protocols` header; the server's choice is read back via `wt.protocol`. |
 | `allowPooling`, `requireUnreliable`, `congestionControl` |                                                   | Accepted for spec parity; currently informational.                                                                                                        |
 
+A pinned certificate is still validated beyond its fingerprint, matching what browsers enforce: it must be currently valid (now within `notBefore`..`notAfter`), have a total validity period of at most 14 days (`notAfter - notBefore`), and use an ECDSA key on the NIST P-256 (secp256r1) curve. A pinned cert that fails any of these is rejected: the handshake fails and `ready` rejects with a `WebTransportError`.
+
 When neither `serverCertificateHashes` nor `insecure` is set, the client performs full PKI validation against the system trust store with hostname checking.
+
+### Subprotocols, response headers, and keying material
+
+Once `ready` resolves, a few more W3C session attributes are available:
+
+- `wt.protocol` is the subprotocol the server negotiated from the `protocols` you offered, or `''` if none was negotiated.
+- `wt.responseHeaders` is a `Headers` object holding the headers from the server's Extended CONNECT `2xx` response (empty until the session is established).
+- `wt.exportKeyingMaterial(label, context, outputLength)` returns a `Promise<Uint8Array>` of RFC 5705 TLS keying material bound to this session. Both endpoints of the same session derive identical bytes for the same `label`, `context`, and length, and nobody outside the TLS session can, which makes it suitable for channel binding. `label` and `context` are required (`context` may be an empty buffer); the promise rejects if the session is closed or unusable or the TLS export fails (for example before the handshake completes). It is present on both client and server sessions.
+
+```ts
+await wt.ready;
+wt.protocol;         // negotiated subprotocol, or '' if none
+wt.responseHeaders;  // Headers from the server's Extended CONNECT response
+
+// RFC 5705 keying material for channel binding: identical bytes on both ends.
+const keyingMaterial = await wt.exportKeyingMaterial(
+    new TextEncoder().encode('rwebtransport channel binding'),
+    new Uint8Array(0), // context (may be empty)
+    32,                // output length in bytes
+);
+```
 
 ### Bidirectional streams
 
@@ -392,7 +417,9 @@ for (;;) {
 }
 ```
 
-`WebTransportServerSession` exposes `ready`, `closed`, `datagrams`, `createBidirectionalStream()`, `createUnidirectionalStream()`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, and `close()`, identical to the client, plus the request metadata (`authority`, `path`, `origin`, `headers`). The server runs on the same quiche engine and inherits the same panic containment and hostile-peer hardening as the client.
+`WebTransportServerSession` exposes `ready`, `closed`, `datagrams`, `createBidirectionalStream()`, `createUnidirectionalStream()`, `incomingBidirectionalStreams`, `incomingUnidirectionalStreams`, `exportKeyingMaterial()`, and `close()`, identical to the client, plus the request metadata (`authority`, `path`, `origin`, `headers`, `requestedProtocols`, and the negotiated `protocol`). The server runs on the same quiche engine and inherits the same panic containment and hostile-peer hardening as the client.
+
+`WebTransportServerOptions` also accepts a few negotiation fields alongside `host`, `port`, `cert`, and `key`. `supportedProtocols` lists the subprotocols the server supports, in preference order; for each CONNECT the server selects the first supported protocol the client also offered, echoes it (`wt-protocol`), and exposes it as `session.protocol` (`session.requestedProtocols` holds everything the client offered). `allowedOrigins`, when set, is a built-in origin gate: a CONNECT whose `Origin` header is not in the list is rejected with HTTP 403 before the session is surfaced, so the client's `ready` rejects; when omitted, any origin is accepted and the app can still inspect `session.origin`. `responseHeaders` is a `Record<string, string>` of static extra headers added to every `200` CONNECT response, visible to the client as `wt.responseHeaders`.
 
 ---
 

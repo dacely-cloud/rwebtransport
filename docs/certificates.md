@@ -76,6 +76,14 @@ await wt.ready; // resolves only if the server's leaf cert hashes to `value`
 
 You can pass more than one entry to pin during a certificate rotation (accept the old and the new fingerprint at once). If the presented certificate matches none of them, the handshake fails and `ready` rejects.
 
+A matching fingerprint is necessary but no longer sufficient. As of v0.2.0 the client also validates the pinned leaf beyond the hash, matching what browsers enforce. A pinned certificate is accepted only if all three of these hold:
+
+- it is **currently valid** (the present time falls within `notBefore..notAfter`),
+- its **total validity period is at most 14 days** (`notAfter - notBefore <= 14 days`), and
+- its key is **ECDSA on the NIST P-256 (secp256r1) curve**.
+
+A pinned certificate that fails any one of these is rejected even when its fingerprint matches: the handshake fails and `ready` rejects with a `WebTransportError`. See [The 14-day validity rule for pinned certificates](#the-14-day-validity-rule-for-pinned-certificates) below.
+
 The same fingerprint can be read straight from the certificate file with `openssl`, which is handy for logging or for pinning from another language:
 
 ```sh
@@ -116,7 +124,7 @@ Both `cert` and `key` are paths on disk, not inline PEM strings. `cert` may cont
 
 ## Generating a development certificate with openssl
 
-A self-signed EC (P-256) certificate is enough for local development and for pinning. The repository ships a ready-made script at [../examples/generate-cert.sh](../examples/generate-cert.sh); the commands it runs are:
+A self-signed EC (P-256) certificate is enough for local development and for pinning. The repository ships a ready-made script at [../examples/generate-cert.sh](../examples/generate-cert.sh); it now issues a 13-day certificate (so a pinned copy stays under the 14-day cap) with an EC P-256 key. The commands it runs are:
 
 ```sh
 # 1. Private key: EC on the prime256v1 (P-256) curve.
@@ -128,7 +136,7 @@ openssl ecparam -name prime256v1 -genkey -noout -out key.pem
 openssl req -new -x509 \
   -key key.pem \
   -out cert.pem \
-  -days 90 \
+  -days 13 \
   -subj "/CN=localhost" \
   -addext "subjectAltName=DNS:localhost,IP:127.0.0.1,IP:::1"
 
@@ -142,7 +150,13 @@ Point the server at `cert.pem` and `key.pem`, then have the client either pin th
 
 Real browsers accept a certificate pinned through `serverCertificateHashes` **only if its validity period is at most 14 days** (measured from `notBefore` to `notAfter`). This is a deliberate limit in the WebTransport specification: a pinned, un-revocable certificate should be short-lived.
 
-`rwebtransport` does **not** enforce this limit. The client will accept a matching pinned certificate with any validity period, which is why the development script above can issue a 90-day certificate and still pin it. If you intend the same server and pin to also be reachable from a browser, keep the certificate's validity window to 14 days or less and rotate it on a schedule, or the browser will refuse it even though this Node client accepts it.
+As of v0.2.0 `rwebtransport` **enforces the same rules browsers do**. A certificate pinned through `serverCertificateHashes` is accepted only when all three of these hold:
+
+- it is **currently valid** (the present time is within `notBefore..notAfter`),
+- its **total validity period is at most 14 days** (`notAfter - notBefore <= 14 days`), and
+- its key is **ECDSA on the NIST P-256 (secp256r1) curve**.
+
+If a pinned certificate fails any of these, the client rejects it even when the fingerprint matches: the handshake fails and `ready` rejects with a `WebTransportError`. Because of this, development certificates you intend to pin must be short-lived (14 days or less), use an EC P-256 key, and be rotated on a schedule before they expire. The development script above issues a 13-day EC P-256 certificate for exactly this reason.
 
 ## See also
 

@@ -69,6 +69,7 @@ interface WebTransportOptions {
     insecure?: boolean;
     headers?: Record<string, string>;
     origin?: string;
+    protocols?: string[];
 
     // Accepted for spec parity, currently informational (see below).
     allowPooling?: boolean;
@@ -103,8 +104,13 @@ Notes:
 - `value` is any `BufferSource` (a `Uint8Array`, `Buffer`, typed array, `DataView`,
   or `ArrayBuffer`) and must be exactly 32 bytes.
 - You may pass more than one hash; a match against any entry is accepted.
-- Browser WebTransport additionally caps the certificate validity period for this
-  mode. This client does not impose that cap.
+- A matching fingerprint is not enough on its own. This client now enforces the
+  same constraints browsers apply to a pinned leaf: it must be currently valid
+  (the present time falls within `notBefore..notAfter`), its total validity
+  period must be at most 14 days (`notAfter - notBefore <= 14 days`), and it must
+  use an ECDSA key on the NIST P-256 (`secp256r1`) curve. A pinned certificate
+  that violates any of these is rejected: the handshake fails and `ready` rejects
+  with a `WebTransportError`.
 
 ### `insecure` (Node extension)
 
@@ -137,6 +143,21 @@ The value to send in the `Origin` request header. Defaults to none.
 const wt = new WebTransport('https://example.com:4433/echo', {
     origin: 'https://app.example.com',
 });
+```
+
+### `protocols`
+
+The WebTransport subprotocols the client offers, in preference order. They are
+sent to the server in the `wt-available-protocols` Extended CONNECT header (an
+RFC 9651 structured-field list). The server picks one and echoes it back; read
+its selection through [`protocol`](#protocol).
+
+```ts
+const wt = new WebTransport('https://example.com:4433/chat', {
+    protocols: ['chat.v2', 'chat.v1'],
+});
+await wt.ready;
+console.log('server selected', wt.protocol); // '' if none was negotiated
 ```
 
 ### Informational options
@@ -181,6 +202,42 @@ await wt.ready; // throws WebTransportError on any of the above
 
 Always `await ready` (or attach a `.catch`) before using the session; an
 unhandled rejection here is the most common client mistake.
+
+---
+
+## `protocol`
+
+```ts
+readonly protocol: string
+```
+
+The subprotocol the server negotiated from the list you offered in
+[`protocols`](#protocols), or `''` when none was negotiated (and before the
+session is ready). This mirrors the W3C `protocol` attribute.
+
+```ts
+await wt.ready;
+if (wt.protocol === 'chat.v2') {
+    // speak the v2 dialect
+}
+```
+
+---
+
+## `responseHeaders`
+
+```ts
+readonly responseHeaders: Headers
+```
+
+The headers from the server's Extended CONNECT `2xx` response, as a `Headers`
+object. It is empty until the session is established. This mirrors the W3C
+`responseHeaders` attribute and is client only.
+
+```ts
+await wt.ready;
+const version = wt.responseHeaders.get('x-server-version');
+```
 
 ---
 
@@ -361,6 +418,38 @@ After it is called, `closed` resolves with the code and reason you supplied.
 ```ts
 wt.close(); // clean close, code 0
 wt.close({ closeCode: 17, reason: 'done' }); // with an application code
+```
+
+---
+
+## `exportKeyingMaterial()`
+
+```ts
+exportKeyingMaterial(
+    label: BufferSource,
+    context: BufferSource,
+    outputLength: number,
+): Promise<Uint8Array>
+```
+
+Exports RFC 5705 TLS keying material bound to this session. This method is
+present on both the client and the server session. Both endpoints of the same
+session derive identical bytes for the same `label`, `context`, and
+`outputLength`, and nobody outside the TLS session can, which makes the result
+suitable for channel binding.
+
+`label` and `context` are both required; `context` may be an empty buffer. The
+promise rejects if the session is closed or otherwise unusable, or if the TLS
+export fails (for example when called before the handshake completes).
+
+```ts
+await wt.ready;
+const key = await wt.exportKeyingMaterial(
+    new TextEncoder().encode('rwebtransport channel binding'),
+    new Uint8Array(0),
+    32,
+);
+// The server derives the same 32 bytes for the same label and context.
 ```
 
 ---
