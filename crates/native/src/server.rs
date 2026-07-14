@@ -108,6 +108,10 @@ pub enum ServerCommand {
         code: u32,
         reason: Vec<u8>,
     },
+    /// Send a DRAIN_WEBTRANSPORT_SESSION capsule to one session's peer.
+    Drain {
+        session: u64,
+    },
     /// Tear the whole server down.
     Shutdown,
 }
@@ -556,7 +560,8 @@ fn apply_command(
         | ServerCommand::StopSending { session, .. }
         | ServerCommand::SetPaused { session, .. }
         | ServerCommand::SendDatagram { session, .. }
-        | ServerCommand::CloseSession { session, .. } => *session,
+        | ServerCommand::CloseSession { session, .. }
+        | ServerCommand::Drain { session } => *session,
         ServerCommand::Shutdown => return,
     };
     let Some(scid) = sessions.get(&session_id) else {
@@ -594,6 +599,7 @@ fn apply_command(
             .session
             .send_datagram(&mut server.conn, &data, request_id, &mut evs),
         ServerCommand::CloseSession { code, reason, .. } => server.session.close(code, reason),
+        ServerCommand::Drain { .. } => server.session.send_drain(),
         ServerCommand::Shutdown => {}
     }
     // Surface events produced synchronously by the command (StreamOpened,

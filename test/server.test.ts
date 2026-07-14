@@ -182,6 +182,23 @@ describe('WebTransportServer', () => {
         expect(received).toEqual(payload);
     });
 
+    it('resolves the client draining promise when the server drains the session', async () => {
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+        void (async () => {
+            const sreader = server.incomingSessions.getReader();
+            const { value: session } = await sreader.read();
+            if (session) session.drain(); // send DRAIN_WEBTRANSPORT_SESSION
+        })();
+
+        const wt = connect(`https://127.0.0.1:${server.port}/drain`);
+        await wt.ready;
+        // The session stays usable; draining just signals intent to close soon.
+        await expect(wt.draining).resolves.toBeUndefined();
+        expect(wt.reliability).toBe('supports-unreliable');
+    });
+
     it('reports reliability pending before ready, supports-unreliable after', async () => {
         const url = await echoServer();
         const wt = connect(url);

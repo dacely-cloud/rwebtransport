@@ -415,6 +415,8 @@ export interface NativeAddon {
      * @param reason - The UTF-8 encoded close reason.
      */
     closeSession(handle: NativeHandle, code: number, reason: Uint8Array): void;
+    /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
+    drain(handle: NativeHandle): void;
     /**
      * Tear down the session's driver thread. Called on close; the native
      * finalizer also invokes it as a safety net.
@@ -555,6 +557,8 @@ export interface NativeAddon {
         code: number,
         reason: Uint8Array,
     ): void;
+    /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to one session's peer. */
+    serverDrain(handle: NativeServerHandle, session: number): void;
     /**
      * Stop the server, closing all its sessions and freeing the listening socket.
      *
@@ -817,6 +821,8 @@ export interface SessionTransport {
      * @param reason - The UTF-8 encoded close reason.
      */
     closeSession(code: number, reason: Uint8Array): void;
+    /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
+    drain(): void;
     /** Tear down the session's native resources. */
     shutdown(): void;
 }
@@ -1030,6 +1036,11 @@ export class SessionCore {
     public close(code: number, reason: string): void {
         if (this.closedState || !this.transport) return;
         this.transport.closeSession(code >>> 0, new TextEncoder().encode(reason));
+    }
+
+    /** Tell the peer this session is draining (send a DRAIN capsule). */
+    public drain(): void {
+        this.transport?.drain();
     }
 
     /** Tear down the native resources for this session. No-op if not attached. */
@@ -1320,6 +1331,10 @@ class ClientTransport implements SessionTransport {
     public closeSession(code: number, reason: Uint8Array): void {
         this.native.closeSession(this.handle, code, reason);
     }
+    /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
+    public drain(): void {
+        this.native.drain(this.handle);
+    }
     /** Tear down the session's native driver thread. */
     public shutdown(): void {
         this.native.shutdown(this.handle);
@@ -1436,6 +1451,10 @@ export class ServerTransport implements SessionTransport {
      */
     public closeSession(code: number, reason: Uint8Array): void {
         this.native.serverCloseSession(this.handle, this.session, code, reason);
+    }
+    /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to this session's peer. */
+    public drain(): void {
+        this.native.serverDrain(this.handle, this.session);
     }
     /**
      * No-op: the server driver owns the session lifecycle, so there is nothing to
