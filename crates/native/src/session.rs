@@ -108,6 +108,12 @@ pub enum Ev {
         rtt_variation_ms: f64,
         min_rtt_ms: f64,
     },
+    /// Result of an exportKeyingMaterial() request: the exported bytes, or
+    /// `None` if the TLS export failed (for example, before the handshake).
+    KeyingMaterial {
+        request_id: u64,
+        data: Option<Vec<u8>>,
+    },
 }
 
 /// Snapshot a quiche connection's stats into a [`Ev::Stats`] for `request_id`.
@@ -133,6 +139,25 @@ pub fn build_stats(conn: &quiche::Connection, request_id: u64) -> Ev {
         rtt_variation_ms: to_ms(rttvar),
         min_rtt_ms: to_ms(min_rtt),
     }
+}
+
+/// Export `length` bytes of TLS keying material (RFC 5705) into a
+/// [`Ev::KeyingMaterial`] for `request_id`. `data` is `None` if the export
+/// failed. WebTransport always supplies a context, so it is passed through even
+/// when empty (an empty context differs from no context per RFC 5705).
+pub fn build_keying_material(
+    conn: &mut quiche::Connection,
+    request_id: u64,
+    label: &[u8],
+    context: &[u8],
+    length: u32,
+) -> Ev {
+    let mut out = vec![0u8; length as usize];
+    let data = match conn.export_keying_material(&mut out, label, Some(context)) {
+        Ok(()) => Some(out),
+        Err(_) => None,
+    };
+    Ev::KeyingMaterial { request_id, data }
 }
 
 /// One queued outbound chunk on a stream.

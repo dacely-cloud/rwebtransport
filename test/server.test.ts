@@ -254,6 +254,39 @@ describe('WebTransportServer', () => {
         expect(wt.reliability).toBe('supports-unreliable');
     });
 
+    it('exportKeyingMaterial derives identical bytes on both endpoints', async () => {
+        // Both peers share one TLS session, so RFC 5705 export with the same
+        // label/context/length MUST yield identical bytes end to end.
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+        const serverSessionP = (async () => {
+            const reader = server.incomingSessions.getReader();
+            const { value } = await reader.read();
+            return value!;
+        })();
+
+        const wt = connect(`https://127.0.0.1:${server.port}/ekm`);
+        await wt.ready;
+        const serverSession = await serverSessionP;
+
+        const eq = (a: Uint8Array, b: Uint8Array) =>
+            a.length === b.length && a.every((v, i) => v === b[i]);
+
+        const label = enc.encode('rwebtransport exporter test');
+        const context = enc.encode('context-abcd');
+        const clientKm = await wt.exportKeyingMaterial(label, context, 32);
+        const serverKm = await serverSession.exportKeyingMaterial(label, context, 32);
+
+        expect(clientKm).toBeInstanceOf(Uint8Array);
+        expect(clientKm.byteLength).toBe(32);
+        expect(eq(clientKm, serverKm)).toBe(true);
+
+        // A different label yields unrelated material.
+        const other = await wt.exportKeyingMaterial(enc.encode('other label'), context, 32);
+        expect(eq(other, clientKm)).toBe(false);
+    });
+
     it('round-trips a stream reset code through the HTTP/3 error range', async () => {
         // The server resets its send side with application code 42. The code is
         // mapped into the HTTP/3 WT_APPLICATION_ERROR range on the wire and back,

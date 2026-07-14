@@ -7595,6 +7595,17 @@ impl<F: BufFactory> Connection<F> {
         self.alpn.as_ref()
     }
 
+    /// Exports keying material from the TLS session (RFC 5705).
+    ///
+    /// Writes `out.len()` bytes of keying material, derived from `label` and the
+    /// optional `context`, into `out`. Only available once the handshake has
+    /// completed; calling it earlier returns [`Error::TlsFail`].
+    pub fn export_keying_material(
+        &mut self, out: &mut [u8], label: &[u8], context: Option<&[u8]>,
+    ) -> Result<()> {
+        self.handshake.export_keying_material(out, label, context)
+    }
+
     /// Returns the server name requested by the client.
     #[inline]
     pub fn server_name(&self) -> Option<&str> {

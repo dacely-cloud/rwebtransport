@@ -410,6 +410,21 @@ fn get_stats(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn export_keying_material(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
+    let request_id = to_request_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let label = cx.argument::<JsTypedArray<u8>>(2)?.as_slice(&cx).to_vec();
+    let context = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
+    let length = cx.argument::<JsNumber>(4)?.value(&mut cx) as u32;
+    handle.send(Command::ExportKeyingMaterial {
+        request_id,
+        label,
+        context,
+        length,
+    });
+    Ok(cx.undefined())
+}
+
 fn shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     handle.send(Command::Shutdown);
@@ -651,6 +666,23 @@ fn server_get_stats(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn server_export_keying_material(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let request_id = to_request_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    let label = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
+    let context = cx.argument::<JsTypedArray<u8>>(4)?.as_slice(&cx).to_vec();
+    let length = cx.argument::<JsNumber>(5)?.value(&mut cx) as u32;
+    handle.send(ServerCommand::ExportKeyingMaterial {
+        session,
+        request_id,
+        label,
+        context,
+        length,
+    });
+    Ok(cx.undefined())
+}
+
 fn server_shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
     handle.send(ServerCommand::Shutdown);
@@ -797,6 +829,19 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
             set_num(cx, &obj, "requestId", *request_id as f64)?;
             set_bool(cx, &obj, "sent", *sent)?;
         }
+        Ev::KeyingMaterial { request_id, data } => {
+            set_str(cx, &obj, "type", "keyingMaterial")?;
+            set_num(cx, &obj, "requestId", *request_id as f64)?;
+            match data {
+                Some(bytes) => {
+                    set_bool(cx, &obj, "ok", true)?;
+                    set_buf(cx, &obj, "data", bytes)?;
+                }
+                None => {
+                    set_bool(cx, &obj, "ok", false)?;
+                }
+            }
+        }
     }
     Ok(obj)
 }
@@ -861,6 +906,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("closeSession", close_session)?;
     cx.export_function("drain", drain)?;
     cx.export_function("getStats", get_stats)?;
+    cx.export_function("exportKeyingMaterial", export_keying_material)?;
     cx.export_function("shutdown", shutdown)?;
 
     // Server surface.
@@ -876,6 +922,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serverCloseSession", server_close_session)?;
     cx.export_function("serverDrain", server_drain)?;
     cx.export_function("serverGetStats", server_get_stats)?;
+    cx.export_function("serverExportKeyingMaterial", server_export_keying_material)?;
     cx.export_function("serverShutdown", server_shutdown)?;
     Ok(())
 }

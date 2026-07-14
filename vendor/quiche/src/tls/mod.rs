@@ -666,6 +666,38 @@ impl Handshake {
         }
     }
 
+    /// Export keying material from the completed TLS handshake (RFC 5705).
+    ///
+    /// Fills `out` with `out.len()` bytes derived from `label` and the optional
+    /// `context`. Fails if the handshake has not completed.
+    pub fn export_keying_material(
+        &mut self, out: &mut [u8], label: &[u8], context: Option<&[u8]>,
+    ) -> Result<()> {
+        let (context, context_len, use_context) = match context {
+            Some(c) => (c.as_ptr(), c.len(), 1),
+            None => (ptr::null(), 0, 0),
+        };
+
+        let rc = unsafe {
+            SSL_export_keying_material(
+                self.as_mut_ptr(),
+                out.as_mut_ptr(),
+                out.len(),
+                label.as_ptr() as *const c_char,
+                label.len(),
+                context,
+                context_len,
+                use_context,
+            )
+        };
+
+        if rc == 1 {
+            Ok(())
+        } else {
+            Err(Error::TlsFail)
+        }
+    }
+
     #[cfg(feature = "boringssl-boring-crate")]
     pub(crate) fn ssl_mut(&mut self) -> &mut boring::ssl::SslRef {
         use foreign_types_shared::ForeignTypeRef;
@@ -1205,6 +1237,12 @@ extern "C" {
     fn SSL_in_init(ssl: *const SSL) -> c_int;
 
     fn SSL_clear(ssl: *mut SSL) -> c_int;
+
+    fn SSL_export_keying_material(
+        ssl: *mut SSL, out: *mut u8, out_len: usize, label: *const c_char,
+        label_len: usize, context: *const u8, context_len: usize,
+        use_context: c_int,
+    ) -> c_int;
 
     fn SSL_free(ssl: *mut SSL);
 

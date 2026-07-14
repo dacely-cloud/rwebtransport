@@ -79,6 +79,14 @@ pub enum Command {
     GetStats {
         request_id: u64,
     },
+    /// Export TLS keying material (RFC 5705); the result arrives as a
+    /// `keyingMaterial` event.
+    ExportKeyingMaterial {
+        request_id: u64,
+        label: Vec<u8>,
+        context: Vec<u8>,
+        length: u32,
+    },
     /// Tear the driver down (the JS handle was closed/GC'd).
     Shutdown,
 }
@@ -350,6 +358,14 @@ fn run_inner(
                 Command::GetStats { request_id } => {
                     evs.push(crate::session::build_stats(&conn, request_id))
                 }
+                Command::ExportKeyingMaterial {
+                    request_id,
+                    label,
+                    context,
+                    length,
+                } => evs.push(crate::session::build_keying_material(
+                    &mut conn, request_id, &label, &context, length,
+                )),
                 Command::Shutdown => {
                     shutdown = true;
                     break;

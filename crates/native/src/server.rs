@@ -117,6 +117,15 @@ pub enum ServerCommand {
         session: u64,
         request_id: u64,
     },
+    /// Export TLS keying material (RFC 5705) for one session; result arrives as
+    /// a `keyingMaterial` event.
+    ExportKeyingMaterial {
+        session: u64,
+        request_id: u64,
+        label: Vec<u8>,
+        context: Vec<u8>,
+        length: u32,
+    },
     /// Tear the whole server down.
     Shutdown,
 }
@@ -567,7 +576,8 @@ fn apply_command(
         | ServerCommand::SendDatagram { session, .. }
         | ServerCommand::CloseSession { session, .. }
         | ServerCommand::Drain { session }
-        | ServerCommand::GetStats { session, .. } => *session,
+        | ServerCommand::GetStats { session, .. }
+        | ServerCommand::ExportKeyingMaterial { session, .. } => *session,
         ServerCommand::Shutdown => return,
     };
     let Some(scid) = sessions.get(&session_id) else {
@@ -609,6 +619,19 @@ fn apply_command(
         ServerCommand::GetStats { request_id, .. } => {
             evs.push(crate::session::build_stats(&server.conn, request_id))
         }
+        ServerCommand::ExportKeyingMaterial {
+            request_id,
+            label,
+            context,
+            length,
+            ..
+        } => evs.push(crate::session::build_keying_material(
+            &mut server.conn,
+            request_id,
+            &label,
+            &context,
+            length,
+        )),
         ServerCommand::Shutdown => {}
     }
     // Surface events produced synchronously by the command (StreamOpened,

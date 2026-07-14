@@ -73,6 +73,8 @@ export enum NativeEventType {
     DatagramAck = 'datagramAck',
     /** Result of a {@link NativeAddon.getStats} request. */
     Stats = 'stats',
+    /** Result of a {@link NativeAddon.exportKeyingMaterial} request. */
+    KeyingMaterial = 'keyingMaterial',
     /** Server level: the listener is bound (carries the port). */
     Listening = 'listening',
     /** Server level: a fatal server failure. */
@@ -292,6 +294,22 @@ export interface NativeStatsEvent {
 }
 
 /**
+ * The result of a {@link NativeAddon.exportKeyingMaterial} request, keyed by
+ * `requestId`.
+ * @internal
+ */
+export interface NativeKeyingMaterialEvent {
+    /** Discriminant. */
+    type: NativeEventType.KeyingMaterial;
+    /** The request id passed to {@link NativeAddon.exportKeyingMaterial}. */
+    requestId: number;
+    /** True if the export succeeded; false if the TLS export failed. */
+    ok: boolean;
+    /** The exported keying material, present only when `ok` is true. */
+    data?: Uint8Array;
+}
+
+/**
  * Events delivered by the native addon to a client session's, or one server
  * session's, `onEvent` callback.
  *
@@ -315,7 +333,8 @@ export type NativeEvent =
     | NativeStreamOpenedEvent
     | NativeWriteAckEvent
     | NativeDatagramAckEvent
-    | NativeStatsEvent;
+    | NativeStatsEvent
+    | NativeKeyingMaterialEvent;
 
 /**
  * The raw function surface exported by `rwebtransport.node`.
@@ -449,6 +468,23 @@ export interface NativeAddon {
     drain(handle: NativeHandle): void;
     /** Request connection stats; the result arrives as a `stats` event. */
     getStats(handle: NativeHandle, requestId: number): void;
+    /**
+     * Export TLS keying material (RFC 5705); the result arrives as a
+     * `keyingMaterial` event.
+     *
+     * @param handle - The session handle.
+     * @param requestId - Correlates the reply event.
+     * @param label - The exporter label bytes.
+     * @param context - The exporter context bytes (may be empty).
+     * @param length - Number of bytes of keying material to produce.
+     */
+    exportKeyingMaterial(
+        handle: NativeHandle,
+        requestId: number,
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): void;
     /**
      * Tear down the session's driver thread. Called on close; the native
      * finalizer also invokes it as a safety net.
@@ -593,6 +629,18 @@ export interface NativeAddon {
     serverDrain(handle: NativeServerHandle, session: number): void;
     /** Request one session's connection stats; the result arrives as a `stats` event. */
     serverGetStats(handle: NativeServerHandle, session: number, requestId: number): void;
+    /**
+     * Export TLS keying material (RFC 5705) for one session; the result arrives
+     * as a `keyingMaterial` event.
+     */
+    serverExportKeyingMaterial(
+        handle: NativeServerHandle,
+        session: number,
+        requestId: number,
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): void;
     /**
      * Stop the server, closing all its sessions and freeing the listening socket.
      *
@@ -859,6 +907,21 @@ export interface SessionTransport {
     drain(): void;
     /** Request connection stats; the result arrives as a `stats` event. */
     getStats(requestId: number): void;
+    /**
+     * Export TLS keying material (RFC 5705); the result arrives as a
+     * `keyingMaterial` event.
+     *
+     * @param requestId - Id correlating the eventual `keyingMaterial` event.
+     * @param label - The exporter label bytes.
+     * @param context - The exporter context bytes (may be empty).
+     * @param length - Number of bytes of keying material to produce.
+     */
+    exportKeyingMaterial(
+        requestId: number,
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): void;
     /** Tear down the session's native resources. */
     shutdown(): void;
 }
@@ -892,6 +955,8 @@ export class SessionCore {
     private readonly datagramAcks = new Map<number, Deferred<boolean>>();
     /** Pending getStats() requests, keyed by request id. */
     private readonly statsRequests = new Map<number, Deferred<WebTransportConnectionStats>>();
+    /** Pending exportKeyingMaterial() requests, keyed by request id. */
+    private readonly keyingMaterialRequests = new Map<number, Deferred<Uint8Array>>();
     /** Active receive sinks, keyed by stream id. */
     private readonly receives = new Map<number, ReceiveSink>();
     /** Active send sinks, keyed by stream id. */
@@ -1105,6 +1170,24 @@ export class SessionCore {
         return d.promise;
     }
 
+    /**
+     * Export TLS keying material (RFC 5705). Resolves with `length` bytes derived
+     * from `label` and `context` once the driver reports back; rejects if the
+     * session is not usable or the TLS export fails.
+     */
+    public exportKeyingMaterial(
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): Promise<Uint8Array> {
+        if (!this.usable()) return Promise.reject(this.deadError());
+        const requestId = this.nextId();
+        const d = deferred<Uint8Array>();
+        this.keyingMaterialRequests.set(requestId, d);
+        this.transport!.exportKeyingMaterial(requestId, label, context, length);
+        return d.promise;
+    }
+
     /** Tear down the native resources for this session. No-op if not attached. */
     public shutdown(): void {
         this.transport?.shutdown();
@@ -1273,6 +1356,22 @@ export class SessionCore {
                 this.statsRequests.delete(ev.requestId);
                 break;
             }
+            case NativeEventType.KeyingMaterial: {
+                const d = this.keyingMaterialRequests.get(ev.requestId);
+                if (d) {
+                    if (ev.ok && ev.data) {
+                        d.resolve(ev.data);
+                    } else {
+                        d.reject(
+                            new WebTransportError('keying material export failed', {
+                                source: 'session',
+                            }),
+                        );
+                    }
+                    this.keyingMaterialRequests.delete(ev.requestId);
+                }
+                break;
+            }
         }
     }
 
@@ -1320,12 +1419,14 @@ export class SessionCore {
         for (const d of this.writes.values()) d.reject(err);
         for (const d of this.datagramAcks.values()) d.resolve(false);
         for (const d of this.statsRequests.values()) d.reject(err);
+        for (const d of this.keyingMaterialRequests.values()) d.reject(err);
         for (const sink of this.receives.values()) sink.onReset(0);
         for (const sink of this.sends.values()) sink.onStopSending(0);
         this.opens.clear();
         this.writes.clear();
         this.datagramAcks.clear();
         this.statsRequests.clear();
+        this.keyingMaterialRequests.clear();
         this.receives.clear();
         this.sends.clear();
 
@@ -1425,6 +1526,15 @@ class ClientTransport implements SessionTransport {
     /** Request connection stats; the result arrives as a `stats` event. */
     public getStats(requestId: number): void {
         this.native.getStats(this.handle, requestId);
+    }
+    /** Export TLS keying material; the result arrives as a `keyingMaterial` event. */
+    public exportKeyingMaterial(
+        requestId: number,
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): void {
+        this.native.exportKeyingMaterial(this.handle, requestId, label, context, length);
     }
     /** Tear down the session's native driver thread. */
     public shutdown(): void {
@@ -1550,6 +1660,22 @@ export class ServerTransport implements SessionTransport {
     /** Request this session's connection stats; the result arrives as a `stats` event. */
     public getStats(requestId: number): void {
         this.native.serverGetStats(this.handle, this.session, requestId);
+    }
+    /** Export TLS keying material; the result arrives as a `keyingMaterial` event. */
+    public exportKeyingMaterial(
+        requestId: number,
+        label: Uint8Array,
+        context: Uint8Array,
+        length: number,
+    ): void {
+        this.native.serverExportKeyingMaterial(
+            this.handle,
+            this.session,
+            requestId,
+            label,
+            context,
+            length,
+        );
     }
     /**
      * No-op: the server driver owns the session lifecycle, so there is nothing to

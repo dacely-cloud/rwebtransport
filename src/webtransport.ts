@@ -327,6 +327,29 @@ export class WebTransportSession {
     public getStats(): Promise<WebTransportConnectionStats> {
         return this.core.getStats();
     }
+
+    /**
+     * Export keying material from the session's TLS connection (RFC 5705),
+     * matching the W3C `exportKeyingMaterial`. Both endpoints derive identical
+     * bytes for the same `label`, `context`, and `outputLength`, and nothing
+     * outside the TLS session can reproduce them, which makes the result
+     * suitable for channel binding.
+     *
+     * @param label - The exporter label, a {@link BinarySource}.
+     * @param context - The exporter context, a {@link BinarySource}; pass an
+     *   empty buffer for no application context.
+     * @param outputLength - Number of bytes of keying material to produce.
+     * @returns A promise resolving to a `Uint8Array` of `outputLength` bytes.
+     * @throws WebTransportError (the promise rejects) if the session is closed or
+     *   the TLS export fails (for example, before the handshake completes).
+     */
+    public exportKeyingMaterial(
+        label: BinarySource,
+        context: BinarySource,
+        outputLength: number,
+    ): Promise<Uint8Array> {
+        return this.core.exportKeyingMaterial(toBytes(label), toBytes(context), outputLength);
+    }
 }
 
 /**
