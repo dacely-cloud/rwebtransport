@@ -34,6 +34,11 @@
 #   npm run build
 
 $ErrorActionPreference = 'Stop'
+# A native command's non-zero exit must NOT throw: winget returns benign
+# non-zero codes (e.g. "already installed"), and we inspect $LASTEXITCODE
+# ourselves. This automatic variable only exists on PowerShell 7.3+; assigning
+# it on 5.1 is a harmless no-op.
+$PSNativeCommandUseErrorActionPreference = $false
 
 function Write-Step($msg) { Write-Host "==> $msg" -ForegroundColor Cyan }
 function Write-Ok($msg) { Write-Host "  ok  $msg" -ForegroundColor Green }
@@ -43,12 +48,22 @@ if ($env:OS -ne 'Windows_NT') {
     Write-Error 'This script is for Windows only.'
 }
 
-# Reload PATH from the registry so tools installed during this run become
-# visible to Get-Command without opening a new shell.
+# Merge the persisted (Machine + User) PATH into the live process PATH so tools
+# installed during this run become visible to Get-Command, WITHOUT dropping
+# entries the launching shell injected into the process only (a profile tweak,
+# a Node version manager, a VS developer shell, etc.).
 function Update-SessionPath {
-    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
-    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
-    $env:Path = @($machine, $user | Where-Object { $_ }) -join ';'
+    $reg = @(
+        [Environment]::GetEnvironmentVariable('Path', 'Machine'),
+        [Environment]::GetEnvironmentVariable('Path', 'User')
+    ) -join ';'
+    $have = $env:Path -split ';'
+    foreach ($p in ($reg -split ';' | Where-Object { $_ })) {
+        if ($have -notcontains $p) {
+            $env:Path += ";$p"
+            $have += $p
+        }
+    }
 }
 
 function Test-Tool($name) {
@@ -79,17 +94,20 @@ function Install-Tool($command, $wingetId, $label) {
         return
     }
     Write-Host "  installing $label via winget ($wingetId) ..."
-    try {
-        winget install --id $wingetId --exact --silent `
-            --accept-source-agreements --accept-package-agreements
-    } catch {
-        Write-Note "winget reported: $($_.Exception.Message)"
+    winget install --id $wingetId --exact --silent `
+        --accept-source-agreements --accept-package-agreements
+    # Inspect the exit code directly (a non-zero native exit does not throw).
+    # 0 = installed; -1978335189 (0x8A15002B) = no applicable installer/upgrade,
+    # i.e. already present, which is fine.
+    $code = $LASTEXITCODE
+    if ($code -ne 0 -and $code -ne -1978335189) {
+        Write-Note ("winget could not install {0} (exit 0x{1:X}); install it by hand." -f $label, $code)
     }
     Update-SessionPath
     if (Test-Tool $command) {
         Write-Ok "$label installed"
     } else {
-        Write-Note "$label was installed but '$command' is not on PATH yet; a new terminal may be needed."
+        Write-Note "$label is still not on PATH. Open a new terminal to re-check, or install it manually."
     }
 }
 
@@ -101,12 +119,15 @@ Install-Tool 'nasm' 'NASM.NASM' 'NASM'
 # ---- Rust MSVC toolchain ----------------------------------------------------
 if (Test-Tool 'rustup') {
     Write-Step 'Ensuring the MSVC Rust toolchain (boring-sys needs MSVC, not GNU)'
-    try {
-        rustup toolchain install stable-x86_64-pc-windows-msvc | Out-Null
-        Write-Ok 'stable-x86_64-pc-windows-msvc is installed'
-    } catch {
-        Write-Note "Could not install the MSVC toolchain automatically: $($_.Exception.Message)"
+    rustup toolchain install stable-x86_64-pc-windows-msvc | Out-Null
+    # If the active default toolchain is GNU, switch the default to MSVC so the
+    # build actually uses it (cargo would otherwise keep using the GNU default).
+    $default = (& rustup default 2>$null | Out-String)
+    if ($default -match 'gnu') {
+        Write-Note 'Default Rust toolchain is GNU; switching the default to MSVC for this build.'
+        rustup default stable-x86_64-pc-windows-msvc | Out-Null
     }
+    Write-Ok 'MSVC Rust toolchain ready'
 }
 
 # ---- NASM discovery + the ASM_NASM fix -------------------------------------
@@ -132,18 +153,15 @@ function Find-Nasm {
 $nasm = Find-Nasm
 if ($nasm) {
     # cmake reads ASM_NASM to locate the assembler. Set it (persistently, user
-    # scope) to the real nasm.exe so the boring-sys build stops failing.
+    # scope) to the real nasm.exe so the boring-sys build stops failing. This
+    # alone fixes the reported error; we deliberately do NOT rewrite the
+    # persistent User PATH, because reading it expanded and writing it back would
+    # bake %VAR% entries from REG_EXPAND_SZ to REG_SZ and lose live expansion.
     [Environment]::SetEnvironmentVariable('ASM_NASM', $nasm, 'User')
     $env:ASM_NASM = $nasm
-
-    # Belt and suspenders: make sure NASM's folder is on the user PATH too.
+    # Make nasm reachable in THIS session too (process scope only).
     $nasmDir = Split-Path $nasm
-    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
-    if (($userPath -split ';') -notcontains $nasmDir) {
-        $newPath = if ($userPath) { "$userPath;$nasmDir" } else { $nasmDir }
-        [Environment]::SetEnvironmentVariable('Path', $newPath, 'User')
-    }
-    Update-SessionPath
+    if (($env:Path -split ';') -notcontains $nasmDir) { $env:Path = "$nasmDir;$env:Path" }
     Write-Ok "ASM_NASM = $nasm"
 } else {
     # Clear a stale ASM_NASM that points to a missing file (this is the exact

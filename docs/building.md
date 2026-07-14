@@ -90,13 +90,13 @@ The script (see [`../scripts/setup-windows.ps1`](../scripts/setup-windows.ps1)) 
 
 Doing it by hand instead? Install the [MSVC C++ build tools](https://visualstudio.microsoft.com/downloads/) ("Desktop development with C++" workload), [Rust](https://rustup.rs) (the default `x86_64-pc-windows-msvc` toolchain), [CMake](https://cmake.org/download/), [Go](https://go.dev/dl/), [NASM](https://www.nasm.us/), and [Node 24 or 26](https://nodejs.org/).
 
-> **`CMake Error: Could not find the compiler specified in the environment variable ASM_NASM`.** cmake locates the assembler through the `ASM_NASM` environment variable, and this error means it is unset or points at a `nasm.exe` that is not there (the NASM user installer writes to `%LOCALAPPDATA%\bin\NASM\`, and a half-finished install leaves the variable dangling). Fix it by installing NASM and setting `ASM_NASM` to the real path, which is exactly what `npm run setup:windows` does. To set it by hand in PowerShell:
+> **`CMake Error: Could not find the compiler specified in the environment variable ASM_NASM`.** cmake locates the assembler through the `ASM_NASM` environment variable, and this error means it is unset or points at a `nasm.exe` that is not there (the NASM user installer writes to `%LOCALAPPDATA%\bin\NASM\`, and a half-finished install leaves the variable dangling). Fix it by installing NASM and setting `ASM_NASM` to the real path, which is exactly what `npm run setup:windows` does. To set it by hand, open a **new** terminal so NASM is on `PATH`, then let PowerShell find `nasm.exe` for you rather than hardcoding a path that differs by installer:
 >
 > ```powershell
-> [Environment]::SetEnvironmentVariable('ASM_NASM', 'C:\Program Files\NASM\nasm.exe', 'User')
+> [Environment]::SetEnvironmentVariable('ASM_NASM', (Get-Command nasm).Source, 'User')
 > ```
 >
-> Then open a new terminal and rebuild. (`cargo clean -p boring-sys` forces the BoringSSL build to re-run if it cached the failure.)
+> Then open another new terminal and rebuild. (`cargo clean -p boring-sys` forces the BoringSSL build to re-run if it cached the failure.)
 
 ### Build it
 

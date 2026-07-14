@@ -156,7 +156,7 @@ async function benchDatagrams(n, size) {
     return { sendRate: n / (sendMs / 1000), echoed, sent: n };
 }
 
-console.log(`\nrwebtransport benchmark — node ${process.version}, ${process.platform}/${process.arch}`);
+console.log(`\nrwebtransport benchmark: node ${process.version}, ${process.platform}/${process.arch}`);
 console.log('peer: our WebTransportServer over loopback (127.0.0.1)\n');
 
 const hs = await benchHandshake(100);

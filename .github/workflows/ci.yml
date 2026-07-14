@@ -14,7 +14,7 @@ concurrency:
 
 jobs:
   test:
-    name: test ${{ matrix.os }} · node ${{ matrix.node }}
+    name: test ${{ matrix.os }} (node ${{ matrix.node }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -502,7 +502,7 @@ npm run setup:unix        # Linux/macOS: compiler, cmake, ninja, Go, Rust via yo
 npm run setup:windows     # Windows: Rust, CMake, Go, NASM via winget, and sets ASM_NASM
 ```
 
-On **Windows** you also need NASM (BoringSSL's assembler). If a `cargo build` there fails with `Could not find the compiler specified in the environment variable ASM_NASM`, that is the missing NASM; run the script above (or see [`docs/building.md`](./docs/building.md#windows-setup)) and rebuild in a fresh terminal.
+On **Windows** you also need NASM (BoringSSL's assembler) and the MSVC C++ Build Tools. `setup:windows` installs Rust, CMake, Go, and NASM and sets `ASM_NASM`; it checks for the MSVC C++ Build Tools and Node and points you to any that are missing, but it does not auto-install the multi-gigabyte Visual Studio C++ workload. If a `cargo build` there fails with `Could not find the compiler specified in the environment variable ASM_NASM`, that is the missing NASM; run the script above (or see [`docs/building.md`](./docs/building.md#windows-setup)) and rebuild in a fresh terminal.
 
 ---
 
