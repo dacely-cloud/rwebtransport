@@ -18,6 +18,8 @@ use std::sync::Arc;
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll};
 
+use wtcore::h3;
+
 use crate::config::build_server_config;
 use crate::driver::{DriverShared, SOCKET_TOKEN};
 use crate::session::{Ev, WtSession};
@@ -512,7 +514,7 @@ fn run_inner(
             // lingering as a zombie until the idle timeout.
             if server.session.is_closed() && !server.conn.is_closed() && !server.conn.is_draining()
             {
-                let _ = server.conn.close(true, 0, b"session closed");
+                let _ = server.conn.close(true, h3::H3_NO_ERROR, b"");
             }
 
             if let Some(sz) = server.conn.dgram_max_writable_len() {
@@ -533,12 +535,18 @@ fn run_inner(
             if server.conn.is_closed() && !server.closed_emitted {
                 server.closed_emitted = true;
                 if !server.session.is_closed() {
-                    let (code, reason, remote, err) = closure_info(&server.conn);
                     let mut evs = Vec::new();
-                    if let Some(msg) = err {
-                        evs.push(Ev::Error(msg));
+                    if let Some((code, reason)) = server.session.local_close_info() {
+                        // Locally initiated graceful WebTransport close: surface the
+                        // WT code/reason (the wire close used H3_NO_ERROR).
+                        server.session.mark_closed(&mut evs, code, reason, false);
+                    } else {
+                        let (code, reason, remote, err) = closure_info(&server.conn);
+                        if let Some(msg) = err {
+                            evs.push(Ev::Error(msg));
+                        }
+                        server.session.mark_closed(&mut evs, code, reason, remote);
                     }
-                    server.session.mark_closed(&mut evs, code, reason, remote);
                     for ev in evs {
                         out.push(ServerMsg::Session(server.session_id, ev));
                     }

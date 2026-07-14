@@ -19,6 +19,11 @@ pub const FRAME_HEADERS: u64 = 0x01;
 pub const FRAME_SETTINGS: u64 = 0x04;
 pub const FRAME_GOAWAY: u64 = 0x07;
 
+/// HTTP/3 `H3_NO_ERROR`: the application error code for a graceful, error-free
+/// connection close. A WebTransport session close carries its own code/reason in
+/// the CLOSE_WEBTRANSPORT_SESSION capsule, so the QUIC close uses this.
+pub const H3_NO_ERROR: u64 = 0x100;
+
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;

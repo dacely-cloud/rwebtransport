@@ -321,6 +321,12 @@ pub struct WtSession {
     close_req: Option<CloseReq>,
     /// Set once the QUIC connection should be closed (after connect FIN flush).
     want_quic_close: Option<(u32, Vec<u8>)>,
+    /// True once the QUIC close has been deferred one flush pass, so the queued
+    /// CLOSE_WEBTRANSPORT_SESSION capsule + FIN are serialized to the wire before
+    /// the CONNECTION_CLOSE frame supersedes all stream frames.
+    close_deferred_once: bool,
+    /// True once we have issued the graceful QUIC close, so it happens once.
+    quic_close_issued: bool,
     /// Server role only: the client's remote address, captured when the
     /// connection was accepted and surfaced on the `serverReady` event.
     remote_addr: Option<std::net::SocketAddr>,
@@ -357,6 +363,8 @@ impl WtSession {
             streams: HashMap::new(),
             close_req: None,
             want_quic_close: None,
+            close_deferred_once: false,
+            quic_close_issued: false,
             remote_addr: None,
         }
     }
@@ -388,6 +396,8 @@ impl WtSession {
             streams: HashMap::new(),
             close_req: None,
             want_quic_close: None,
+            close_deferred_once: false,
+            quic_close_issued: false,
             remote_addr: Some(remote),
         }
     }
@@ -1293,23 +1303,46 @@ impl WtSession {
         // Opens blocked on stream credit simply keep their WT-signal prefix queued
         // in `out`; `flush_stream` retries them on every loop until credit lands.
 
-        // If a graceful close finished flushing the CONNECT stream, close QUIC.
-        if self.want_quic_close.is_none() {
-            if let Some(req) = self.close_req.as_ref() {
-                let connect_drained = self
-                    .streams
-                    .get(&CONNECT_ID)
-                    .map(|s| s.out.is_empty() && s.fin_sent)
-                    .unwrap_or(true);
-                if req.capsule_queued && connect_drained {
-                    self.want_quic_close = Some((req.code, req.reason.clone()));
+        // Graceful QUIC close, issued exactly once. After the CONNECT stream has
+        // flushed the CLOSE_WEBTRANSPORT_SESSION capsule + FIN, close the HTTP/3
+        // connection with H3_NO_ERROR (the WebTransport code/reason ride the
+        // capsule, never the QUIC error field). The close is deferred one flush
+        // pass so the driver's flush_send() serializes the capsule + FIN before the
+        // CONNECTION_CLOSE frame supersedes all buffered stream frames. Ev::Closed
+        // is emitted later by the driver's terminal branch (once conn.is_closed),
+        // so JS never sees the close while the driver thread is still running.
+        if !self.quic_close_issued {
+            if self.want_quic_close.is_none() {
+                if let Some(req) = self.close_req.as_ref() {
+                    let connect_drained = self
+                        .streams
+                        .get(&CONNECT_ID)
+                        .map(|s| s.out.is_empty() && s.fin_sent)
+                        .unwrap_or(true);
+                    if req.capsule_queued && connect_drained {
+                        self.want_quic_close = Some((req.code, req.reason.clone()));
+                    }
+                }
+            }
+            if self.want_quic_close.is_some() {
+                if self.close_deferred_once {
+                    self.want_quic_close = None;
+                    self.quic_close_issued = true;
+                    let _ = conn.close(true, h3::H3_NO_ERROR, b"");
+                } else {
+                    self.close_deferred_once = true;
                 }
             }
         }
+    }
 
-        if let Some((code, reason)) = self.want_quic_close.take() {
-            let _ = conn.close(true, code as u64, &reason);
-        }
+    /// If this session initiated a graceful close, the WebTransport close code and
+    /// reason to surface to the application (the wire uses H3_NO_ERROR, but the JS
+    /// `closeInfo` must carry the app-level code/reason).
+    pub fn local_close_info(&self) -> Option<(u32, Vec<u8>)> {
+        self.close_req
+            .as_ref()
+            .map(|req| (req.code, req.reason.clone()))
     }
 
     fn flush_stream(&mut self, conn: &mut quiche::Connection, id: u64, ev: &mut Vec<Ev>) {

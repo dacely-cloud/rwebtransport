@@ -744,6 +744,13 @@ export interface ReceiveSink {
      * @param code - The application error code from the reset.
      */
     onReset(code: number): void;
+    /**
+     * The session terminated, taking this stream with it. Distinct from a peer
+     * stream reset: the error is session-sourced, not a per-stream reset code.
+     *
+     * @param error - The session-terminal error to fail the stream with.
+     */
+    onSessionClose(error: WebTransportError): void;
 }
 
 /**
@@ -761,6 +768,13 @@ export interface SendSink {
      * @param code - The application error code the peer supplied.
      */
     onStopSending(code: number): void;
+    /**
+     * The session terminated, taking this stream with it. Distinct from a peer
+     * STOP_SENDING: the error is session-sourced, not a per-stream code.
+     *
+     * @param error - The session-terminal error to fail the stream with.
+     */
+    onSessionClose(error: WebTransportError): void;
 }
 
 /**
@@ -1433,8 +1447,8 @@ export class SessionCore {
         for (const d of this.datagramAcks.values()) d.resolve(false);
         for (const d of this.statsRequests.values()) d.reject(err);
         for (const d of this.keyingMaterialRequests.values()) d.reject(err);
-        for (const sink of this.receives.values()) sink.onReset(0);
-        for (const sink of this.sends.values()) sink.onStopSending(0);
+        for (const sink of this.receives.values()) sink.onSessionClose(err);
+        for (const sink of this.sends.values()) sink.onSessionClose(err);
         this.opens.clear();
         this.writes.clear();
         this.datagramAcks.clear();

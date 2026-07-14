@@ -111,6 +111,14 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
                 );
                 session.unregisterReceive(streamId);
             },
+            onSessionClose(error) {
+                try {
+                    controller.error(error);
+                } catch {
+                    // already closed/errored
+                }
+                session.unregisterReceive(streamId);
+            },
         });
 
         this.streamId = streamId;
@@ -224,6 +232,14 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
                             streamErrorCode: code,
                         }),
                     );
+                } catch {
+                    // already errored/closed
+                }
+                session.unregisterSend(streamId);
+            },
+            onSessionClose(error) {
+                try {
+                    controller.error(error);
                 } catch {
                     // already errored/closed
                 }

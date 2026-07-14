@@ -427,11 +427,18 @@ fn run_inner(
         // 6. Terminal state?
         if conn.is_closed() {
             if !session.is_closed() {
-                let (code, reason, remote, err) = closure_info(&conn);
-                if let Some(msg) = err {
-                    evs.push(Ev::Error(msg));
+                if let Some((code, reason)) = session.local_close_info() {
+                    // We initiated a graceful WebTransport close: surface the WT
+                    // code/reason (the wire close used H3_NO_ERROR), a clean local
+                    // close, not an error.
+                    session.mark_closed(&mut evs, code, reason, false);
+                } else {
+                    let (code, reason, remote, err) = closure_info(&conn);
+                    if let Some(msg) = err {
+                        evs.push(Ev::Error(msg));
+                    }
+                    session.mark_closed(&mut evs, code, reason, remote);
                 }
-                session.mark_closed(&mut evs, code, reason, remote);
             }
             shared.closed.store(true, Ordering::Relaxed);
             if !evs.is_empty() {

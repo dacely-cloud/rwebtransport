@@ -203,6 +203,33 @@ describe('WebTransportServer', () => {
         expect(wt.reliability).toBe('supports-unreliable');
     });
 
+    it('delivers the WebTransport close code and reason to the peer on graceful close', async () => {
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+        const serverSessionP = (async () => {
+            const reader = server.incomingSessions.getReader();
+            const { value } = await reader.read();
+            return value!;
+        })();
+
+        const wt = connect(`https://127.0.0.1:${server.port}/close`);
+        await wt.ready;
+        const serverSession = await serverSessionP;
+
+        wt.close({ closeCode: 0x1234, reason: 'bye now' });
+
+        // Local closeInfo carries the WebTransport code/reason (the wire close
+        // itself uses H3_NO_ERROR, not the raw code).
+        await expect(wt.closed).resolves.toEqual({ closeCode: 0x1234, reason: 'bye now' });
+        // The peer receives the CLOSE_WEBTRANSPORT_SESSION capsule (proving it is
+        // serialized before the QUIC close) with the same code/reason.
+        await expect(serverSession.closed).resolves.toEqual({
+            closeCode: 0x1234,
+            reason: 'bye now',
+        });
+    });
+
     it('settles the draining promise when the session closes without a prior DRAIN', async () => {
         const url = await echoServer();
         const wt = connect(url);
