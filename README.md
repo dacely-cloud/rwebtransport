@@ -41,22 +41,23 @@
 1. [Why](#why)
 2. [Install](#install)
 3. [Quick start](#quick-start)
-4. [The client API](#the-client-api)
+4. [Reliable streams and unreliable datagrams](#reliable-streams-and-unreliable-datagrams)
+5. [The client API](#the-client-api)
     - [Connecting](#connecting)
     - [Bidirectional streams](#bidirectional-streams)
     - [Unidirectional streams](#unidirectional-streams)
     - [Datagrams](#datagrams)
     - [Closing](#closing)
-5. [The server API](#the-server-api)
-6. [Threading, workers, and cluster](#threading-workers-and-cluster)
-7. [Docs and examples](#docs-and-examples)
-8. [Requirements](#requirements)
-9. [How it works](#how-it-works)
-10. [Building from source](#building-from-source)
-11. [Testing](#testing)
-12. [Robustness](#robustness)
-13. [Security and the TLS profile](#security-and-the-tls-profile)
-14. [License](#license)
+6. [The server API](#the-server-api)
+7. [Threading, workers, and cluster](#threading-workers-and-cluster)
+8. [Docs and examples](#docs-and-examples)
+9. [Requirements](#requirements)
+10. [How it works](#how-it-works)
+11. [Building from source](#building-from-source)
+12. [Testing](#testing)
+13. [Robustness](#robustness)
+14. [Security and the TLS profile](#security-and-the-tls-profile)
+15. [License](#license)
 
 </details>
 
@@ -149,6 +150,142 @@ wt.close({ closeCode: 0, reason: 'bye' });
 ```
 
 Runnable versions of these live in [`examples/`](./examples).
+
+---
+
+## Reliable streams and unreliable datagrams
+
+Yes, both, over the one QUIC connection, and this library implements each:
+
+- **Streams are reliable and ordered.** A bidirectional stream (or a one-way send / receive stream) is a WHATWG `ReadableStream` / `WritableStream` of bytes. Everything you write is delivered, in order, with end-to-end backpressure onto QUIC flow control. Open as many as you want; they are independently multiplexed, so a stall on one never blocks another (no head-of-line blocking).
+- **Datagrams are unreliable and unordered.** `session.datagrams` is a duplex of `Uint8Array` messages. Each datagram is sent best-effort in a single QUIC packet: it may be dropped, reordered, or never arrive, and it is never retransmitted. Reach for them when you would rather drop data than delay it: position updates, audio frames, heartbeats.
+
+The complete TypeScript program below starts a server, connects a client, and exercises both. It is the runnable [`examples/echo.ts`](./examples/echo.ts) (the in-repo copy imports the built output; in your own project the import is `from 'rwebtransport'`). On Node 24+ you can run it directly with `node examples/echo.ts`.
+
+```ts
+import { X509Certificate, createHash } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+import { WebTransport, WebTransportServer, type WebTransportServerSession } from 'rwebtransport';
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+const CERT = join(HERE, 'cert.pem');
+const KEY = join(HERE, 'key.pem');
+
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+// SHA-256 of the certificate's DER encoding: exactly what serverCertificateHashes wants.
+function certHash(path: string): Uint8Array {
+    const der = new X509Certificate(readFileSync(path)).raw;
+    return new Uint8Array(createHash('sha256').update(der).digest());
+}
+
+// Echo an accepted session: pipe every reliable stream and every datagram back.
+function echo(session: WebTransportServerSession): void {
+    void (async () => {
+        const reader = session.incomingBidirectionalStreams.getReader();
+        for (;;) {
+            const { value: stream, done } = await reader.read();
+            if (done) break;
+            if (stream) void stream.readable.pipeTo(stream.writable).catch(() => {});
+        }
+    })();
+    void session.datagrams.readable.pipeTo(session.datagrams.writable).catch(() => {});
+}
+
+// Read a reliable readable stream to end-of-stream and return all its bytes.
+async function readAll(readable: ReadableStream<Uint8Array>): Promise<Uint8Array> {
+    const reader = readable.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+            chunks.push(value);
+            total += value.length;
+        }
+    }
+    const out = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.length;
+    }
+    return out;
+}
+
+async function main(): Promise<void> {
+    // Server: bind an OS-assigned loopback port and echo everything.
+    const server = new WebTransportServer({ host: '127.0.0.1', port: 0, cert: CERT, key: KEY });
+    await server.ready;
+    void (async () => {
+        const reader = server.incomingSessions.getReader();
+        for (;;) {
+            const { value: session, done } = await reader.read();
+            if (done) break;
+            if (session) echo(session);
+        }
+    })();
+
+    const url = `https://127.0.0.1:${server.port}/echo`;
+    console.log(`server listening at ${url}`);
+
+    // Client: connect, trusting the server's pinned certificate.
+    const client = new WebTransport(url, {
+        serverCertificateHashes: [{ algorithm: 'sha-256', value: certHash(CERT) }],
+    });
+    await client.ready;
+    console.log('client connected');
+
+    // RELIABLE: a bidirectional stream. Delivery is guaranteed and ordered.
+    const stream = await client.createBidirectionalStream();
+    const writer = stream.writable.getWriter();
+    await writer.write(encoder.encode('hello over a reliable stream'));
+    await writer.close(); // ends our send side so the echo's read side sees `done`
+    const reply = decoder.decode(await readAll(stream.readable));
+    console.log(`reliable stream echo: ${JSON.stringify(reply)}`);
+
+    // UNRELIABLE: a datagram. Best-effort: it may be dropped, so we retry.
+    const dgWriter = client.datagrams.writable.getWriter();
+    const dgReader = client.datagrams.readable.getReader();
+    const payload = encoder.encode('hello over an unreliable datagram');
+    const inbound = dgReader.read().then((r) => r.value);
+    let echoed: Uint8Array | undefined;
+    for (let attempt = 0; attempt < 40 && !echoed; attempt++) {
+        await dgWriter.write(payload);
+        echoed = await Promise.race([inbound, sleep(25).then(() => undefined)]);
+    }
+    if (echoed) {
+        console.log(`unreliable datagram echo: ${JSON.stringify(decoder.decode(echoed))}`);
+    } else {
+        console.log('unreliable datagram echo: none (datagrams are lossy by design)');
+    }
+
+    // Clean shutdown of both ends.
+    client.close({ closeCode: 0, reason: 'done' });
+    server.close();
+    process.exit(0);
+}
+
+main().catch((err: unknown) => {
+    console.error('echo failed:', err);
+    process.exit(1);
+});
+```
+
+Running it prints:
+
+```text
+server listening at https://127.0.0.1:53348/echo
+client connected
+reliable stream echo: "hello over a reliable stream"
+unreliable datagram echo: "hello over an unreliable datagram"
+```
 
 ---
 

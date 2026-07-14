@@ -1,8 +1,10 @@
 # rwebtransport examples
 
-Small, runnable ESM (`.mjs`) programs that exercise the real
-[`rwebtransport`](../README.md) API: an all-in-one echo demo, a standalone echo
-server, and a client you point at any WebTransport endpoint.
+Small, runnable programs that exercise the real
+[`rwebtransport`](../README.md) API: a TypeScript round-trip, an all-in-one echo
+demo, a standalone echo server, and a client you point at any WebTransport
+endpoint. The ESM examples are `.mjs`; the TypeScript one is `.ts` and runs
+directly on Node 24+.
 
 ## 1. Build the package first
 
@@ -54,6 +56,7 @@ once it expires.
 
 Run each from the repository root after building. One line each:
 
+- `node examples/echo.ts` is the TypeScript version of the round-trip: an in-process server and client on loopback that exercises a reliable bidirectional stream and an unreliable datagram, fully typed. Node 24+ runs the `.ts` file directly; it reads `examples/cert.pem` / `examples/key.pem` and needs no arguments.
 - `node examples/echo-demo.mjs` starts an in-process `WebTransportServer` and a `WebTransport` client on loopback, then round-trips a bidirectional stream and a datagram end to end (self-contained: it reads `examples/cert.pem` / `examples/key.pem` and derives the pinned hash itself, so no arguments are needed).
 - `node examples/server.mjs` runs a standalone echo server on `127.0.0.1` (reads `examples/cert.pem` / `examples/key.pem`) and prints its `https://` URL and the certificate hash hex to paste into the client.
 - `node examples/client.mjs <url> <certHashHex>` connects to any WebTransport server (for example the one printed by `server.mjs`), opens a bidi stream, sends a message, prints the echoed reply, then sends and reads back a datagram; `<certHashHex>` is the SHA-256 hex from step 2 and is passed as `serverCertificateHashes: [{ algorithm: 'sha-256', value }]`.
