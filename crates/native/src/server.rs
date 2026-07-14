@@ -112,6 +112,11 @@ pub enum ServerCommand {
     Drain {
         session: u64,
     },
+    /// Snapshot one session's connection stats; result arrives as a `stats` event.
+    GetStats {
+        session: u64,
+        request_id: u64,
+    },
     /// Tear the whole server down.
     Shutdown,
 }
@@ -561,7 +566,8 @@ fn apply_command(
         | ServerCommand::SetPaused { session, .. }
         | ServerCommand::SendDatagram { session, .. }
         | ServerCommand::CloseSession { session, .. }
-        | ServerCommand::Drain { session } => *session,
+        | ServerCommand::Drain { session }
+        | ServerCommand::GetStats { session, .. } => *session,
         ServerCommand::Shutdown => return,
     };
     let Some(scid) = sessions.get(&session_id) else {
@@ -600,6 +606,9 @@ fn apply_command(
             .send_datagram(&mut server.conn, &data, request_id, &mut evs),
         ServerCommand::CloseSession { code, reason, .. } => server.session.close(code, reason),
         ServerCommand::Drain { .. } => server.session.send_drain(),
+        ServerCommand::GetStats { request_id, .. } => {
+            evs.push(crate::session::build_stats(&server.conn, request_id))
+        }
         ServerCommand::Shutdown => {}
     }
     // Surface events produced synchronously by the command (StreamOpened,

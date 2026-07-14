@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The default "Google Chrome" TLS profile for the QUIC (TLS 1.3) handshake.
 //!
-//! QUIC mandates TLS 1.3, so — unlike a TCP/TLS stack — there is no TLS 1.2
+//! QUIC mandates TLS 1.3, so, unlike a TCP/TLS stack, there is no TLS 1.2
 //! cipher list to negotiate. What still shapes the ClientHello, and what servers
 //! (Cloudflare in particular) fingerprint, is the group preference, the
 //! signature-algorithm list, GREASE, and extension ordering. We mirror Chrome's

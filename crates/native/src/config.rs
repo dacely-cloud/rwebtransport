@@ -65,7 +65,7 @@ pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
         }
         CertVerification::Hashes(_) | CertVerification::Insecure => {
             // Verification is fully handled on the SSL context (custom callback /
-            // NONE). Do NOT call verify_peer here — it would install quiche's own
+            // NONE). Do NOT call verify_peer here: it would install quiche's own
             // None-callback over ours.
         }
     }

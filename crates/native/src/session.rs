@@ -89,6 +89,43 @@ pub enum Ev {
     WriteAck { request_id: u64 },
     /// A datagram send request was processed (sent or intentionally dropped).
     DatagramAck { request_id: u64, sent: bool },
+    /// Result of a getStats() request.
+    Stats {
+        request_id: u64,
+        bytes_sent: u64,
+        bytes_received: u64,
+        packets_sent: u64,
+        packets_received: u64,
+        packets_lost: u64,
+        smoothed_rtt_ms: f64,
+        rtt_variation_ms: f64,
+        min_rtt_ms: f64,
+    },
+}
+
+/// Snapshot a quiche connection's stats into a [`Ev::Stats`] for `request_id`.
+pub fn build_stats(conn: &quiche::Connection, request_id: u64) -> Ev {
+    let s = conn.stats();
+    let to_ms = |d: std::time::Duration| d.as_secs_f64() * 1000.0;
+    let (rtt, min_rtt, rttvar) = match conn.path_stats().next() {
+        Some(p) => (p.rtt, p.min_rtt.unwrap_or(p.rtt), p.rttvar),
+        None => (
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+        ),
+    };
+    Ev::Stats {
+        request_id,
+        bytes_sent: s.sent_bytes,
+        bytes_received: s.recv_bytes,
+        packets_sent: s.sent as u64,
+        packets_received: s.recv as u64,
+        packets_lost: s.lost as u64,
+        smoothed_rtt_ms: to_ms(rtt),
+        rtt_variation_ms: to_ms(rttvar),
+        min_rtt_ms: to_ms(min_rtt),
+    }
 }
 
 /// One queued outbound chunk on a stream.

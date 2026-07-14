@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-//! WebTransport **echo** server — a test fixture for the rwebtransport client.
+//! WebTransport **echo** server: a test fixture for the rwebtransport client.
 //!
 //! It speaks real QUIC/HTTP-3/WebTransport (Cloudflare quiche + BoringSSL,
 //! server role) and echoes everything a client sends:
-//! * bidirectional streams — bytes are written straight back on the same stream;
-//! * unidirectional streams — the server opens a matching uni stream and echoes;
-//! * datagrams — sent back verbatim.
+//! * bidirectional streams: bytes are written straight back on the same stream;
+//! * unidirectional streams: the server opens a matching uni stream and echoes;
+//! * datagrams: sent back verbatim.
 //!
 //! Usage: `wt-echo-server --cert <pem> --key <pem> [--host 127.0.0.1] [--port 0]`.
 //! On startup it prints two machine-readable lines to stdout:
@@ -56,10 +56,10 @@ const CONNECT_ID: u64 = 0;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Role {
     LocalControlPlane,
-    PeerControlPlane, // client control/qpack uni streams — drain
+    PeerControlPlane, // client control/qpack uni streams (drain)
     Connect,          // client CONNECT bidi (id 0)
-    WtBidi,           // client bidi WT stream — echo on the same stream
-    WtUniIn,          // client uni WT stream — echo via a new server uni stream
+    WtBidi,           // client bidi WT stream: echo on the same stream
+    WtUniIn,          // client uni WT stream: echo via a new server uni stream
     PendingUni,       // client uni, type varint not yet read
     Ignored,
 }

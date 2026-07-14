@@ -199,6 +199,31 @@ describe('WebTransportServer', () => {
         expect(wt.reliability).toBe('supports-unreliable');
     });
 
+    it('getStats reports connection statistics', async () => {
+        const url = await echoServer();
+        const wt = connect(url);
+        await wt.ready;
+        // Exchange data so the counters are non-zero.
+        const stream = await wt.createBidirectionalStream();
+        const w = stream.writable.getWriter();
+        await w.write(enc.encode('collect some stats'));
+        await w.close();
+        await readAll(stream.readable);
+
+        const stats = await wt.getStats();
+        expect(stats.bytesSent).toBeGreaterThan(0);
+        expect(stats.bytesReceived).toBeGreaterThan(0);
+        expect(stats.packetsSent).toBeGreaterThan(0);
+        expect(stats.packetsReceived).toBeGreaterThan(0);
+        expect(typeof stats.smoothedRtt).toBe('number');
+        expect(stats.minRtt).toBeGreaterThanOrEqual(0);
+        expect(stats.datagrams).toEqual({
+            expiredOutgoing: 0,
+            droppedIncoming: 0,
+            lostOutgoing: 0,
+        });
+    });
+
     it('reports reliability pending before ready, supports-unreliable after', async () => {
         const url = await echoServer();
         const wt = connect(url);

@@ -75,6 +75,10 @@ pub enum Command {
     },
     /// Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer.
     Drain,
+    /// Snapshot connection stats; the result arrives as a `stats` event.
+    GetStats {
+        request_id: u64,
+    },
     /// Tear the driver down (the JS handle was closed/GC'd).
     Shutdown,
 }
@@ -167,7 +171,7 @@ fn setup_and_run(
     sink: &dyn EventSink,
     shared: &Arc<DriverShared>,
 ) {
-    // DNS resolution — potentially blocking, so it runs here (driver thread),
+    // DNS resolution, potentially blocking, so it runs here (driver thread),
     // never on the JS event loop.
     let peer = match (setup.host.as_str(), setup.port)
         .to_socket_addrs()
@@ -234,7 +238,7 @@ fn setup_and_run(
 }
 
 /// The actual event loop. Runs until the connection closes or a fatal error
-/// occurs. Never call this directly from the spawned thread — go through
+/// occurs. Never call this directly from the spawned thread; go through
 /// [`run`], which contains the panic boundary.
 #[allow(clippy::too_many_arguments)]
 fn run_inner(
@@ -343,6 +347,9 @@ fn run_inner(
                 }
                 Command::Close { code, reason } => session.close(code, reason),
                 Command::Drain => session.send_drain(),
+                Command::GetStats { request_id } => {
+                    evs.push(crate::session::build_stats(&conn, request_id))
+                }
                 Command::Shutdown => {
                     shutdown = true;
                     break;

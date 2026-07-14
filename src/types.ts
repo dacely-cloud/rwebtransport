@@ -46,6 +46,41 @@ export type WebTransportCongestionControl = 'default' | 'throughput' | 'low-late
  */
 export type WebTransportReliabilityMode = 'pending' | 'reliable-only' | 'supports-unreliable';
 
+/**
+ * Per-session datagram statistics. This transport does not currently track
+ * per-datagram expiry or loss, so these are reported as `0`.
+ */
+export interface WebTransportDatagramStats {
+    /** Outgoing datagrams dropped because they exceeded their max age. */
+    expiredOutgoing: number;
+    /** Incoming datagrams dropped because the receive queue was full. */
+    droppedIncoming: number;
+    /** Outgoing datagrams presumed lost in flight. */
+    lostOutgoing: number;
+}
+
+/** Connection statistics returned by {@link WebTransport.getStats}. */
+export interface WebTransportConnectionStats {
+    /** Total bytes sent on the connection. */
+    bytesSent: number;
+    /** Total bytes received. */
+    bytesReceived: number;
+    /** QUIC packets sent. */
+    packetsSent: number;
+    /** QUIC packets received. */
+    packetsReceived: number;
+    /** QUIC packets declared lost. */
+    packetsLost: number;
+    /** Smoothed round-trip time, in milliseconds. */
+    smoothedRtt: number;
+    /** Round-trip-time variation, in milliseconds. */
+    rttVariation: number;
+    /** Minimum observed round-trip time, in milliseconds. */
+    minRtt: number;
+    /** Datagram-specific statistics. */
+    datagrams: WebTransportDatagramStats;
+}
+
 /** Options accepted by the {@link WebTransport} constructor. */
 export interface WebTransportOptions {
     /**

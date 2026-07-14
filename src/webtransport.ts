@@ -15,6 +15,7 @@ import type {
     WebTransportCloseOptions,
     WebTransportOptions,
     WebTransportReliabilityMode,
+    WebTransportConnectionStats,
 } from './types.js';
 
 /**
@@ -301,6 +302,16 @@ export class WebTransportSession {
      */
     public drain(): void {
         this.core.drain();
+    }
+
+    /**
+     * Snapshot connection statistics (bytes and packets transferred, RTT, and
+     * datagram counters).
+     * @returns A promise resolving to {@link WebTransportConnectionStats}.
+     * @throws WebTransportError (the promise rejects) if the session is closed.
+     */
+    public getStats(): Promise<WebTransportConnectionStats> {
+        return this.core.getStats();
     }
 }
 

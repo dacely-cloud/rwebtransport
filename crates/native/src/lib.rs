@@ -403,6 +403,13 @@ fn drain(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn get_stats(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
+    let request_id = to_request_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    handle.send(Command::GetStats { request_id });
+    Ok(cx.undefined())
+}
+
 fn shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     handle.send(Command::Shutdown);
@@ -633,6 +640,17 @@ fn server_drain(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn server_get_stats(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    let request_id = to_request_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
+    handle.send(ServerCommand::GetStats {
+        session,
+        request_id,
+    });
+    Ok(cx.undefined())
+}
+
 fn server_shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
     handle.send(ServerCommand::Shutdown);
@@ -674,6 +692,28 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
         }
         Ev::Draining => {
             set_str(cx, &obj, "type", "draining")?;
+        }
+        Ev::Stats {
+            request_id,
+            bytes_sent,
+            bytes_received,
+            packets_sent,
+            packets_received,
+            packets_lost,
+            smoothed_rtt_ms,
+            rtt_variation_ms,
+            min_rtt_ms,
+        } => {
+            set_str(cx, &obj, "type", "stats")?;
+            set_num(cx, &obj, "requestId", *request_id as f64)?;
+            set_num(cx, &obj, "bytesSent", *bytes_sent as f64)?;
+            set_num(cx, &obj, "bytesReceived", *bytes_received as f64)?;
+            set_num(cx, &obj, "packetsSent", *packets_sent as f64)?;
+            set_num(cx, &obj, "packetsReceived", *packets_received as f64)?;
+            set_num(cx, &obj, "packetsLost", *packets_lost as f64)?;
+            set_num(cx, &obj, "smoothedRtt", *smoothed_rtt_ms)?;
+            set_num(cx, &obj, "rttVariation", *rtt_variation_ms)?;
+            set_num(cx, &obj, "minRtt", *min_rtt_ms)?;
         }
         Ev::ServerReady {
             authority,
@@ -820,6 +860,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("isClosed", is_closed)?;
     cx.export_function("closeSession", close_session)?;
     cx.export_function("drain", drain)?;
+    cx.export_function("getStats", get_stats)?;
     cx.export_function("shutdown", shutdown)?;
 
     // Server surface.
@@ -834,6 +875,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serverMaxDatagramSize", server_max_datagram_size)?;
     cx.export_function("serverCloseSession", server_close_session)?;
     cx.export_function("serverDrain", server_drain)?;
+    cx.export_function("serverGetStats", server_get_stats)?;
     cx.export_function("serverShutdown", server_shutdown)?;
     Ok(())
 }

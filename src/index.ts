@@ -139,6 +139,8 @@ export type {
     WebTransportHash,
     WebTransportCongestionControl,
     WebTransportReliabilityMode,
+    WebTransportConnectionStats,
+    WebTransportDatagramStats,
     WebTransportCloseInfo,
     WebTransportCloseOptions,
     BinarySource,

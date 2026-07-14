@@ -4,7 +4,7 @@
 
 import { loadNative } from './loader.js';
 import { WebTransportError } from './errors.js';
-import type { WebTransportCloseInfo } from './types.js';
+import type { WebTransportCloseInfo, WebTransportConnectionStats } from './types.js';
 
 /**
  * Opaque handle to a native client session (a neon `JsBox`).
@@ -71,6 +71,8 @@ export enum NativeEventType {
     WriteAck = 'writeAck',
     /** Acknowledges a {@link NativeAddon.sendDatagram}. */
     DatagramAck = 'datagramAck',
+    /** Result of a {@link NativeAddon.getStats} request. */
+    Stats = 'stats',
     /** Server level: the listener is bound (carries the port). */
     Listening = 'listening',
     /** Server level: a fatal server failure. */
@@ -263,6 +265,33 @@ export interface NativeDatagramAckEvent {
 }
 
 /**
+ * The result of a {@link NativeAddon.getStats} request, keyed by `requestId`.
+ * @internal
+ */
+export interface NativeStatsEvent {
+    /** Discriminant. */
+    type: NativeEventType.Stats;
+    /** The request id passed to {@link NativeAddon.getStats}. */
+    requestId: number;
+    /** Total bytes sent. */
+    bytesSent: number;
+    /** Total bytes received. */
+    bytesReceived: number;
+    /** QUIC packets sent. */
+    packetsSent: number;
+    /** QUIC packets received. */
+    packetsReceived: number;
+    /** QUIC packets declared lost. */
+    packetsLost: number;
+    /** Smoothed RTT in milliseconds. */
+    smoothedRtt: number;
+    /** RTT variation in milliseconds. */
+    rttVariation: number;
+    /** Minimum observed RTT in milliseconds. */
+    minRtt: number;
+}
+
+/**
  * Events delivered by the native addon to a client session's, or one server
  * session's, `onEvent` callback.
  *
@@ -285,7 +314,8 @@ export type NativeEvent =
     | NativeStreamStopSendingEvent
     | NativeStreamOpenedEvent
     | NativeWriteAckEvent
-    | NativeDatagramAckEvent;
+    | NativeDatagramAckEvent
+    | NativeStatsEvent;
 
 /**
  * The raw function surface exported by `rwebtransport.node`.
@@ -417,6 +447,8 @@ export interface NativeAddon {
     closeSession(handle: NativeHandle, code: number, reason: Uint8Array): void;
     /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
     drain(handle: NativeHandle): void;
+    /** Request connection stats; the result arrives as a `stats` event. */
+    getStats(handle: NativeHandle, requestId: number): void;
     /**
      * Tear down the session's driver thread. Called on close; the native
      * finalizer also invokes it as a safety net.
@@ -559,6 +591,8 @@ export interface NativeAddon {
     ): void;
     /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to one session's peer. */
     serverDrain(handle: NativeServerHandle, session: number): void;
+    /** Request one session's connection stats; the result arrives as a `stats` event. */
+    serverGetStats(handle: NativeServerHandle, session: number, requestId: number): void;
     /**
      * Stop the server, closing all its sessions and freeing the listening socket.
      *
@@ -823,6 +857,8 @@ export interface SessionTransport {
     closeSession(code: number, reason: Uint8Array): void;
     /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
     drain(): void;
+    /** Request connection stats; the result arrives as a `stats` event. */
+    getStats(requestId: number): void;
     /** Tear down the session's native resources. */
     shutdown(): void;
 }
@@ -854,6 +890,8 @@ export class SessionCore {
     private readonly writes = new Map<number, Deferred<void>>();
     /** Pending {@link SessionCore.sendDatagram} requests, keyed by request id. */
     private readonly datagramAcks = new Map<number, Deferred<boolean>>();
+    /** Pending getStats() requests, keyed by request id. */
+    private readonly statsRequests = new Map<number, Deferred<WebTransportConnectionStats>>();
     /** Active receive sinks, keyed by stream id. */
     private readonly receives = new Map<number, ReceiveSink>();
     /** Active send sinks, keyed by stream id. */
@@ -1043,6 +1081,20 @@ export class SessionCore {
         this.transport?.drain();
     }
 
+    /**
+     * Snapshot the connection's stats. Resolves with a
+     * {@link WebTransportConnectionStats} once the driver reports back; rejects
+     * if the session is closed or was never attached.
+     */
+    public getStats(): Promise<WebTransportConnectionStats> {
+        if (!this.usable()) return Promise.reject(this.deadError());
+        const requestId = this.nextId();
+        const d = deferred<WebTransportConnectionStats>();
+        this.statsRequests.set(requestId, d);
+        this.transport!.getStats(requestId);
+        return d.promise;
+    }
+
     /** Tear down the native resources for this session. No-op if not attached. */
     public shutdown(): void {
         this.transport?.shutdown();
@@ -1189,6 +1241,21 @@ export class SessionCore {
                 this.datagramAcks.delete(ev.requestId);
                 break;
             }
+            case NativeEventType.Stats: {
+                this.statsRequests.get(ev.requestId)?.resolve({
+                    bytesSent: ev.bytesSent,
+                    bytesReceived: ev.bytesReceived,
+                    packetsSent: ev.packetsSent,
+                    packetsReceived: ev.packetsReceived,
+                    packetsLost: ev.packetsLost,
+                    smoothedRtt: ev.smoothedRtt,
+                    rttVariation: ev.rttVariation,
+                    minRtt: ev.minRtt,
+                    datagrams: { expiredOutgoing: 0, droppedIncoming: 0, lostOutgoing: 0 },
+                });
+                this.statsRequests.delete(ev.requestId);
+                break;
+            }
         }
     }
 
@@ -1234,11 +1301,13 @@ export class SessionCore {
         for (const d of this.opens.values()) d.reject(err);
         for (const d of this.writes.values()) d.reject(err);
         for (const d of this.datagramAcks.values()) d.resolve(false);
+        for (const d of this.statsRequests.values()) d.reject(err);
         for (const sink of this.receives.values()) sink.onReset(0);
         for (const sink of this.sends.values()) sink.onStopSending(0);
         this.opens.clear();
         this.writes.clear();
         this.datagramAcks.clear();
+        this.statsRequests.clear();
         this.receives.clear();
         this.sends.clear();
 
@@ -1334,6 +1403,10 @@ class ClientTransport implements SessionTransport {
     /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer. */
     public drain(): void {
         this.native.drain(this.handle);
+    }
+    /** Request connection stats; the result arrives as a `stats` event. */
+    public getStats(requestId: number): void {
+        this.native.getStats(this.handle, requestId);
     }
     /** Tear down the session's native driver thread. */
     public shutdown(): void {
@@ -1455,6 +1528,10 @@ export class ServerTransport implements SessionTransport {
     /** Send a DRAIN_WEBTRANSPORT_SESSION capsule to this session's peer. */
     public drain(): void {
         this.native.serverDrain(this.handle, this.session);
+    }
+    /** Request this session's connection stats; the result arrives as a `stats` event. */
+    public getStats(requestId: number): void {
+        this.native.serverGetStats(this.handle, this.session, requestId);
     }
     /**
      * No-op: the server driver owns the session lifecycle, so there is nothing to
