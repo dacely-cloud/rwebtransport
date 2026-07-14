@@ -70,51 +70,68 @@ function Test-Tool($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
-# ---- winget ----------------------------------------------------------------
-Write-Step 'Checking for winget (the Windows package manager)'
-if (-not (Test-Tool 'winget')) {
-    Write-Error @'
-winget was not found. It ships with Windows 10 (1809+) and Windows 11 as the
-"App Installer" package; install it from the Microsoft Store, then re-run this.
-Or install the tools by hand:
-  Rust:  https://rustup.rs
-  CMake: https://cmake.org/download/
-  NASM:  https://www.nasm.us/
-  Go:    https://go.dev/dl/
-  Node:  https://nodejs.org/  (version 24 or 26)
+# ---- winget (resolve; a missing winget is NOT fatal) -----------------------
+# winget is usually on PATH, but the App Installer execution alias
+# (%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe) is sometimes missing from a
+# given shell's PATH, so fall back to it before giving up.
+function Resolve-Winget {
+    $cmd = Get-Command winget -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+    if (Test-Path $alias) { return $alias }
+    return $null
+}
+
+Write-Step 'Locating winget (the Windows package manager)'
+$script:winget = Resolve-Winget
+if ($script:winget) {
+    Write-Ok "winget found ($script:winget)"
+} else {
+    Write-Note @'
+winget was not found. It ships with Windows 10 (1809+) and 11 as the "App
+Installer" package. If it IS installed, open a normal (non-admin) Windows
+Terminal where 'winget --version' works and run this script there, or install
+App Installer from the Microsoft Store.
+Continuing anyway: the script will still check your toolchain and configure
+NASM, but it cannot install missing tools. Install any it reports from:
+  Rust  https://rustup.rs    CMake https://cmake.org/download/
+  Go    https://go.dev/dl/   NASM  https://www.nasm.us/   Node https://nodejs.org/
 '@
 }
-Write-Ok 'winget is available'
 
 # Install a winget package only if its command is missing.
-function Install-Tool($command, $wingetId, $label) {
+function Install-Tool($command, $wingetId, $label, $url) {
     Write-Step "Checking for $label"
     if (Test-Tool $command) {
         Write-Ok "$label already installed ($((Get-Command $command).Source))"
         return
     }
+    if (-not $script:winget) {
+        Write-Note "$label is missing; install it from $url"
+        return
+    }
     Write-Host "  installing $label via winget ($wingetId) ..."
-    winget install --id $wingetId --exact --silent `
+    & $script:winget install --id $wingetId --exact --silent `
         --accept-source-agreements --accept-package-agreements
     # Inspect the exit code directly (a non-zero native exit does not throw).
     # 0 = installed; -1978335189 (0x8A15002B) = no applicable installer/upgrade,
     # i.e. already present, which is fine.
     $code = $LASTEXITCODE
     if ($code -ne 0 -and $code -ne -1978335189) {
-        Write-Note ("winget could not install {0} (exit 0x{1:X}); install it by hand." -f $label, $code)
+        Write-Note ("winget could not install {0} (exit 0x{1:X}); install it from {2}" -f $label, $code, $url)
     }
     Update-SessionPath
     if (Test-Tool $command) {
         Write-Ok "$label installed"
     } else {
-        Write-Note "$label is still not on PATH. Open a new terminal to re-check, or install it manually."
+        Write-Note "$label is still not on PATH. Open a new terminal to re-check, or install it from $url"
     }
 }
 
-Install-Tool 'cargo' 'Rustlang.Rustup' 'Rust (rustup)'
-Install-Tool 'cmake' 'Kitware.CMake' 'CMake'
-Install-Tool 'go' 'GoLang.Go' 'Go'
-Install-Tool 'nasm' 'NASM.NASM' 'NASM'
+Install-Tool 'cargo' 'Rustlang.Rustup' 'Rust (rustup)' 'https://rustup.rs'
+Install-Tool 'cmake' 'Kitware.CMake' 'CMake' 'https://cmake.org/download/'
+Install-Tool 'go' 'GoLang.Go' 'Go' 'https://go.dev/dl/'
+Install-Tool 'nasm' 'NASM.NASM' 'NASM' 'https://www.nasm.us/'
 
 # ---- Rust MSVC toolchain ----------------------------------------------------
 if (Test-Tool 'rustup') {
