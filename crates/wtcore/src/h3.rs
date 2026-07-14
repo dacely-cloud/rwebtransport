@@ -349,7 +349,7 @@ mod tests {
         assert_eq!(http_code_to_webtransport_code(WT_APP_ERROR_FIRST - 1), None);
         assert_eq!(http_code_to_webtransport_code(WT_APP_ERROR_LAST + 1), None);
         let mut grease = WT_APP_ERROR_FIRST;
-        while grease.wrapping_sub(0x21) % 0x1f != 0 {
+        while !grease.wrapping_sub(0x21).is_multiple_of(0x1f) {
             grease += 1;
         }
         assert!(grease <= WT_APP_ERROR_LAST);

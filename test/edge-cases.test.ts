@@ -73,7 +73,7 @@ describe('Connection setup', () => {
         const wt = new WebTransport(server.url, {
             serverCertificateHashes: [{ algorithm: 'sha-256', value: server.certHash }],
         });
-        // Do NOT await ready first — the stream open is queued and completes once
+        // Do NOT await ready first; the stream open is queued and completes once
         // the session establishes.
         const streamPromise = wt.createBidirectionalStream();
         const stream = await streamPromise;

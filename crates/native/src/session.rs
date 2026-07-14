@@ -284,6 +284,10 @@ pub struct WtSession {
     fc_max_streams_bidi_remote: u64,
     #[allow(dead_code)]
     fc_max_streams_uni_remote: u64,
+    /// Reassembly buffer for capsules on the session (CONNECT) stream: RFC 9297
+    /// lets a capsule span multiple HTTP/3 DATA frames, so bytes are accumulated
+    /// here and only whole capsules are consumed.
+    capsule_buf: Vec<u8>,
 
     peer_settings: Option<h3::PeerSettings>,
 
@@ -323,6 +327,7 @@ impl WtSession {
             fc_max_data_remote: 0,
             fc_max_streams_bidi_remote: 0,
             fc_max_streams_uni_remote: 0,
+            capsule_buf: Vec::new(),
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -353,6 +358,7 @@ impl WtSession {
             fc_max_data_remote: 0,
             fc_max_streams_bidi_remote: 0,
             fc_max_streams_uni_remote: 0,
+            capsule_buf: Vec::new(),
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -621,7 +627,7 @@ impl WtSession {
                         self.mark_closed(ev, 0, b"webtransport not supported".to_vec(), false);
                     }
                 }
-            } else if ty == h3::FRAME_GOAWAY && !self.drain_emitted {
+            } else if ty == h3::FRAME_GOAWAY && !self.drain_emitted && !self.closed {
                 // The peer is gracefully shutting down the HTTP/3 connection.
                 // Exactly one WebTransport session rides it, so surface GOAWAY as
                 // the session draining (going away soon, still usable).
@@ -696,20 +702,32 @@ impl WtSession {
         }
     }
 
-    fn scan_capsules(&mut self, mut buf: &[u8], ev: &mut Vec<Ev>) {
-        while !buf.is_empty() {
-            let Some((ty, n1)) = h3::read_varint(buf) else {
-                break;
+    fn scan_capsules(&mut self, payload: &[u8], ev: &mut Vec<Ev>) {
+        // A capsule may span multiple HTTP/3 DATA frames (RFC 9297), so append
+        // this frame's payload and consume only whole capsules from the buffer.
+        self.capsule_buf.extend_from_slice(payload);
+        loop {
+            let (ty, start, len) = {
+                let buf = &self.capsule_buf;
+                let Some((ty, n1)) = h3::read_varint(buf) else {
+                    break;
+                };
+                let Some((len, n2)) = h3::read_varint(&buf[n1..]) else {
+                    break;
+                };
+                (ty, n1 + n2, len as usize)
             };
-            let Some((len, n2)) = h3::read_varint(&buf[n1..]) else {
-                break;
-            };
-            let len = len as usize;
-            let start = n1 + n2;
-            if buf.len() < start + len {
+            // Guard against a hostile/oversized declared length.
+            if len > MAX_CONTROL_FRAME {
+                self.capsule_buf.clear();
                 break;
             }
-            let value = &buf[start..start + len];
+            if self.capsule_buf.len() < start + len {
+                break; // capsule not fully arrived; wait for the next DATA frame
+            }
+            let value: Vec<u8> = self.capsule_buf[start..start + len].to_vec();
+            self.capsule_buf.drain(..start + len);
+
             if ty == h3::WT_CLOSE_SESSION_CAPSULE && !self.closed {
                 let (code, reason) = if value.len() >= 4 {
                     (
@@ -720,23 +738,22 @@ impl WtSession {
                     (0, Vec::new())
                 };
                 self.mark_closed(ev, code, reason, true);
-            } else if ty == h3::WT_DRAIN_SESSION_CAPSULE && !self.drain_emitted {
+            } else if ty == h3::WT_DRAIN_SESSION_CAPSULE && !self.drain_emitted && !self.closed {
                 self.drain_emitted = true;
                 ev.push(Ev::Draining);
             } else if ty == h3::WT_MAX_DATA_CAPSULE {
-                if let Some((v, _)) = h3::read_varint(value) {
+                if let Some((v, _)) = h3::read_varint(&value) {
                     self.fc_max_data_remote = self.fc_max_data_remote.max(v);
                 }
             } else if ty == h3::WT_MAX_STREAMS_BIDI_CAPSULE {
-                if let Some((v, _)) = h3::read_varint(value) {
+                if let Some((v, _)) = h3::read_varint(&value) {
                     self.fc_max_streams_bidi_remote = self.fc_max_streams_bidi_remote.max(v);
                 }
             } else if ty == h3::WT_MAX_STREAMS_UNI_CAPSULE {
-                if let Some((v, _)) = h3::read_varint(value) {
+                if let Some((v, _)) = h3::read_varint(&value) {
                     self.fc_max_streams_uni_remote = self.fc_max_streams_uni_remote.max(v);
                 }
             }
-            buf = &buf[start + len..];
         }
     }
 
@@ -1126,17 +1143,19 @@ impl WtSession {
         if self.closed || self.drain_sent {
             return;
         }
-        self.drain_sent = true;
         let mut capsule = Vec::new();
         h3::put_varint(h3::WT_DRAIN_SESSION_CAPSULE, &mut capsule);
         h3::put_varint(0, &mut capsule); // DRAIN carries no content
         let body = h3::frame(h3::FRAME_DATA, &capsule);
+        // Only mark it sent once the CONNECT stream actually exists and we have
+        // queued the capsule; a drain() issued before establishment retries later.
         if let Some(st) = self.streams.get_mut(&CONNECT_ID) {
             st.out.push_back(OutChunk {
                 data: body,
                 off: 0,
                 request_id: None,
             });
+            self.drain_sent = true;
         }
     }
 

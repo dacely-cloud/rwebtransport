@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Adversarial tests: a hostile / misbehaving server must never crash or hang
-//! the client — it must fail cleanly (reject ready, error a stream, or resolve
+//! the client; it must fail cleanly (reject ready, error a stream, or resolve
 //! closed) and the Node process must survive.
 
 import { afterEach, describe, expect, it } from 'vitest';

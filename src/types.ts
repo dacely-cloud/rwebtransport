@@ -57,6 +57,8 @@ export interface WebTransportDatagramStats {
     droppedIncoming: number;
     /** Outgoing datagrams presumed lost in flight. */
     lostOutgoing: number;
+    /** Incoming datagrams dropped because they exceeded their max age. */
+    expiredIncoming: number;
 }
 
 /** Connection statistics returned by {@link WebTransport.getStats}. */
@@ -178,13 +180,3 @@ export interface WebTransportCloseOptions {
      */
     reason?: string;
 }
-
-/**
- * Grouping handle that schedules the sends of its member streams relative to
- * one another (spec parity).
- *
- * @remarks
- * Placeholder for the W3C `WebTransportSendGroup` concept; typed as `unknown`
- * because it is not yet modeled or used by this implementation.
- */
-export type WebTransportSendGroup = unknown;

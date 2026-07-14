@@ -906,6 +906,10 @@ export class SessionCore {
     private closedState = false;
     /** True once the session has been established (`ready`/`serverReady`). */
     private readyState = false;
+    /** True when the session reached its terminal state through an error. */
+    private failedState = false;
+    /** The most recent stats reported by the native layer, cached for {@link SessionCore.getStats}. */
+    private lastStats: WebTransportConnectionStats | undefined;
 
     /**
      * Resolves when the session is established, rejects if it fails before then.
@@ -1083,11 +1087,17 @@ export class SessionCore {
 
     /**
      * Snapshot the connection's stats. Resolves with a
-     * {@link WebTransportConnectionStats} once the driver reports back; rejects
-     * if the session is closed or was never attached.
+     * {@link WebTransportConnectionStats} once the driver reports back. After a
+     * clean close it resolves with the last stats seen while live; it rejects
+     * only when the session was never attached or terminated through an error.
      */
     public getStats(): Promise<WebTransportConnectionStats> {
-        if (!this.usable()) return Promise.reject(this.deadError());
+        if (!this.usable()) {
+            if (!this.failedState && this.lastStats !== undefined) {
+                return Promise.resolve(this.lastStats);
+            }
+            return Promise.reject(this.deadError());
+        }
         const requestId = this.nextId();
         const d = deferred<WebTransportConnectionStats>();
         this.statsRequests.set(requestId, d);
@@ -1242,7 +1252,7 @@ export class SessionCore {
                 break;
             }
             case NativeEventType.Stats: {
-                this.statsRequests.get(ev.requestId)?.resolve({
+                const stats: WebTransportConnectionStats = {
                     bytesSent: ev.bytesSent,
                     bytesReceived: ev.bytesReceived,
                     packetsSent: ev.packetsSent,
@@ -1251,8 +1261,15 @@ export class SessionCore {
                     smoothedRtt: ev.smoothedRtt,
                     rttVariation: ev.rttVariation,
                     minRtt: ev.minRtt,
-                    datagrams: { expiredOutgoing: 0, droppedIncoming: 0, lostOutgoing: 0 },
-                });
+                    datagrams: {
+                        expiredOutgoing: 0,
+                        droppedIncoming: 0,
+                        lostOutgoing: 0,
+                        expiredIncoming: 0,
+                    },
+                };
+                this.lastStats = stats;
+                this.statsRequests.get(ev.requestId)?.resolve(stats);
                 this.statsRequests.delete(ev.requestId);
                 break;
             }
@@ -1278,6 +1295,7 @@ export class SessionCore {
     private finish(info: WebTransportCloseInfo | null, error: WebTransportError | undefined): void {
         if (this.closedState) return;
         this.closedState = true;
+        if (error) this.failedState = true;
 
         if (!this.readyState) {
             // The session never established: both `ready` and `closed` reject

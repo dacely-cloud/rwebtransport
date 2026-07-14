@@ -175,7 +175,7 @@ describe('Robustness / panic containment', () => {
         } finally {
             delete process.env.RWT_TEST_PANIC;
         }
-        // If we got here, the process is still alive — prove it with a normal session.
+        // If we got here, the process is still alive, so prove it with a normal session.
         const wt2 = connect();
         await expect(wt2.ready).resolves.toBeUndefined();
         wt2.close();

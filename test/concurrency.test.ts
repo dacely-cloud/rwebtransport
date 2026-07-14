@@ -87,7 +87,7 @@ describe('Deadlock freedom', () => {
         clients.push(wt);
         await wt.ready;
 
-        const SIZE = 4 * 1024 * 1024; // 4 MiB — far exceeds the ~1 MiB stream / 10 MiB conn windows
+        const SIZE = 4 * 1024 * 1024; // 4 MiB, far exceeds the ~1 MiB stream / 10 MiB conn windows
         const CHUNK = 64 * 1024;
         const byte = (i: number) => (i * 31 + 7) & 0xff;
 

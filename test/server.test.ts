@@ -72,6 +72,10 @@ async function echoServer(): Promise<string> {
 }
 
 function handleSession(session: WebTransportServerSession): void {
+    // Each loop below runs detached for the session's lifetime. Tearing the
+    // session down mid-read/mid-write rejects the in-flight stream op, so every
+    // loop swallows that terminal rejection instead of leaking it as unhandled.
+
     // Bidirectional streams: echo by piping readable → writable.
     void (async () => {
         const reader = session.incomingBidirectionalStreams.getReader();
@@ -80,7 +84,7 @@ function handleSession(session: WebTransportServerSession): void {
             if (done) break;
             if (stream) void stream.readable.pipeTo(stream.writable).catch(() => undefined);
         }
-    })();
+    })().catch(() => undefined);
 
     // Unidirectional streams: read the payload, echo on a fresh uni stream.
     void (async () => {
@@ -95,7 +99,7 @@ function handleSession(session: WebTransportServerSession): void {
             await w.write(data);
             await w.close();
         }
-    })();
+    })().catch(() => undefined);
 
     // Datagrams: echo back.
     void (async () => {
@@ -106,7 +110,7 @@ function handleSession(session: WebTransportServerSession): void {
             if (done) break;
             if (value) await w.write(value);
         }
-    })();
+    })().catch(() => undefined);
 }
 
 function connect(url: string): WebTransport {
@@ -238,6 +242,7 @@ describe('WebTransportServer', () => {
             expiredOutgoing: 0,
             droppedIncoming: 0,
             lostOutgoing: 0,
+            expiredIncoming: 0,
         });
     });
 
@@ -317,7 +322,7 @@ describe('WebTransportServer', () => {
                     await writer.write(payload);
                     await new Promise((r) => setTimeout(r, 100));
                 }
-            })();
+            })().catch(() => undefined);
         });
         expect(dec.decode(received)).toBe('server-datagram');
     });
