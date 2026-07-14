@@ -7,7 +7,12 @@ import { fileURLToPath } from 'node:url';
 
 import { afterEach, describe, expect, it } from 'vitest';
 
-import { WebTransport, WebTransportServer, type WebTransportServerSession } from '../src/index.js';
+import {
+    WebTransport,
+    WebTransportError,
+    WebTransportServer,
+    type WebTransportServerSession,
+} from '../src/index.js';
 import { certHash } from './helpers/echo-server.js';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
@@ -175,6 +180,39 @@ describe('WebTransportServer', () => {
         const received = await readAll(stream.readable);
         expect(received.byteLength).toBe(SIZE);
         expect(received).toEqual(payload);
+    });
+
+    it('round-trips a stream reset code through the HTTP/3 error range', async () => {
+        // The server resets its send side with application code 42. The code is
+        // mapped into the HTTP/3 WT_APPLICATION_ERROR range on the wire and back,
+        // so the client must observe exactly 42 (proving the mapping composes to
+        // identity end to end, not just that some error surfaced).
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+        void (async () => {
+            const sreader = server.incomingSessions.getReader();
+            const { value: session } = await sreader.read();
+            if (!session) return;
+            const streams = session.incomingBidirectionalStreams.getReader();
+            const { value: stream } = await streams.read();
+            if (!stream) return;
+            void stream.writable.abort(
+                new WebTransportError('server reset', { streamErrorCode: 42 }),
+            );
+        })();
+
+        const wt = connect(`https://127.0.0.1:${server.port}/reset`);
+        await wt.ready;
+        const stream = await wt.createBidirectionalStream();
+        await stream.writable
+            .getWriter()
+            .write(enc.encode('hi'))
+            .catch(() => undefined);
+
+        await expect(stream.readable.getReader().read()).rejects.toMatchObject({
+            streamErrorCode: 42,
+        });
     });
 
     it('echoes a unidirectional stream via a server-opened uni stream', async () => {

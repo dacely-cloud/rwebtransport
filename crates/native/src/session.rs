@@ -410,7 +410,12 @@ impl WtSession {
                 st.recv_dead = true;
             }
             match role {
-                Some(Role::WtData { .. }) => ev.push(Ev::StreamReset { id, code }),
+                Some(Role::WtData { .. }) => {
+                    // Map the HTTP/3 reset code back to the WebTransport
+                    // application code; pass unmapped codes through unchanged.
+                    let app = h3::http_code_to_webtransport_code(code).unwrap_or(code);
+                    ev.push(Ev::StreamReset { id, code: app })
+                }
                 Some(Role::Connect) if !self.closed => {
                     // A reset of the session (CONNECT) stream ends the session;
                     // if we swallowed it, ready/closed would hang forever.
@@ -596,7 +601,7 @@ impl WtSession {
                 let (code, reason) = if value.len() >= 4 {
                     (
                         u32::from_be_bytes([value[0], value[1], value[2], value[3]]),
-                        value[4..].to_vec(),
+                        h3::truncate_close_reason(value[4..].to_vec()),
                     )
                 } else {
                     (0, Vec::new())
@@ -949,7 +954,10 @@ impl WtSession {
 
     pub fn stream_reset(&mut self, conn: &mut quiche::Connection, id: u64, code: u64) {
         if self.streams.contains_key(&id) {
-            let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, code);
+            // The QUIC RESET_STREAM code must be the WebTransport application code
+            // mapped into the HTTP/3 error space.
+            let h = h3::webtransport_code_to_http_code(code);
+            let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, h);
             if let Some(st) = self.streams.get_mut(&id) {
                 st.out.clear();
                 st.fin_sent = true;
@@ -959,7 +967,8 @@ impl WtSession {
 
     pub fn stream_stop_sending(&mut self, conn: &mut quiche::Connection, id: u64, code: u64) {
         if self.streams.contains_key(&id) {
-            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, code);
+            let h = h3::webtransport_code_to_http_code(code);
+            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, h);
             if let Some(st) = self.streams.get_mut(&id) {
                 st.recv_dead = true;
             }
@@ -976,7 +985,7 @@ impl WtSession {
         if self.close_req.is_none() {
             self.close_req = Some(CloseReq {
                 code,
-                reason,
+                reason: h3::truncate_close_reason(reason),
                 capsule_queued: false,
             });
         }
@@ -1089,7 +1098,8 @@ impl WtSession {
                 Err(quiche::Error::Done) => return,
                 Err(quiche::Error::StreamLimit) => return, // no stream credit yet; retry next loop
                 Err(quiche::Error::StreamStopped(code)) => {
-                    ev.push(Ev::StreamStopSending { id, code });
+                    let app = h3::http_code_to_webtransport_code(code).unwrap_or(code);
+                    ev.push(Ev::StreamStopSending { id, code: app });
                     // Settle every queued write's promise so a stalled write()
                     // (and its WritableStream) cannot hang forever.
                     for chunk in st.out.drain(..) {

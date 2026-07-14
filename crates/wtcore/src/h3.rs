@@ -38,6 +38,51 @@ pub const WT_CLOSE_SESSION_CAPSULE: u64 = 0x2843;
 /// `DRAIN_WEBTRANSPORT_SESSION` capsule type.
 pub const WT_DRAIN_SESSION_CAPSULE: u64 = 0x78ae;
 
+/// Maximum length in bytes of a `CLOSE_WEBTRANSPORT_SESSION` reason phrase.
+pub const WT_MAX_CLOSE_REASON: usize = 1024;
+
+/// First code of the HTTP/3 error range reserved for WebTransport application
+/// errors (draft-ietf-webtrans-http3 §4.3).
+pub const WT_APP_ERROR_FIRST: u64 = 0x52e4_a40f_a8db;
+/// Last code of that range: `webtransport_code_to_http_code(0xffff_ffff)`.
+pub const WT_APP_ERROR_LAST: u64 = 0x52e5_ac98_3162;
+
+/// Map a 32-bit WebTransport application error code into the HTTP/3 error-code
+/// space, skipping the HTTP/3 GREASE codepoints (`0x1f * N + 0x21`). This is the
+/// code an endpoint MUST put in a QUIC RESET_STREAM / STOP_SENDING for a
+/// WebTransport data stream.
+pub fn webtransport_code_to_http_code(n: u64) -> u64 {
+    WT_APP_ERROR_FIRST + n + n / 0x1e
+}
+
+/// Inverse of [`webtransport_code_to_http_code`]. Returns `None` when `h` is
+/// outside the reserved range or lands on a reserved GREASE codepoint, i.e. it
+/// is not a valid WebTransport-mapped code.
+pub fn http_code_to_webtransport_code(h: u64) -> Option<u64> {
+    if !(WT_APP_ERROR_FIRST..=WT_APP_ERROR_LAST).contains(&h) {
+        return None;
+    }
+    if h.wrapping_sub(0x21).is_multiple_of(0x1f) {
+        return None;
+    }
+    let shifted = h - WT_APP_ERROR_FIRST;
+    Some(shifted - shifted / 0x1f)
+}
+
+/// Truncate a close reason to the longest valid UTF-8 prefix not exceeding
+/// [`WT_MAX_CLOSE_REASON`] bytes, without splitting a multi-byte character.
+pub fn truncate_close_reason(mut reason: Vec<u8>) -> Vec<u8> {
+    if reason.len() <= WT_MAX_CLOSE_REASON {
+        return reason;
+    }
+    let mut end = WT_MAX_CLOSE_REASON;
+    while end > 0 && (reason[end] & 0xc0) == 0x80 {
+        end -= 1;
+    }
+    reason.truncate(end);
+    reason
+}
+
 /// Largest QPACK header block we will decode from a peer.
 pub const MAX_HEADER_BLOCK: u64 = 64 * 1024;
 
@@ -223,4 +268,73 @@ pub fn status_of(headers: &[Header]) -> Option<u16> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn error_code_mapping_roundtrips() {
+        assert_eq!(webtransport_code_to_http_code(0), WT_APP_ERROR_FIRST);
+        assert_eq!(
+            webtransport_code_to_http_code(0xffff_ffff),
+            WT_APP_ERROR_LAST
+        );
+        for n in [
+            0u64,
+            1,
+            29,
+            30,
+            31,
+            100,
+            1000,
+            0x1e,
+            0x1f,
+            65_535,
+            0xffff_ffff,
+        ] {
+            let h = webtransport_code_to_http_code(n);
+            assert!((WT_APP_ERROR_FIRST..=WT_APP_ERROR_LAST).contains(&h));
+            assert_eq!(http_code_to_webtransport_code(h), Some(n), "n={n} h={h:#x}");
+        }
+    }
+
+    #[test]
+    fn mapping_never_lands_on_a_grease_codepoint() {
+        for n in 0u64..3000 {
+            let h = webtransport_code_to_http_code(n);
+            assert_ne!(
+                h.wrapping_sub(0x21) % 0x1f,
+                0,
+                "n={n} mapped onto a GREASE code"
+            );
+        }
+    }
+
+    #[test]
+    fn out_of_range_and_grease_have_no_inverse() {
+        assert_eq!(http_code_to_webtransport_code(WT_APP_ERROR_FIRST - 1), None);
+        assert_eq!(http_code_to_webtransport_code(WT_APP_ERROR_LAST + 1), None);
+        let mut grease = WT_APP_ERROR_FIRST;
+        while grease.wrapping_sub(0x21) % 0x1f != 0 {
+            grease += 1;
+        }
+        assert!(grease <= WT_APP_ERROR_LAST);
+        assert_eq!(http_code_to_webtransport_code(grease), None);
+    }
+
+    #[test]
+    fn reason_truncation_keeps_utf8_boundary() {
+        assert_eq!(truncate_close_reason(b"hi".to_vec()), b"hi");
+        // 3-byte chars so 1024 does not fall on a boundary; must back up.
+        let big = "\u{20ac}".repeat(500).into_bytes(); // 1500 bytes
+        let out = truncate_close_reason(big);
+        assert!(out.len() <= WT_MAX_CLOSE_REASON);
+        assert!(
+            std::str::from_utf8(&out).is_ok(),
+            "truncation split a character"
+        );
+        assert_eq!(out.len(), 1023); // 341 * 3
+    }
 }
