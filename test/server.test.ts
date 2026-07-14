@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-//! End-to-end tests of the WebTransport **server** — our own client talks to our
+//! End-to-end tests of the WebTransport **server**: our own client talks to our
 //! own server (both native quiche), no external process.
 
 import { dirname, join } from 'node:path';
@@ -137,6 +137,10 @@ describe('WebTransportServer', () => {
         const session = await sessionPromise;
         expect(session).toBeDefined();
         expect(session!.path).toBe('/chat/room1');
+        // The client connects over loopback, so the server sees 127.0.0.1 and
+        // the client's ephemeral UDP port.
+        expect(session!.remoteAddress).toBe('127.0.0.1');
+        expect(session!.remotePort).toBeGreaterThan(0);
     });
 
     it('echoes a bidirectional stream client → server → client', async () => {

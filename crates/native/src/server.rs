@@ -428,7 +428,7 @@ fn run_inner(
                         key.clone(),
                         ServerConn {
                             conn,
-                            session: WtSession::new_server(),
+                            session: WtSession::new_server(from),
                             session_id,
                             closed_emitted: false,
                         },

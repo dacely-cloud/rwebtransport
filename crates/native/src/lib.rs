@@ -270,7 +270,7 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
 
     // Event-loop plumbing (created here so the poll registry can back the waker
     // stored in the handle). DNS resolution, socket bind, TLS/QUIC config, and
-    // the handshake all run on the driver thread — see `driver::SessionSetup`.
+    // the handshake all run on the driver thread; see `driver::SessionSetup`.
     let poll = match mio::Poll::new() {
         Ok(p) => p,
         Err(e) => return cx.throw_error(format!("mio poll: {e}")),
@@ -674,6 +674,8 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
             path,
             origin,
             headers,
+            remote_addr,
+            remote_port,
         } => {
             set_str(cx, &obj, "type", "serverReady")?;
             set_str(cx, &obj, "authority", authority)?;
@@ -690,6 +692,8 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
                 set_str(cx, &hobj, k, v)?;
             }
             obj.set(cx, "headers", hobj)?;
+            set_str(cx, &obj, "remoteAddress", remote_addr)?;
+            set_num(cx, &obj, "remotePort", *remote_port as f64)?;
         }
         Ev::Closed {
             code,

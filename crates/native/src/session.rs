@@ -2,15 +2,15 @@
 //! WebTransport client session state machine over a single quiche connection.
 //!
 //! One `WtSession` drives exactly one WebTransport session (one HTTP/3 Extended
-//! CONNECT) over one QUIC connection. It owns no I/O — the [`crate::driver`]
+//! CONNECT) over one QUIC connection. It owns no I/O: the [`crate::driver`]
 //! event loop feeds it readable-stream / datagram / timer notifications and asks
 //! it to flush. Everything the session wants to tell JS is returned as [`Ev`]s.
 //!
 //! Stream-id layout (client-initiated):
-//! * bidi `0` — the CONNECT stream (this is also the WebTransport *session id*).
-//! * uni `2`, `6`, `10` — HTTP/3 control, QPACK encoder, QPACK decoder.
-//! * bidi `4, 8, …` — WebTransport bidirectional streams.
-//! * uni `14, 18, …` — WebTransport unidirectional streams.
+//! * bidi `0` is the CONNECT stream (this is also the WebTransport session id).
+//! * uni `2`, `6`, `10` are HTTP/3 control, QPACK encoder, QPACK decoder.
+//! * bidi `4, 8, ...` are WebTransport bidirectional streams.
+//! * uni `14, 18, ...` are WebTransport unidirectional streams.
 
 use std::collections::{HashMap, VecDeque};
 
@@ -55,6 +55,10 @@ pub enum Ev {
         path: String,
         origin: Option<String>,
         headers: Vec<(String, String)>,
+        /// The client's remote IP (as a string) at session establishment.
+        remote_addr: String,
+        /// The client's remote UDP port at session establishment.
+        remote_port: u16,
     },
     /// The session ended. `remote` is true if the peer initiated it.
     Closed {
@@ -98,7 +102,7 @@ enum Role {
     LocalControlPlane,
     /// The CONNECT (session) bidi stream.
     Connect,
-    /// The peer's HTTP/3 control stream — parse SETTINGS/frames.
+    /// The peer's HTTP/3 control stream: parse SETTINGS/frames.
     PeerControl,
     /// A peer uni stream we drain and discard (QPACK/push/unknown).
     Ignored,
@@ -125,7 +129,7 @@ struct Stream {
     /// Application asked to FIN once `out` drains.
     fin_queued: bool,
     fin_sent: bool,
-    /// Peer already reset/finished — stop touching recv.
+    /// Peer already reset/finished, stop touching recv.
     recv_dead: bool,
 }
 
@@ -222,6 +226,9 @@ pub struct WtSession {
     close_req: Option<CloseReq>,
     /// Set once the QUIC connection should be closed (after connect FIN flush).
     want_quic_close: Option<(u32, Vec<u8>)>,
+    /// Server role only: the client's remote address, captured when the
+    /// connection was accepted and surfaced on the `serverReady` event.
+    remote_addr: Option<std::net::SocketAddr>,
 }
 
 impl WtSession {
@@ -247,11 +254,14 @@ impl WtSession {
             streams: HashMap::new(),
             close_req: None,
             want_quic_close: None,
+            remote_addr: None,
         }
     }
 
     /// A server-role session that will accept an incoming Extended CONNECT.
-    pub fn new_server() -> Self {
+    /// `remote` is the client's address, surfaced to the application via the
+    /// `serverReady` event.
+    pub fn new_server(remote: std::net::SocketAddr) -> Self {
         Self {
             is_server: true,
             authority: String::new(),
@@ -267,6 +277,7 @@ impl WtSession {
             streams: HashMap::new(),
             close_req: None,
             want_quic_close: None,
+            remote_addr: Some(remote),
         }
     }
 
@@ -682,11 +693,17 @@ impl WtSession {
                     });
                 }
                 self.ready = true;
+                let (remote_addr, remote_port) = match self.remote_addr {
+                    Some(a) => (a.ip().to_string(), a.port()),
+                    None => (String::new(), 0),
+                };
                 ev.push(Ev::ServerReady {
                     authority,
                     path,
                     origin,
                     headers: extra,
+                    remote_addr,
+                    remote_port,
                 });
             }
             Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT response: {e}"))),
