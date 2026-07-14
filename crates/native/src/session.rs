@@ -227,6 +227,8 @@ pub struct WtSession {
     /// Set once a DRAIN_WEBTRANSPORT_SESSION capsule has been surfaced, so the
     /// `Draining` event is emitted at most once.
     drain_emitted: bool,
+    /// Set once we have queued an outbound DRAIN capsule, so we send at most one.
+    drain_sent: bool,
 
     peer_settings: Option<h3::PeerSettings>,
 
@@ -261,6 +263,7 @@ impl WtSession {
             closed: false,
             connect_pending: false,
             drain_emitted: false,
+            drain_sent: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -286,6 +289,7 @@ impl WtSession {
             closed: false,
             connect_pending: false,
             drain_emitted: false,
+            drain_sent: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -1026,6 +1030,27 @@ impl WtSession {
                 code,
                 reason: h3::truncate_close_reason(reason),
                 capsule_queued: false,
+            });
+        }
+    }
+
+    /// Queue a DRAIN_WEBTRANSPORT_SESSION capsule on the session stream, telling
+    /// the peer we intend to close soon. The session stays usable; this is not a
+    /// close. Emitted at most once and only while the session is open.
+    pub fn send_drain(&mut self) {
+        if self.closed || self.drain_sent {
+            return;
+        }
+        self.drain_sent = true;
+        let mut capsule = Vec::new();
+        h3::put_varint(h3::WT_DRAIN_SESSION_CAPSULE, &mut capsule);
+        h3::put_varint(0, &mut capsule); // DRAIN carries no content
+        let body = h3::frame(h3::FRAME_DATA, &capsule);
+        if let Some(st) = self.streams.get_mut(&CONNECT_ID) {
+            st.out.push_back(OutChunk {
+                data: body,
+                off: 0,
+                request_id: None,
             });
         }
     }

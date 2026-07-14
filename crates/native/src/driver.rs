@@ -73,6 +73,8 @@ pub enum Command {
         code: u32,
         reason: Vec<u8>,
     },
+    /// Send a DRAIN_WEBTRANSPORT_SESSION capsule to the peer.
+    Drain,
     /// Tear the driver down (the JS handle was closed/GC'd).
     Shutdown,
 }
@@ -340,6 +342,7 @@ fn run_inner(
                     session.send_datagram(&mut conn, &data, request_id, &mut evs)
                 }
                 Command::Close { code, reason } => session.close(code, reason),
+                Command::Drain => session.send_drain(),
                 Command::Shutdown => {
                     shutdown = true;
                     break;

@@ -291,6 +291,17 @@ export class WebTransportSession {
         this.closeCalled = true;
         this.core.close(closeInfo.closeCode ?? 0, closeInfo.reason ?? '');
     }
+
+    /**
+     * Tell the peer this session is draining by sending a
+     * `DRAIN_WEBTRANSPORT_SESSION` capsule: a graceful signal that you intend to
+     * stop using it soon, while the session and its streams stay open until
+     * {@link close}. The peer observes this through its {@link draining} promise.
+     * A Node extension beyond the W3C API, useful for a server shedding load.
+     */
+    public drain(): void {
+        this.core.drain();
+    }
 }
 
 /**

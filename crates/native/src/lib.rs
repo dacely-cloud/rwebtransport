@@ -397,6 +397,12 @@ fn close_session(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn drain(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
+    handle.send(Command::Drain);
+    Ok(cx.undefined())
+}
+
 fn shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     handle.send(Command::Shutdown);
@@ -620,6 +626,13 @@ fn server_close_session(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     Ok(cx.undefined())
 }
 
+fn server_drain(mut cx: FunctionContext) -> JsResult<JsUndefined> {
+    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
+    let session = to_stream_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
+    handle.send(ServerCommand::Drain { session });
+    Ok(cx.undefined())
+}
+
 fn server_shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
     handle.send(ServerCommand::Shutdown);
@@ -806,6 +819,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("isReady", is_ready)?;
     cx.export_function("isClosed", is_closed)?;
     cx.export_function("closeSession", close_session)?;
+    cx.export_function("drain", drain)?;
     cx.export_function("shutdown", shutdown)?;
 
     // Server surface.
@@ -819,6 +833,7 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serverSendDatagram", server_send_datagram)?;
     cx.export_function("serverMaxDatagramSize", server_max_datagram_size)?;
     cx.export_function("serverCloseSession", server_close_session)?;
+    cx.export_function("serverDrain", server_drain)?;
     cx.export_function("serverShutdown", server_shutdown)?;
     Ok(())
 }
