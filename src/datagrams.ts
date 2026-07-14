@@ -133,6 +133,8 @@ export class WebTransportDatagramDuplexStream {
             // Unreliable: drop when the inbound queue is already full.
             if ((rController.desiredSize ?? 1) > 0) {
                 rController.enqueue(data);
+            } else {
+                session.recordDroppedIncomingDatagram();
             }
         });
 

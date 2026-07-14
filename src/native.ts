@@ -966,6 +966,8 @@ export class SessionCore {
     private incoming: IncomingHandler | undefined;
     /** Sink for inbound datagrams, if one has been set. */
     private datagramSink: DatagramSink | undefined;
+    /** Count of inbound datagrams dropped because the readable queue was full. */
+    private droppedIncomingDatagrams = 0;
 
     /** True once the session has reached its terminal (closed) state. */
     private closedState = false;
@@ -1261,6 +1263,14 @@ export class SessionCore {
     }
 
     /**
+     * Record that one inbound datagram was dropped because the readable queue
+     * was full. Surfaced through getStats() as `datagrams.droppedIncoming`.
+     */
+    public recordDroppedIncomingDatagram(): void {
+        this.droppedIncomingDatagrams++;
+    }
+
+    /**
      * Route one native event to the appropriate promise, sink, or handler.
      *
      * @param ev - The event delivered by the native addon.
@@ -1346,7 +1356,7 @@ export class SessionCore {
                     minRtt: ev.minRtt,
                     datagrams: {
                         expiredOutgoing: 0,
-                        droppedIncoming: 0,
+                        droppedIncoming: this.droppedIncomingDatagrams,
                         lostOutgoing: 0,
                         expiredIncoming: 0,
                     },
@@ -1395,6 +1405,9 @@ export class SessionCore {
         if (this.closedState) return;
         this.closedState = true;
         if (error) this.failedState = true;
+        // A session that closes without a prior DRAIN never emitted `draining`;
+        // settle it here so `await session.draining` cannot hang past close.
+        this.draining.resolve();
 
         if (!this.readyState) {
             // The session never established: both `ready` and `closed` reject

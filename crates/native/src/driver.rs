@@ -7,7 +7,6 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::Instant;
 
 use mio::net::UdpSocket;
 use mio::{Events, Poll, Token};
@@ -428,7 +427,10 @@ fn run_inner(
         // 6. Terminal state?
         if conn.is_closed() {
             if !session.is_closed() {
-                let (code, reason, remote) = closure_info(&conn);
+                let (code, reason, remote, err) = closure_info(&conn);
+                if let Some(msg) = err {
+                    evs.push(Ev::Error(msg));
+                }
                 session.mark_closed(&mut evs, code, reason, remote);
             }
             shared.closed.store(true, Ordering::Relaxed);
@@ -475,15 +477,55 @@ fn flush_send(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8],
     }
 }
 
-/// Extract a close code/reason from a terminated connection.
-fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool) {
+/// Extract a close code/reason from a terminated connection. The fourth element
+/// is `Some(message)` when the termination was an abnormal transport-level event
+/// (idle timeout, a transport CONNECTION_CLOSE with `is_app == false`, or a
+/// stateless reset) rather than a clean WebTransport/HTTP-3 close; the driver
+/// emits an `Ev::Error` for it so the JS `closed` promise rejects. A clean
+/// application close keeps its WebTransport code/reason and returns `None`.
+fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool, Option<String>) {
     if let Some(err) = conn.peer_error() {
-        return (err.error_code as u32, err.reason.clone(), true);
+        if err.is_app {
+            return (err.error_code as u32, err.reason.clone(), true, None);
+        }
+        return (
+            0,
+            Vec::new(),
+            true,
+            Some(format!(
+                "connection terminated by peer transport error {:#x}",
+                err.error_code
+            )),
+        );
     }
     if let Some(err) = conn.local_error() {
-        return (err.error_code as u32, err.reason.clone(), false);
+        if err.is_app {
+            return (err.error_code as u32, err.reason.clone(), false, None);
+        }
+        return (
+            0,
+            Vec::new(),
+            false,
+            Some(format!(
+                "connection closed by transport error {:#x}",
+                err.error_code
+            )),
+        );
     }
-    // Idle timeout / no explicit error.
-    let _ = Instant::now();
-    (0, Vec::new(), true)
+    if conn.is_timed_out() {
+        return (
+            0,
+            Vec::new(),
+            false,
+            Some("connection timed out".to_string()),
+        );
+    }
+    // No explicit error and not a timeout (for example a stateless reset): still
+    // an abnormal loss of the connection.
+    (
+        0,
+        Vec::new(),
+        true,
+        Some("connection closed abnormally".to_string()),
+    )
 }

@@ -203,6 +203,31 @@ describe('WebTransportServer', () => {
         expect(wt.reliability).toBe('supports-unreliable');
     });
 
+    it('settles the draining promise when the session closes without a prior DRAIN', async () => {
+        const url = await echoServer();
+        const wt = connect(url);
+        await wt.ready;
+        // No DRAIN capsule is ever sent; closing must still settle `draining` so
+        // an `await session.draining` cannot hang past the session's end.
+        wt.close();
+        await expect(wt.draining).resolves.toBeUndefined();
+    });
+
+    it('counts droppedIncoming datagrams when the inbound queue overflows', async () => {
+        const url = await echoServer();
+        const wt = connect(url);
+        await wt.ready;
+        // Never read wt.datagrams.readable: echoed datagrams pile into the
+        // bounded inbound queue (high-water mark 64) and overflow, which must be
+        // counted as droppedIncoming.
+        const writer = wt.datagrams.writable.getWriter();
+        const payload = enc.encode('flood');
+        for (let i = 0; i < 400; i++) await writer.write(payload);
+        await new Promise((r) => setTimeout(r, 600));
+        const stats = await wt.getStats();
+        expect(stats.datagrams.droppedIncoming).toBeGreaterThan(0);
+    });
+
     it('accepts sendOrder / sendGroup on stream creation and exposes them', async () => {
         const url = await echoServer();
         const wt = connect(url);

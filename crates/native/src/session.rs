@@ -923,6 +923,11 @@ impl WtSession {
             st.class_buf.clone()
         };
         let Some((ty, n)) = h3::read_varint(&buf) else {
+            // Peer FIN'd before we could classify: no more bytes will ever
+            // arrive, so drop the entry rather than leak a Pending stream.
+            if fin {
+                self.streams.remove(&id);
+            }
             return; // need more bytes for the type varint
         };
         match ty {
@@ -945,6 +950,10 @@ impl WtSession {
             }
             t if t == h3::WT_UNI_STREAM_TYPE => {
                 let Some((session, n2)) = h3::read_varint(&buf[n..]) else {
+                    // Peer FIN'd mid-header: reclaim the entry instead of leaking.
+                    if fin {
+                        self.streams.remove(&id);
+                    }
                     return; // need session id
                 };
                 if session != CONNECT_ID {
@@ -1001,6 +1010,10 @@ impl WtSession {
             st.class_buf.clone()
         };
         let Some((signal, n)) = h3::read_varint(&buf) else {
+            // Peer FIN'd before we could classify: reclaim the entry.
+            if fin {
+                self.streams.remove(&id);
+            }
             return;
         };
         if signal != h3::WT_BIDI_FRAME_TYPE {
@@ -1013,6 +1026,10 @@ impl WtSession {
             return;
         }
         let Some((session, n2)) = h3::read_varint(&buf[n..]) else {
+            // Peer FIN'd mid-header: reclaim the entry instead of leaking.
+            if fin {
+                self.streams.remove(&id);
+            }
             return;
         };
         if session != CONNECT_ID {

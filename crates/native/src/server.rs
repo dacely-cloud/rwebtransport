@@ -533,8 +533,11 @@ fn run_inner(
             if server.conn.is_closed() && !server.closed_emitted {
                 server.closed_emitted = true;
                 if !server.session.is_closed() {
-                    let (code, reason, remote) = closure_info(&server.conn);
+                    let (code, reason, remote, err) = closure_info(&server.conn);
                     let mut evs = Vec::new();
+                    if let Some(msg) = err {
+                        evs.push(Ev::Error(msg));
+                    }
                     server.session.mark_closed(&mut evs, code, reason, remote);
                     for ev in evs {
                         out.push(ServerMsg::Session(server.session_id, ev));
@@ -660,14 +663,54 @@ fn flush_send(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8])
     }
 }
 
-fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool) {
+/// Extract a close code/reason from a terminated connection. The fourth element
+/// is `Some(message)` for an abnormal transport-level termination (idle timeout,
+/// transport CONNECTION_CLOSE with `is_app == false`, stateless reset), which is
+/// surfaced as an `Ev::Error` so the JS `closed` promise rejects; a clean
+/// application close keeps its WebTransport code/reason and returns `None`.
+fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool, Option<String>) {
     if let Some(err) = conn.peer_error() {
-        return (err.error_code as u32, err.reason.clone(), true);
+        if err.is_app {
+            return (err.error_code as u32, err.reason.clone(), true, None);
+        }
+        return (
+            0,
+            Vec::new(),
+            true,
+            Some(format!(
+                "connection terminated by peer transport error {:#x}",
+                err.error_code
+            )),
+        );
     }
     if let Some(err) = conn.local_error() {
-        return (err.error_code as u32, err.reason.clone(), false);
+        if err.is_app {
+            return (err.error_code as u32, err.reason.clone(), false, None);
+        }
+        return (
+            0,
+            Vec::new(),
+            false,
+            Some(format!(
+                "connection closed by transport error {:#x}",
+                err.error_code
+            )),
+        );
     }
-    (0, Vec::new(), true)
+    if conn.is_timed_out() {
+        return (
+            0,
+            Vec::new(),
+            false,
+            Some("connection timed out".to_string()),
+        );
+    }
+    (
+        0,
+        Vec::new(),
+        true,
+        Some("connection closed abnormally".to_string()),
+    )
 }
 
 #[cfg(test)]
