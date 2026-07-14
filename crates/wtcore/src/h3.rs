@@ -28,6 +28,26 @@ pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 pub const SETTINGS_WT_MAX_SESSIONS: u64 = 0x14e9_cd29;
 /// Older draft `SETTINGS_ENABLE_WEBTRANSPORT` (kept for maximum compatibility).
 pub const SETTINGS_ENABLE_WEBTRANSPORT: u64 = 0x2b60_3742;
+/// `SETTINGS_WT_INITIAL_MAX_DATA`: initial per-session send-data allowance.
+pub const SETTINGS_WT_INITIAL_MAX_DATA: u64 = 0x2b61;
+/// `SETTINGS_WT_INITIAL_MAX_STREAMS_UNI`: initial per-session uni stream limit.
+pub const SETTINGS_WT_INITIAL_MAX_STREAMS_UNI: u64 = 0x2b64;
+/// `SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI`: initial per-session bidi stream limit.
+pub const SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI: u64 = 0x2b65;
+
+/// Per-session flow-control capsule types (draft-ietf-webtrans-http3 §5).
+pub const WT_MAX_DATA_CAPSULE: u64 = 0x190b_4d3d;
+pub const WT_MAX_STREAMS_BIDI_CAPSULE: u64 = 0x190b_4d3f;
+pub const WT_MAX_STREAMS_UNI_CAPSULE: u64 = 0x190b_4d40;
+pub const WT_DATA_BLOCKED_CAPSULE: u64 = 0x190b_4d41;
+pub const WT_STREAMS_BLOCKED_BIDI_CAPSULE: u64 = 0x190b_4d43;
+pub const WT_STREAMS_BLOCKED_UNI_CAPSULE: u64 = 0x190b_4d44;
+
+/// Our advertised per-session flow-control limits. They match the QUIC transport
+/// limits in `config.rs` because exactly one WebTransport session rides each QUIC
+/// connection, so the session budget and the connection budget coincide.
+pub const WT_INITIAL_MAX_DATA: u64 = 10 * 1024 * 1024;
+pub const WT_INITIAL_MAX_STREAMS: u64 = 256;
 
 /// Unidirectional WebTransport stream type prefix.
 pub const WT_UNI_STREAM_TYPE: u64 = 0x54;
@@ -157,13 +177,16 @@ pub fn control_stream_prefix() -> Vec<u8> {
 /// WebTransport capability settings).
 pub fn settings_payload() -> Vec<u8> {
     let mut p = Vec::new();
-    let pairs: [(u64, u64); 6] = [
+    let pairs: [(u64, u64); 9] = [
         (SETTINGS_QPACK_MAX_TABLE_CAPACITY, 0),
         (SETTINGS_QPACK_BLOCKED_STREAMS, 0),
         (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
         (SETTINGS_H3_DATAGRAM, 1),
         (SETTINGS_ENABLE_WEBTRANSPORT, 1),
         (SETTINGS_WT_MAX_SESSIONS, 256),
+        (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
+        (SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, WT_INITIAL_MAX_STREAMS),
+        (SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, WT_INITIAL_MAX_STREAMS),
     ];
     for (id, val) in pairs {
         put_varint(id, &mut p);
@@ -179,6 +202,12 @@ pub struct PeerSettings {
     pub h3_datagram: bool,
     pub enable_webtransport: bool,
     pub wt_max_sessions: u64,
+    /// Peer's initial per-session send-data allowance (SETTINGS_WT_INITIAL_MAX_DATA).
+    pub wt_initial_max_data: u64,
+    /// Peer's initial per-session bidi stream limit.
+    pub wt_initial_max_streams_bidi: u64,
+    /// Peer's initial per-session uni stream limit.
+    pub wt_initial_max_streams_uni: u64,
 }
 
 impl PeerSettings {
@@ -205,6 +234,9 @@ pub fn parse_settings(mut payload: &[u8]) -> PeerSettings {
             SETTINGS_H3_DATAGRAM => s.h3_datagram = val != 0,
             SETTINGS_ENABLE_WEBTRANSPORT => s.enable_webtransport = val != 0,
             SETTINGS_WT_MAX_SESSIONS => s.wt_max_sessions = val,
+            SETTINGS_WT_INITIAL_MAX_DATA => s.wt_initial_max_data = val,
+            SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI => s.wt_initial_max_streams_bidi = val,
+            SETTINGS_WT_INITIAL_MAX_STREAMS_UNI => s.wt_initial_max_streams_uni = val,
             _ => {}
         }
         payload = &payload[n1 + n2..];
@@ -336,5 +368,15 @@ mod tests {
             "truncation split a character"
         );
         assert_eq!(out.len(), 1023); // 341 * 3
+    }
+
+    #[test]
+    fn settings_advertise_and_parse_wt_flow_control() {
+        let s = parse_settings(&settings_payload());
+        assert!(s.webtransport_ok());
+        assert_eq!(s.wt_max_sessions, 256);
+        assert_eq!(s.wt_initial_max_data, WT_INITIAL_MAX_DATA);
+        assert_eq!(s.wt_initial_max_streams_bidi, WT_INITIAL_MAX_STREAMS);
+        assert_eq!(s.wt_initial_max_streams_uni, WT_INITIAL_MAX_STREAMS);
     }
 }
