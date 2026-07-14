@@ -7,6 +7,10 @@ export default defineConfig({
         environment: 'node',
         include: ['test/**/*.test.ts', 'test/**/*.spec.ts'],
         exclude: [...configDefaults.exclude],
+        // Mint a fresh short-lived test certificate before the suite: the client
+        // enforces the serverCertificateHashes 14-day validity ceiling, so the
+        // fixture must be generated per run rather than committed long-lived.
+        globalSetup: ['./test/helpers/global-setup.ts'],
         // The native driver spawns background threads and a real UDP server; keep
         // the suite serial so ports/handles don't contend.
         pool: 'forks',

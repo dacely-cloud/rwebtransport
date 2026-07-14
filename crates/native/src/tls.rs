@@ -9,10 +9,14 @@
 //! cipher-suite preference order is fixed inside BoringSSL and already matches
 //! Chrome (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305).
 
+use std::cmp::Ordering;
+
+use boring::asn1::Asn1Time;
 use boring::hash::MessageDigest;
 use boring::ssl::{
     SslAlert, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode, SslVersion,
 };
+use boring::x509::X509Ref;
 
 /// How the server certificate is verified.
 #[derive(Clone, Debug)]
@@ -83,14 +87,51 @@ pub fn build_client_tls(verify: &CertVerification) -> Result<SslContextBuilder, 
                 let digest = cert
                     .digest(MessageDigest::sha256())
                     .map_err(|_| SslVerifyError::Invalid(SslAlert::CERTIFICATE_UNKNOWN))?;
-                if hashes.iter().any(|h| digest.as_ref() == h.as_slice()) {
-                    Ok(())
-                } else {
-                    Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))
+                if !hashes.iter().any(|h| digest.as_ref() == h.as_slice()) {
+                    return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
                 }
+                // The WebTransport serverCertificateHashes contract requires the
+                // pinned leaf to be currently valid and to span at most two weeks;
+                // a matching fingerprint alone is not sufficient.
+                verify_pinned_cert_validity(&cert)
+                    .map_err(|_| SslVerifyError::Invalid(SslAlert::CERTIFICATE_EXPIRED))?;
+                Ok(())
             });
         }
     }
 
     Ok(b)
+}
+
+/// Maximum validity span (in seconds) allowed for a pinned `serverCertificateHashes`
+/// leaf: two weeks, matching the WebTransport / browser constraint.
+const MAX_PINNED_VALIDITY_SECS: i64 = 14 * 24 * 60 * 60;
+
+/// Enforce the WebTransport `serverCertificateHashes` validity constraints on a
+/// pinned leaf certificate: the current time must be within
+/// `[notBefore, notAfter]`, and the total validity span must not exceed two
+/// weeks. Returns `Err(())` if either check fails (or a time cannot be read).
+fn verify_pinned_cert_validity(cert: &X509Ref) -> Result<(), ()> {
+    let now = Asn1Time::days_from_now(0).map_err(|_| ())?;
+    let not_before = cert.not_before();
+    let not_after = cert.not_after();
+
+    // Reject a not-yet-valid cert (notBefore is in the future).
+    if not_before.compare(&now).map_err(|_| ())? == Ordering::Greater {
+        return Err(());
+    }
+    // Reject an expired cert (notAfter is in the past).
+    if not_after.compare(&now).map_err(|_| ())? == Ordering::Less {
+        return Err(());
+    }
+
+    // Reject a cert whose total validity span exceeds two weeks. `diff` computes
+    // `notAfter - notBefore`.
+    let span = not_before.diff(not_after).map_err(|_| ())?;
+    let span_secs = i64::from(span.days) * 86_400 + i64::from(span.secs);
+    if !(0..=MAX_PINNED_VALIDITY_SECS).contains(&span_secs) {
+        return Err(());
+    }
+
+    Ok(())
 }

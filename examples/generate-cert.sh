@@ -12,7 +12,7 @@
 #
 # Both are FILE PATHS you hand to `new WebTransportServer({ port, cert, key })`.
 #
-# The certificate is valid for ~90 days with CN=localhost and
+# The certificate is valid for 13 days with CN=localhost and
 # subjectAltName = DNS:localhost, IP:127.0.0.1, IP:::1 so that a browser-style
 # client connecting to https://localhost:PORT/ validates the hostname.
 #
@@ -25,9 +25,9 @@
 #     serverCertificateHashes: [hash],
 #   });
 #
-# Note: browsers only accept pinned serverCertificateHashes for certs valid at
-# most 14 days. rwebtransport does not impose that limit, so this 90-day cert is
-# fine for the examples; regenerate more often if you mirror the browser rule.
+# Note: like browsers, rwebtransport only accepts a pinned serverCertificateHashes
+# cert whose total validity is at most 14 days (and which is currently valid), so
+# this cert uses a 13-day window. Regenerate it when it expires.
 
 set -euo pipefail
 
@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 CERT_PATH="${SCRIPT_DIR}/cert.pem"
 KEY_PATH="${SCRIPT_DIR}/key.pem"
-DAYS=90
+DAYS=13
 
 if ! command -v openssl >/dev/null 2>&1; then
   echo "error: openssl not found on PATH" >&2

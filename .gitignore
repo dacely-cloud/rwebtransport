@@ -28,3 +28,7 @@ build-native.log
 
 # Example dev certificates (generate with examples/generate-cert.sh)
 examples/*.pem
+
+# Test certificate, minted fresh each run by the vitest global setup so it stays
+# within the serverCertificateHashes 14-day validity window.
+test/fixtures/*.pem
