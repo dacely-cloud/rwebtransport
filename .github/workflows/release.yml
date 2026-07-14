@@ -61,10 +61,9 @@ jobs:
     name: publish
     needs: prebuild
     runs-on: ubuntu-24.04
-    # Expose the npm token as a job-level env so step `if:` can gate on it
-    # (the `secrets` context is not usable directly in `if`).
-    env:
-      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+    permissions:
+      contents: write # attach the prebuilds tarball to the GitHub Release
+      id-token: write # OIDC token for npm Trusted Publishing (no NPM_TOKEN needed)
     steps:
       - uses: actions/checkout@v6
 
@@ -72,6 +71,10 @@ jobs:
         with:
           node-version: 26
           registry-url: https://registry.npmjs.org
+
+      - name: Update npm (Trusted Publishing and --provenance need a recent npm)
+        # Pinned: npm 12's global install drops sigstore, which breaks --provenance.
+        run: npm install -g npm@11.18.0
 
       - name: Install deps
         run: npm ci
@@ -107,8 +110,5 @@ jobs:
           files: rwebtransport-prebuilds.tar.gz
           fail_on_unmatched_files: true
 
-      - name: Publish to npm
-        if: ${{ env.NPM_TOKEN != '' }}
-        run: npm publish --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      - name: Publish to npm (Trusted Publishing via OIDC, no token)
+        run: npm publish --provenance --access public
