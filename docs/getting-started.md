@@ -27,10 +27,11 @@ mkdir wt-quickstart && cd wt-quickstart
 npm install rwebtransport
 ```
 
-Prebuilt native binaries ship for Node 24 and 26 on Linux, macOS, and Windows
-(x64 and arm64), so this is a normal install. If no prebuilt binary matches your
-platform, the package compiles the Rust core at install time (that path needs a
-Rust toolchain, `cmake`, and a C/C++ compiler). See the
+Prebuilt native binaries ship for Node 24 and 26 on Linux (x64 and arm64),
+macOS (Apple Silicon), and Windows (x64), so this is a normal install. If no
+prebuilt binary matches your platform (for example an Intel Mac), the package
+compiles the Rust core at install time (that path needs a Rust toolchain,
+`cmake`, and a C/C++ compiler). See the
 [README](../README.md#install) for details.
 
 ## 2. Generate a development certificate

@@ -21,20 +21,18 @@ jobs:
             target: linux-x64
           - os: ubuntu-24.04-arm
             target: linux-arm64
-          - os: macos-13
-            target: darwin-x64
-          - os: macos-14
+          - os: macos-15
             target: darwin-arm64
-          - os: windows-2022
+          - os: windows-2025
             target: win32-x64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
-          go-version: '1.22'
+          go-version: 'stable'
 
       - if: runner.os == 'Windows'
         uses: ilammy/setup-nasm@v1
@@ -45,7 +43,7 @@ jobs:
       - if: runner.os == 'macOS'
         run: brew install cmake ninja
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 26
 
@@ -53,7 +51,7 @@ jobs:
         run: node scripts/build.js
 
       - name: Upload prebuilt
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: prebuild-${{ matrix.target }}
           path: prebuilds/${{ matrix.target }}/rwebtransport.node
@@ -68,9 +66,9 @@ jobs:
     env:
       NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 26
           registry-url: https://registry.npmjs.org
@@ -81,7 +79,7 @@ jobs:
           RWEBTRANSPORT_SKIP_POSTINSTALL: '1'
 
       - name: Download all prebuilds
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: prebuild-*
           path: artifacts
@@ -104,7 +102,7 @@ jobs:
         run: tar czf rwebtransport-prebuilds.tar.gz prebuilds
 
       - name: Attach prebuilds to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: rwebtransport-prebuilds.tar.gz
           fail_on_unmatched_files: true

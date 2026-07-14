@@ -16,11 +16,11 @@ Prebuilt binaries are published for these targets:
 | ------------------------------------------ | ------- | ----- | --------- |
 | `linux-x64`                                | Linux   | x64   | yes       |
 | `linux-arm64`                              | Linux   | arm64 | yes       |
-| `darwin-x64`                               | macOS   | x64   | yes       |
 | `darwin-arm64`                             | macOS   | arm64 | yes       |
 | `win32-x64`                                | Windows | x64   | yes       |
+| `darwin-x64`                               | macOS   | x64   | no        |
 
-Any other combination (for example `win32-arm64`) has no prebuilt binary and is compiled from source at install time, which requires the toolchain described below. The directory name is always `${process.platform}-${process.arch}`, so it matches the values Node reports at runtime.
+Any other combination (for example `darwin-x64` on an Intel Mac, or `win32-arm64`) has no prebuilt binary and is compiled from source at install time, which requires the toolchain described below. Intel Macs are winding down (Apple's macOS 26 is the last to support them and GitHub is retiring its Intel runners), so `darwin-x64` ships as a from-source target rather than a prebuild. The directory name is always `${process.platform}-${process.arch}`, so it matches the values Node reports at runtime.
 
 > One binary serves both Node lines. The addon targets **N-API version 8** (`neon` feature `napi-8` in [`../crates/native/Cargo.toml`](../crates/native/Cargo.toml)), a stable ABI, so a prebuild compiled on Node 26 loads unchanged on Node 24.
 
@@ -59,7 +59,7 @@ The Rust core links quiche against **BoringSSL**, which is built from source by 
 - **Rust** (stable), the easiest way is [rustup](https://rustup.rs).
 - **cmake**, to configure the BoringSSL build.
 - A **C/C++ compiler** (clang or gcc on Linux/macOS, MSVC on Windows).
-- **Go**, used by BoringSSL's build for code generation. CI installs Go 1.22.
+- **Go**, used by BoringSSL's build for code generation. CI installs the latest stable Go.
 - **NASM** on Windows only, for BoringSSL's assembly.
 - **Ninja** is recommended as the cmake generator. CI installs it on Linux and macOS; cmake can fall back to another generator if it is absent.
 
@@ -197,11 +197,10 @@ A build matrix compiles the native addon on a native runner for each shipped tar
 | -------------- | ------------------ |
 | `linux-x64`    | `ubuntu-24.04`     |
 | `linux-arm64`  | `ubuntu-24.04-arm` |
-| `darwin-x64`   | `macos-13`         |
-| `darwin-arm64` | `macos-14`         |
-| `win32-x64`    | `windows-2022`     |
+| `darwin-arm64` | `macos-15`         |
+| `win32-x64`    | `windows-2025`     |
 
-Each job installs the stable Rust toolchain, Go 1.22, NASM (Windows only), and cmake + ninja (via apt on Linux, brew on macOS), then sets up Node 26 and runs `node scripts/build.js`. The resulting `prebuilds/<target>/rwebtransport.node` is uploaded as an artifact named `prebuild-<target>`. All targets build with Node 26, and the napi-8 ABI keeps them compatible with Node 24 as well.
+Each job installs the stable Rust toolchain, the latest stable Go, NASM (Windows only), and cmake + ninja (via apt on Linux, brew on macOS), then sets up Node 26 and runs `node scripts/build.js`. The resulting `prebuilds/<target>/rwebtransport.node` is uploaded as an artifact named `prebuild-<target>`. All targets build with Node 26, and the napi-8 ABI keeps them compatible with Node 24 as well.
 
 ### 2. `publish`
 
@@ -214,13 +213,13 @@ After all prebuild jobs succeed, the publish job on `ubuntu-24.04`:
 5. Packs `prebuilds/` into `rwebtransport-prebuilds.tar.gz` and attaches it to the GitHub Release.
 6. Runs `npm publish --access public`, gated on an `NPM_TOKEN` secret being present.
 
-The published package therefore contains the five prebuilds plus the full Rust source, giving both the fast path (a matching prebuilt binary) and the fallback path (compile from source) on any install.
+The published package therefore contains the four prebuilds plus the full Rust source, giving both the fast path (a matching prebuilt binary) and the fallback path (compile from source, which is how `darwin-x64` and any other unlisted target are served) on any install.
 
 ---
 
 ## Continuous integration
 
-Separately, [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds from source and runs the test suite on every push and pull request to `main`, across `ubuntu-24.04`, `macos-14`, and `windows-2022`, each on Node 24 and Node 26. It installs the same BoringSSL prerequisites, builds the addon with `npm run build:rust`, builds the `rwebtransport-echo-server` fixture, then runs `typecheck`, `lint`, and `test`. This is the matrix that keeps both Node lines and all three operating systems green.
+Separately, [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) builds from source and runs the test suite on every push and pull request to `main`, across `ubuntu-24.04`, `macos-15`, and `windows-2025`, each on Node 24 and Node 26. It installs the same BoringSSL prerequisites, builds the addon with `npm run build:rust`, builds the `rwebtransport-echo-server` fixture, then runs `typecheck`, `lint`, and `test`. This is the matrix that keeps both Node lines and all three operating systems green.
 
 ---
 

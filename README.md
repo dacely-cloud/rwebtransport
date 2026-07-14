@@ -117,7 +117,7 @@ pnpm add rwebtransport
 yarn add rwebtransport
 ```
 
-Prebuilt native binaries are shipped for **Node 24 and Node 26** on **Linux, macOS, and Windows** (x64 and arm64). If a matching prebuilt binary is not found for your platform, the package **compiles the Rust core automatically** at install time. That needs a [Rust toolchain](https://rustup.rs), `cmake`, and a C/C++ compiler (BoringSSL is built from source). See [Building from source](#building-from-source).
+Prebuilt native binaries are shipped for **Node 24 and Node 26** on **Linux** (x64 and arm64), **macOS** (Apple Silicon), and **Windows** (x64). If a matching prebuilt binary is not found for your platform (for example an Intel Mac), the package **compiles the Rust core automatically** at install time. That needs a [Rust toolchain](https://rustup.rs), `cmake`, and a C/C++ compiler (BoringSSL is built from source). See [Building from source](#building-from-source).
 
 ---
 
