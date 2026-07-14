@@ -368,7 +368,7 @@ fn run_inner(
                     conn.application_proto()
                 );
             }
-            session.on_established(&mut evs);
+            session.on_established();
         }
 
         // Backpressure: if the JS thread is behind on processing events, stop

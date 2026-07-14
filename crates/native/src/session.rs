@@ -218,6 +218,9 @@ pub struct WtSession {
     setup_sent: bool,
     ready: bool,
     closed: bool,
+    /// Client role only: the Extended CONNECT is built but deferred until the
+    /// server's SETTINGS confirm WebTransport support (see parse_control_frames).
+    connect_pending: bool,
 
     peer_settings: Option<h3::PeerSettings>,
 
@@ -250,6 +253,7 @@ impl WtSession {
             setup_sent: false,
             ready: false,
             closed: false,
+            connect_pending: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -273,6 +277,7 @@ impl WtSession {
             setup_sent: false,
             ready: false,
             closed: false,
+            connect_pending: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -289,7 +294,7 @@ impl WtSession {
     /// control-plane streams and advertise SETTINGS. A client also sends the
     /// Extended CONNECT immediately; a server waits for the client's CONNECT on
     /// bidi stream 0.
-    pub fn on_established(&mut self, ev: &mut Vec<Ev>) {
+    pub fn on_established(&mut self) {
         if self.setup_sent {
             return;
         }
@@ -321,20 +326,10 @@ impl WtSession {
         );
 
         if !self.is_server {
-            // CONNECT request on the session (bidi 0) stream.
-            let headers = h3::connect_headers(
-                &self.authority,
-                &self.path,
-                self.origin.as_deref(),
-                &self.extra_headers,
-            );
-            match h3::encode_headers_frame(&headers) {
-                Ok(frame) => {
-                    self.streams
-                        .insert(CONNECT_ID, Stream::with_prefix(Role::Connect, frame));
-                }
-                Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT: {e}"))),
-            }
+            // Per draft-ietf-webtrans-http3 §3.1 the client MUST NOT send the
+            // Extended CONNECT until it has received the server's SETTINGS and
+            // confirmed WebTransport support. Defer it to parse_control_frames.
+            self.connect_pending = true;
         }
         if dbg_on() {
             eprintln!(
@@ -471,7 +466,7 @@ impl WtSession {
                 if let Some(st) = self.streams.get_mut(&id) {
                     st.frames.push(&chunk);
                 }
-                self.parse_control_frames(id);
+                self.parse_control_frames(id, ev);
                 // A malformed control stream is a fatal H3 error; stop reading it
                 // so a hostile server cannot keep us draining (and re-crediting)
                 // an oversized frame into an unbounded buffer.
@@ -523,7 +518,7 @@ impl WtSession {
         }
     }
 
-    fn parse_control_frames(&mut self, id: u64) {
+    fn parse_control_frames(&mut self, id: u64, ev: &mut Vec<Ev>) {
         loop {
             let frame = self
                 .streams
@@ -531,8 +526,41 @@ impl WtSession {
                 .and_then(|s| s.frames.next_frame());
             let Some((ty, payload)) = frame else { break };
             if ty == h3::FRAME_SETTINGS {
-                self.peer_settings = Some(h3::parse_settings(&payload));
+                let settings = h3::parse_settings(&payload);
+                self.peer_settings = Some(settings);
+                // The client deferred its Extended CONNECT until it saw the
+                // server's SETTINGS: now send it if WebTransport is supported,
+                // otherwise reject the session.
+                if self.connect_pending {
+                    self.connect_pending = false;
+                    if settings.webtransport_ok() {
+                        self.queue_connect(ev);
+                    } else {
+                        ev.push(Ev::Error(
+                            "server does not advertise WebTransport support".to_string(),
+                        ));
+                        self.mark_closed(ev, 0, b"webtransport not supported".to_vec(), false);
+                    }
+                }
             }
+        }
+    }
+
+    /// Build and queue the client's Extended CONNECT on the session (bidi 0)
+    /// stream. Called once the server's SETTINGS have confirmed WebTransport.
+    fn queue_connect(&mut self, ev: &mut Vec<Ev>) {
+        let headers = h3::connect_headers(
+            &self.authority,
+            &self.path,
+            self.origin.as_deref(),
+            &self.extra_headers,
+        );
+        match h3::encode_headers_frame(&headers) {
+            Ok(frame) => {
+                self.streams
+                    .insert(CONNECT_ID, Stream::with_prefix(Role::Connect, frame));
+            }
+            Err(e) => ev.push(Ev::Error(format!("failed to encode CONNECT: {e}"))),
         }
     }
 
@@ -764,7 +792,7 @@ impl WtSession {
                 st.role = Role::PeerControl;
                 st.class_buf.clear();
                 st.frames.push(&rest);
-                self.parse_control_frames(id);
+                self.parse_control_frames(id, ev);
             }
             t if t == h3::QPACK_ENCODER_STREAM_TYPE || t == h3::QPACK_DECODER_STREAM_TYPE => {
                 let Some(st) = self.streams.get_mut(&id) else {

@@ -476,7 +476,7 @@ fn run_inner(
         for server in clients.values_mut() {
             let mut evs: Vec<Ev> = Vec::new();
             if server.conn.is_established() {
-                server.session.on_established(&mut evs);
+                server.session.on_established();
             }
             if !backpressured {
                 server.session.on_datagrams(&mut server.conn, &mut evs);
