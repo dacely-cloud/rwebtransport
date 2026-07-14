@@ -43,6 +43,13 @@ const SERVER_FIRST_WT_UNI_ID: u64 = 15;
 /// hostile peer advertising a huge length).
 const MAX_CONTROL_FRAME: usize = 1 << 20;
 
+/// Per-session flow-control credit we grant the peer once established. Large,
+/// because QUIC's connection flow control is the real limit (one session per
+/// connection); this only keeps a strict peer from stalling on our advertised
+/// per-session limits while QUIC does the actual enforcement.
+const WT_GRANT_MAX_DATA: u64 = 1 << 34;
+const WT_GRANT_MAX_STREAMS: u64 = 1 << 20;
+
 /// Events the session emits for the driver to forward to JS.
 #[derive(Debug)]
 pub enum Ev {
@@ -266,6 +273,17 @@ pub struct WtSession {
     drain_emitted: bool,
     /// Set once we have queued an outbound DRAIN capsule, so we send at most one.
     drain_sent: bool,
+    /// Set once we granted the peer per-session flow-control credit.
+    fc_credit_granted: bool,
+    /// Peer's send-side session limits (from SETTINGS_WT_INITIAL_* and WT_MAX_*
+    /// capsules). Parsed and stored; QUIC performs the actual enforcement, so
+    /// these are informational under the one-session-per-connection model.
+    #[allow(dead_code)]
+    fc_max_data_remote: u64,
+    #[allow(dead_code)]
+    fc_max_streams_bidi_remote: u64,
+    #[allow(dead_code)]
+    fc_max_streams_uni_remote: u64,
 
     peer_settings: Option<h3::PeerSettings>,
 
@@ -301,6 +319,10 @@ impl WtSession {
             connect_pending: false,
             drain_emitted: false,
             drain_sent: false,
+            fc_credit_granted: false,
+            fc_max_data_remote: 0,
+            fc_max_streams_bidi_remote: 0,
+            fc_max_streams_uni_remote: 0,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -327,6 +349,10 @@ impl WtSession {
             connect_pending: false,
             drain_emitted: false,
             drain_sent: false,
+            fc_credit_granted: false,
+            fc_max_data_remote: 0,
+            fc_max_streams_bidi_remote: 0,
+            fc_max_streams_uni_remote: 0,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -577,6 +603,10 @@ impl WtSession {
             if ty == h3::FRAME_SETTINGS {
                 let settings = h3::parse_settings(&payload);
                 self.peer_settings = Some(settings);
+                // Seed the peer's per-session flow-control limits from its SETTINGS.
+                self.fc_max_data_remote = settings.wt_initial_max_data;
+                self.fc_max_streams_bidi_remote = settings.wt_initial_max_streams_bidi;
+                self.fc_max_streams_uni_remote = settings.wt_initial_max_streams_uni;
                 // The client deferred its Extended CONNECT until it saw the
                 // server's SETTINGS: now send it if WebTransport is supported,
                 // otherwise reject the session.
@@ -693,6 +723,18 @@ impl WtSession {
             } else if ty == h3::WT_DRAIN_SESSION_CAPSULE && !self.drain_emitted {
                 self.drain_emitted = true;
                 ev.push(Ev::Draining);
+            } else if ty == h3::WT_MAX_DATA_CAPSULE {
+                if let Some((v, _)) = h3::read_varint(value) {
+                    self.fc_max_data_remote = self.fc_max_data_remote.max(v);
+                }
+            } else if ty == h3::WT_MAX_STREAMS_BIDI_CAPSULE {
+                if let Some((v, _)) = h3::read_varint(value) {
+                    self.fc_max_streams_bidi_remote = self.fc_max_streams_bidi_remote.max(v);
+                }
+            } else if ty == h3::WT_MAX_STREAMS_UNI_CAPSULE {
+                if let Some((v, _)) = h3::read_varint(value) {
+                    self.fc_max_streams_uni_remote = self.fc_max_streams_uni_remote.max(v);
+                }
             }
             buf = &buf[start + len..];
         }
@@ -1098,10 +1140,40 @@ impl WtSession {
         }
     }
 
+    /// Queue a single-varint-valued capsule (WT_MAX_DATA / WT_MAX_STREAMS_*) on
+    /// the session stream.
+    fn queue_session_capsule(&mut self, ty: u64, value: u64) {
+        let mut val = Vec::new();
+        h3::put_varint(value, &mut val);
+        let mut capsule = Vec::new();
+        h3::put_varint(ty, &mut capsule);
+        h3::put_varint(val.len() as u64, &mut capsule);
+        capsule.extend_from_slice(&val);
+        let body = h3::frame(h3::FRAME_DATA, &capsule);
+        if let Some(st) = self.streams.get_mut(&CONNECT_ID) {
+            st.out.push_back(OutChunk {
+                data: body,
+                off: 0,
+                request_id: None,
+            });
+        }
+    }
+
     /// Flush pending outbound stream data and drive the graceful-close sequence.
     /// Returns an optional `(code, reason)` if the QUIC connection should now be
     /// closed.
     pub fn flush(&mut self, conn: &mut quiche::Connection, ev: &mut Vec<Ev>) {
+        // Once established, grant the peer ample per-session flow-control credit.
+        // Exactly one WebTransport session rides this QUIC connection, so QUIC's
+        // connection-level flow control is the real limit; granting a large WT
+        // credit here keeps a strict peer that honors our advertised session
+        // limits from stalling, while QUIC does the actual enforcement.
+        if self.ready && !self.fc_credit_granted && !self.closed {
+            self.fc_credit_granted = true;
+            self.queue_session_capsule(h3::WT_MAX_DATA_CAPSULE, WT_GRANT_MAX_DATA);
+            self.queue_session_capsule(h3::WT_MAX_STREAMS_BIDI_CAPSULE, WT_GRANT_MAX_STREAMS);
+            self.queue_session_capsule(h3::WT_MAX_STREAMS_UNI_CAPSULE, WT_GRANT_MAX_STREAMS);
+        }
         // Queue the CLOSE_WEBTRANSPORT_SESSION capsule + FIN once, if requested.
         if let Some(req) = self.close_req.as_mut() {
             if !req.capsule_queued {
