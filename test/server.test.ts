@@ -182,6 +182,14 @@ describe('WebTransportServer', () => {
         expect(received).toEqual(payload);
     });
 
+    it('reports reliability pending before ready, supports-unreliable after', async () => {
+        const url = await echoServer();
+        const wt = connect(url);
+        expect(wt.reliability).toBe('pending');
+        await wt.ready;
+        expect(wt.reliability).toBe('supports-unreliable');
+    });
+
     it('round-trips a stream reset code through the HTTP/3 error range', async () => {
         // The server resets its send side with application code 42. The code is
         // mapped into the HTTP/3 WT_APPLICATION_ERROR range on the wire and back,

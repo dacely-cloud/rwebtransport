@@ -659,6 +659,9 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
         Ev::Ready => {
             set_str(cx, &obj, "type", "ready")?;
         }
+        Ev::Draining => {
+            set_str(cx, &obj, "type", "draining")?;
+        }
         Ev::ServerReady {
             authority,
             path,

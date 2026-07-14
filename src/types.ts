@@ -39,6 +39,13 @@ export interface WebTransportHash {
  */
 export type WebTransportCongestionControl = 'default' | 'throughput' | 'low-latency';
 
+/**
+ * The reliability modes a session offers. `'pending'` before it is established,
+ * `'reliable-only'` for a streams-only transport, and `'supports-unreliable'`
+ * when datagrams are available too (always the case for this HTTP/3 transport).
+ */
+export type WebTransportReliabilityMode = 'pending' | 'reliable-only' | 'supports-unreliable';
+
 /** Options accepted by the {@link WebTransport} constructor. */
 export interface WebTransportOptions {
     /**

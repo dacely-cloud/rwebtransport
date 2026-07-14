@@ -14,6 +14,7 @@ import type {
     WebTransportCloseInfo,
     WebTransportCloseOptions,
     WebTransportOptions,
+    WebTransportReliabilityMode,
 } from './types.js';
 
 /**
@@ -222,6 +223,26 @@ export class WebTransportSession {
      */
     public get closed(): Promise<WebTransportCloseInfo> {
         return this.core.closed.promise;
+    }
+
+    /**
+     * A promise that resolves when the peer signals it is draining the session
+     * (a `DRAIN_WEBTRANSPORT_SESSION` capsule): it intends to close soon, so you
+     * should stop opening new streams, but the session and its existing streams
+     * stay usable until {@link closed}. Never rejects.
+     * @returns The core's `draining` promise.
+     */
+    public get draining(): Promise<void> {
+        return this.core.draining.promise;
+    }
+
+    /**
+     * The reliability modes this session supports. `'pending'` until the session
+     * is established, then `'supports-unreliable'` because this transport always
+     * offers both reliable streams and unreliable datagrams.
+     */
+    public get reliability(): WebTransportReliabilityMode {
+        return this.core.isReady ? 'supports-unreliable' : 'pending';
     }
 
     /**

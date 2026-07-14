@@ -45,6 +45,8 @@ export type NativeServerHandle = { readonly __brand: 'rwt-server' };
 export enum NativeEventType {
     /** A client session's Extended CONNECT completed and it is established. */
     Ready = 'ready',
+    /** The peer sent DRAIN_WEBTRANSPORT_SESSION (going away soon, still usable). */
+    Draining = 'draining',
     /** A server session was established (a valid CONNECT arrived, answered 200). */
     ServerReady = 'serverReady',
     /** The session ended. */
@@ -84,6 +86,15 @@ export enum NativeEventType {
 export interface NativeReadyEvent {
     /** Discriminant. */
     type: NativeEventType.Ready;
+}
+
+/**
+ * The peer sent a DRAIN_WEBTRANSPORT_SESSION capsule.
+ * @internal
+ */
+export interface NativeDrainingEvent {
+    /** Discriminant. */
+    type: NativeEventType.Draining;
 }
 
 /**
@@ -262,6 +273,7 @@ export interface NativeDatagramAckEvent {
  */
 export type NativeEvent =
     | NativeReadyEvent
+    | NativeDrainingEvent
     | NativeServerReadyEvent
     | NativeClosedEvent
     | NativeErrorEvent
@@ -861,6 +873,12 @@ export class SessionCore {
      * close that happens before the session is ready. Backs `WebTransport.closed`.
      */
     public readonly closed = deferred<WebTransportCloseInfo>();
+    /**
+     * Resolves when the peer sends a DRAIN_WEBTRANSPORT_SESSION capsule (it
+     * intends to close soon but the session stays usable). Backs
+     * `WebTransport.draining`. Never rejects.
+     */
+    public readonly draining = deferred<void>();
 
     /**
      * Attach no-op catch handlers to {@link SessionCore.ready} and
@@ -1106,6 +1124,10 @@ export class SessionCore {
                 this.ready.resolve();
                 break;
             }
+            case NativeEventType.Draining: {
+                this.draining.resolve();
+                break;
+            }
             case NativeEventType.Closed: {
                 const reason = new TextDecoder().decode(ev.reason);
                 this.finish({ closeCode: ev.code, reason }, undefined);
@@ -1215,6 +1237,11 @@ export class SessionCore {
     /** @returns Whether the session has reached its terminal closed state. */
     public get isClosed(): boolean {
         return this.closedState;
+    }
+
+    /** @returns Whether the session has been established (ready). */
+    public get isReady(): boolean {
+        return this.readyState;
     }
 }
 

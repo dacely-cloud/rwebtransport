@@ -48,6 +48,9 @@ const MAX_CONTROL_FRAME: usize = 1 << 20;
 pub enum Ev {
     /// The WebTransport session is established (client role: CONNECT got a 2xx).
     Ready,
+    /// The peer sent DRAIN_WEBTRANSPORT_SESSION: it intends to close soon, but
+    /// the session and its streams stay usable until an actual close.
+    Draining,
     /// A server-role session was established: a valid Extended CONNECT arrived
     /// and we answered 200. Carries the request details for the application.
     ServerReady {
@@ -221,6 +224,9 @@ pub struct WtSession {
     /// Client role only: the Extended CONNECT is built but deferred until the
     /// server's SETTINGS confirm WebTransport support (see parse_control_frames).
     connect_pending: bool,
+    /// Set once a DRAIN_WEBTRANSPORT_SESSION capsule has been surfaced, so the
+    /// `Draining` event is emitted at most once.
+    drain_emitted: bool,
 
     peer_settings: Option<h3::PeerSettings>,
 
@@ -254,6 +260,7 @@ impl WtSession {
             ready: false,
             closed: false,
             connect_pending: false,
+            drain_emitted: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -278,6 +285,7 @@ impl WtSession {
             ready: false,
             closed: false,
             connect_pending: false,
+            drain_emitted: false,
             peer_settings: None,
             streams: HashMap::new(),
             close_req: None,
@@ -635,6 +643,9 @@ impl WtSession {
                     (0, Vec::new())
                 };
                 self.mark_closed(ev, code, reason, true);
+            } else if ty == h3::WT_DRAIN_SESSION_CAPSULE && !self.drain_emitted {
+                self.drain_emitted = true;
+                ev.push(Ev::Draining);
             }
             buf = &buf[start + len..];
         }
