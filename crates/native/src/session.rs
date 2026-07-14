@@ -319,14 +319,20 @@ pub struct WtSession {
     /// Set once we granted the peer per-session flow-control credit.
     fc_credit_granted: bool,
     /// Peer's send-side session limits (from SETTINGS_WT_INITIAL_* and WT_MAX_*
-    /// capsules). Parsed and stored; QUIC performs the actual enforcement, so
-    /// these are informational under the one-session-per-connection model.
-    #[allow(dead_code)]
+    /// capsules). QUIC performs the actual send enforcement under the
+    /// one-session-per-connection model; these drive only the WT_*_BLOCKED
+    /// signaling below.
     fc_max_data_remote: u64,
-    #[allow(dead_code)]
     fc_max_streams_bidi_remote: u64,
-    #[allow(dead_code)]
     fc_max_streams_uni_remote: u64,
+    /// Cumulative WebTransport stream payload bytes handed to quiche, compared
+    /// against `fc_max_data_remote` to detect a WT_DATA_BLOCKED condition.
+    fc_data_sent: u64,
+    /// The WT_MAX_DATA / WT_MAX_STREAMS_* limit value we last announced as blocked
+    /// at (0 = none), so a BLOCKED capsule is re-sent only when the limit changes.
+    data_blocked_at: u64,
+    streams_bidi_blocked_at: u64,
+    streams_uni_blocked_at: u64,
     /// Reassembly buffer for capsules on the session (CONNECT) stream: RFC 9297
     /// lets a capsule span multiple HTTP/3 DATA frames, so bytes are accumulated
     /// here and only whole capsules are consumed.
@@ -381,6 +387,10 @@ impl WtSession {
             fc_max_data_remote: 0,
             fc_max_streams_bidi_remote: 0,
             fc_max_streams_uni_remote: 0,
+            fc_data_sent: 0,
+            data_blocked_at: 0,
+            streams_bidi_blocked_at: 0,
+            streams_uni_blocked_at: 0,
             capsule_buf: Vec::new(),
             peer_settings: None,
             streams: HashMap::new(),
@@ -423,6 +433,10 @@ impl WtSession {
             fc_max_data_remote: 0,
             fc_max_streams_bidi_remote: 0,
             fc_max_streams_uni_remote: 0,
+            fc_data_sent: 0,
+            data_blocked_at: 0,
+            streams_bidi_blocked_at: 0,
+            streams_uni_blocked_at: 0,
             capsule_buf: Vec::new(),
             peer_settings: None,
             streams: HashMap::new(),
@@ -1349,9 +1363,13 @@ impl WtSession {
         }
 
         let ids: Vec<u64> = self.streams.keys().copied().collect();
+        let mut wt_sent = 0u64;
         for id in ids {
-            self.flush_stream(conn, id, ev);
+            self.flush_stream(conn, id, ev, &mut wt_sent);
         }
+        self.fc_data_sent += wt_sent;
+
+        self.signal_flow_control_blocked();
 
         // Prune fully-terminated streams so a hostile peer churning streams
         // cannot grow the map without bound. Keep the CONNECT (session) stream
@@ -1422,18 +1440,83 @@ impl WtSession {
             .map(|req| (req.code, req.reason.clone()))
     }
 
-    fn flush_stream(&mut self, conn: &mut quiche::Connection, id: u64, ev: &mut Vec<Ev>) {
+    /// Emit WT_DATA_BLOCKED / WT_STREAMS_BLOCKED_* capsules when the peer's
+    /// advertised WebTransport limits are holding back a send, once per distinct
+    /// limit value. QUIC's own flow control does the real enforcement under the
+    /// one-session-per-connection model; this is the protocol-conformant signal
+    /// asking the peer to raise the limit.
+    fn signal_flow_control_blocked(&mut self) {
+        // Limits are only meaningful once the peer's SETTINGS have seeded them.
+        if self.peer_settings.is_none() || self.closed {
+            return;
+        }
+
+        // Data-blocked: unsent WT stream payload while at the peer's WT_MAX_DATA.
+        if self.fc_data_sent >= self.fc_max_data_remote
+            && self.data_blocked_at != self.fc_max_data_remote
+        {
+            let has_pending = self.streams.values().any(|s| {
+                matches!(s.role, Role::WtData { .. })
+                    && s.out.iter().any(|c| c.request_id.is_some())
+            });
+            if has_pending {
+                let limit = self.fc_max_data_remote;
+                self.queue_session_capsule(h3::WT_DATA_BLOCKED_CAPSULE, limit);
+                self.data_blocked_at = limit;
+            }
+        }
+
+        // Streams-blocked: more streams opened in a direction than WT_MAX_STREAMS_*.
+        let (first_bidi, first_uni) = if self.is_server {
+            (SERVER_FIRST_WT_BIDI_ID, SERVER_FIRST_WT_UNI_ID)
+        } else {
+            (CLIENT_FIRST_WT_BIDI_ID, CLIENT_FIRST_WT_UNI_ID)
+        };
+        let opened_bidi = (self.next_bidi - first_bidi) / 4;
+        let opened_uni = (self.next_uni - first_uni) / 4;
+
+        if opened_bidi > self.fc_max_streams_bidi_remote
+            && self.streams_bidi_blocked_at != self.fc_max_streams_bidi_remote
+        {
+            let limit = self.fc_max_streams_bidi_remote;
+            self.queue_session_capsule(h3::WT_STREAMS_BLOCKED_BIDI_CAPSULE, limit);
+            self.streams_bidi_blocked_at = limit;
+        }
+        if opened_uni > self.fc_max_streams_uni_remote
+            && self.streams_uni_blocked_at != self.fc_max_streams_uni_remote
+        {
+            let limit = self.fc_max_streams_uni_remote;
+            self.queue_session_capsule(h3::WT_STREAMS_BLOCKED_UNI_CAPSULE, limit);
+            self.streams_uni_blocked_at = limit;
+        }
+    }
+
+    fn flush_stream(
+        &mut self,
+        conn: &mut quiche::Connection,
+        id: u64,
+        ev: &mut Vec<Ev>,
+        wt_sent: &mut u64,
+    ) {
         let Some(st) = self.streams.get_mut(&id) else {
             return;
         };
+        // Only WebTransport stream payload (a WtData stream's request_id-carrying
+        // chunks) counts toward WT_MAX_DATA; the stream-signal prefix and CONNECT
+        // capsules do not.
+        let is_wt_data = matches!(st.role, Role::WtData { .. });
         // Note: we call `stream_send` directly rather than pre-checking
         // `stream_capacity`, because a stream does not exist in quiche until its
         // first `stream_send`, and `stream_capacity` errors (InvalidStreamState)
         // on a not-yet-created stream.
         while let Some(front) = st.out.front_mut() {
             let remaining_len = front.data.len() - front.off;
+            let is_payload = is_wt_data && front.request_id.is_some();
             match conn.stream_send(id, &front.data[front.off..], false) {
                 Ok(sent) => {
+                    if is_payload {
+                        *wt_sent += sent as u64;
+                    }
                     front.off += sent;
                     if front.off >= front.data.len() {
                         let done = st.out.pop_front().unwrap();
@@ -1547,5 +1630,91 @@ fn classify_new(id: u64, is_server: bool) -> Role {
             0x1 => Role::PendingBidi, // server-initiated bidirectional
             _ => Role::Ignored,       // an unexpected client-initiated id
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A minimal established-looking client session with a CONNECT stream (so
+    /// queued session capsules have somewhere to go) and seeded peer settings.
+    fn client_with_connect() -> WtSession {
+        let mut s = WtSession::new_client("h".into(), "/".into(), None, Vec::new(), Vec::new());
+        s.streams.insert(CONNECT_ID, Stream::new(Role::Connect));
+        s.peer_settings = Some(h3::PeerSettings::default());
+        s
+    }
+
+    fn connect_out_len(s: &WtSession) -> usize {
+        s.streams
+            .get(&CONNECT_ID)
+            .map(|st| st.out.len())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn emits_wt_data_blocked_once_per_limit() {
+        let mut s = client_with_connect();
+        s.fc_max_data_remote = 100;
+        s.fc_data_sent = 100;
+        let mut st = Stream::new(Role::WtData { bidi: true });
+        st.out.push_back(OutChunk {
+            data: vec![1, 2, 3],
+            off: 0,
+            request_id: Some(1),
+        });
+        s.streams.insert(4, st);
+
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 1); // one WT_DATA_BLOCKED capsule queued
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 1); // deduped: not re-queued at the same limit
+
+        // A raised limit that we immediately re-exhaust re-arms the signal.
+        s.fc_max_data_remote = 200;
+        s.fc_data_sent = 200;
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 2);
+    }
+
+    #[test]
+    fn no_data_blocked_without_pending_payload() {
+        let mut s = client_with_connect();
+        s.fc_max_data_remote = 100;
+        s.fc_data_sent = 100;
+        // A WtData stream whose only queued chunk is the prefix (request_id None).
+        let mut st = Stream::new(Role::WtData { bidi: false });
+        st.out.push_back(OutChunk {
+            data: vec![0x54],
+            off: 0,
+            request_id: None,
+        });
+        s.streams.insert(14, st);
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 0);
+    }
+
+    #[test]
+    fn emits_streams_blocked_when_over_limit() {
+        let mut s = client_with_connect();
+        s.fc_max_streams_bidi_remote = 1;
+        // Simulate having opened 2 bidi WT streams (next_bidi advanced twice).
+        s.next_bidi = CLIENT_FIRST_WT_BIDI_ID + 8;
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 1); // WT_STREAMS_BLOCKED_BIDI
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 1); // deduped
+    }
+
+    #[test]
+    fn no_signal_before_peer_settings() {
+        let mut s = client_with_connect();
+        s.peer_settings = None;
+        s.fc_max_data_remote = 0;
+        s.fc_data_sent = 0;
+        s.next_bidi = CLIENT_FIRST_WT_BIDI_ID + 8;
+        s.signal_flow_control_blocked();
+        assert_eq!(connect_out_len(&s), 0);
     }
 }
