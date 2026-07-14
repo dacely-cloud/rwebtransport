@@ -41,6 +41,8 @@
     "build:rust": "node scripts/build.js",
     "build:rust:debug": "node scripts/build.js --debug",
     "build:ts": "tsup src/index.ts --format cjs,esm --sourcemap --clean --shims --out-dir dist && tsc -p tsconfig.build.json",
+    "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
+    "setup:unix": "bash scripts/setup-unix.sh",
     "postinstall": "node scripts/postinstall.js",
     "pretest": "npm run build:ts",
     "test": "vitest run",

@@ -492,6 +492,18 @@ npm run build:rust:debug  # faster debug build
 npm run build:ts          # bundle the TypeScript layer
 ```
 
+Building from source needs a Rust toolchain, cmake, a C/C++ compiler, and Go (BoringSSL is compiled from source). Helper scripts install the toolchain for you, one per platform family:
+
+```bash
+npm run setup:unix        # Linux/macOS: compiler, cmake, ninja, Go, Rust via your package manager
+```
+
+```powershell
+npm run setup:windows     # Windows: Rust, CMake, Go, NASM via winget, and sets ASM_NASM
+```
+
+On **Windows** you also need NASM (BoringSSL's assembler). If a `cargo build` there fails with `Could not find the compiler specified in the environment variable ASM_NASM`, that is the missing NASM; run the script above (or see [`docs/building.md`](./docs/building.md#windows-setup)) and rebuild in a fresh terminal.
+
 ---
 
 ## Testing

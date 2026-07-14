@@ -65,6 +65,39 @@ The Rust core links quiche against **BoringSSL**, which is built from source by 
 
 For reference, the toolchain each CI runner installs is spelled out in [`../.github/workflows/ci.yml`](../.github/workflows/ci.yml) and [`../.github/workflows/release.yml`](../.github/workflows/release.yml).
 
+Two helper scripts install the toolchain for you, one per platform family. After either, open a new terminal and run `npm install` then `npm run build`.
+
+### Linux and macOS setup
+
+```bash
+npm run setup:unix                    # install whatever is missing
+bash scripts/setup-unix.sh --check    # or: report only, install nothing
+```
+
+[`../scripts/setup-unix.sh`](../scripts/setup-unix.sh) uses your native package manager (apt, dnf, pacman, zypper, or Homebrew) to install a C/C++ compiler, cmake, ninja, and Go, installs Rust via rustup if `cargo` is missing, and confirms Node is 24 or 26. NASM is not needed off Windows. On macOS it installs via Homebrew and triggers the Xcode Command Line Tools install for the compiler.
+
+### Windows setup
+
+Windows needs the same pieces as everywhere else (Rust, cmake, a C/C++ compiler, Go) plus **NASM**, which BoringSSL uses to assemble its crypto. A helper script installs whatever is missing with `winget` and, importantly, configures NASM so cmake can find it:
+
+```powershell
+npm run setup:windows
+# or, equivalently:
+powershell -ExecutionPolicy Bypass -File scripts\setup-windows.ps1
+```
+
+The script (see [`../scripts/setup-windows.ps1`](../scripts/setup-windows.ps1)) installs Rust (rustup, MSVC toolchain), CMake, Go, and NASM, checks for the MSVC C++ build tools and a supported Node (24 or 26), and sets the `ASM_NASM` environment variable to the real `nasm.exe`. After it runs, **open a new terminal** so the updated environment is picked up, then `npm install` and `npm run build`.
+
+Doing it by hand instead? Install the [MSVC C++ build tools](https://visualstudio.microsoft.com/downloads/) ("Desktop development with C++" workload), [Rust](https://rustup.rs) (the default `x86_64-pc-windows-msvc` toolchain), [CMake](https://cmake.org/download/), [Go](https://go.dev/dl/), [NASM](https://www.nasm.us/), and [Node 24 or 26](https://nodejs.org/).
+
+> **`CMake Error: Could not find the compiler specified in the environment variable ASM_NASM`.** cmake locates the assembler through the `ASM_NASM` environment variable, and this error means it is unset or points at a `nasm.exe` that is not there (the NASM user installer writes to `%LOCALAPPDATA%\bin\NASM\`, and a half-finished install leaves the variable dangling). Fix it by installing NASM and setting `ASM_NASM` to the real path, which is exactly what `npm run setup:windows` does. To set it by hand in PowerShell:
+>
+> ```powershell
+> [Environment]::SetEnvironmentVariable('ASM_NASM', 'C:\Program Files\NASM\nasm.exe', 'User')
+> ```
+>
+> Then open a new terminal and rebuild. (`cargo clean -p boring-sys` forces the BoringSSL build to re-run if it cached the failure.)
+
 ### Build it
 
 ```bash
