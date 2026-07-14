@@ -1,6 +1,6 @@
 <div align="center">
 
-# rwebtransport
+# rWebTransport
 
 ### WebTransport for Node.js. The real thing.
 
