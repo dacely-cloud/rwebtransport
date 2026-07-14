@@ -127,6 +127,27 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
  *   usual. A peer `STOP_SENDING` errors the stream through the session's
  *   {@link SendSink}.
  */
+/**
+ * An opaque handle for grouping streams so their sends can be scheduled relative
+ * to one another via each stream's {@link WebTransportSendStream.sendOrder}.
+ * Create one with `WebTransport.createSendGroup()`. Accepted for W3C API parity;
+ * the grouping is a best-effort hint (quiche schedules by its own urgency).
+ */
+export class WebTransportSendGroup {}
+
+/** Options for creating a send stream (W3C `WebTransportSendStreamOptions`). */
+export interface WebTransportSendStreamOptions {
+    /** The {@link WebTransportSendGroup} to associate the new stream with. */
+    sendGroup?: WebTransportSendGroup;
+    /** Relative send priority; higher is nominally sent first. Defaults to `0`. */
+    sendOrder?: number;
+    /**
+     * Wait for stream-creation credit instead of failing when it is exhausted.
+     * Accepted for parity; stream creation here does not currently fail on credit.
+     */
+    waitUntilAvailable?: boolean;
+}
+
 export class WebTransportSendStream extends WritableStream<Uint8Array> {
     /**
      * The QUIC stream id of the underlying stream. Stable for the lifetime of the
@@ -134,6 +155,16 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
      * one half of a {@link WebTransportBidirectionalStream}.
      */
     public readonly streamId: number;
+    /**
+     * The {@link WebTransportSendGroup} this stream belongs to, or `null`.
+     * Mutable per the W3C API; grouping is a best-effort scheduling hint.
+     */
+    public sendGroup: WebTransportSendGroup | null;
+    /**
+     * Relative send priority within the send group. Higher values are nominally
+     * sent first. Mutable per the W3C API; the effect on the wire is best-effort.
+     */
+    public sendOrder: number;
 
     /**
      * Wire a `WritableStream` up to a native send stream.
@@ -158,7 +189,11 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
      *   A {@link ByteLengthQueuingStrategy} with a high-water mark of 1 MiB
      *   (`1024 * 1024` bytes) bounds the JS-side write queue.
      */
-    public constructor(session: SessionCore, streamId: number) {
+    public constructor(
+        session: SessionCore,
+        streamId: number,
+        options: WebTransportSendStreamOptions = {},
+    ) {
         let controller!: WritableStreamDefaultController;
         super(
             {
@@ -197,6 +232,8 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
         });
 
         this.streamId = streamId;
+        this.sendGroup = options.sendGroup ?? null;
+        this.sendOrder = options.sendOrder ?? 0;
     }
 }
 
@@ -218,8 +255,12 @@ export class WebTransportBidirectionalStream {
      * @param session - The session core backing both halves.
      * @param streamId - The QUIC stream id shared by the readable and writable halves.
      */
-    public constructor(session: SessionCore, streamId: number) {
+    public constructor(
+        session: SessionCore,
+        streamId: number,
+        options: WebTransportSendStreamOptions = {},
+    ) {
         this.readable = new WebTransportReceiveStream(session, streamId);
-        this.writable = new WebTransportSendStream(session, streamId);
+        this.writable = new WebTransportSendStream(session, streamId, options);
     }
 }

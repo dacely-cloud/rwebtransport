@@ -8,6 +8,8 @@ import {
     WebTransportBidirectionalStream,
     WebTransportReceiveStream,
     WebTransportSendStream,
+    WebTransportSendGroup,
+    type WebTransportSendStreamOptions,
 } from './streams.js';
 import type {
     BinarySource,
@@ -255,9 +257,11 @@ export class WebTransportSession {
      * @throws WebTransportError (the returned promise rejects) if the session is
      * already closed or was never attached.
      */
-    public async createBidirectionalStream(): Promise<WebTransportBidirectionalStream> {
+    public async createBidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportBidirectionalStream> {
         const id = await this.core.openStream(true);
-        return new WebTransportBidirectionalStream(this.core, id);
+        return new WebTransportBidirectionalStream(this.core, id, options);
     }
 
     /**
@@ -268,9 +272,19 @@ export class WebTransportSession {
      * @throws WebTransportError (the returned promise rejects) if the session is
      * already closed or was never attached.
      */
-    public async createUnidirectionalStream(): Promise<WebTransportSendStream> {
+    public async createUnidirectionalStream(
+        options: WebTransportSendStreamOptions = {},
+    ): Promise<WebTransportSendStream> {
         const id = await this.core.openStream(false);
-        return new WebTransportSendStream(this.core, id);
+        return new WebTransportSendStream(this.core, id, options);
+    }
+
+    /**
+     * Create a {@link WebTransportSendGroup} for scheduling several streams'
+     * sends relative to one another via each stream's `sendOrder`.
+     */
+    public createSendGroup(): WebTransportSendGroup {
+        return new WebTransportSendGroup();
     }
 
     /**

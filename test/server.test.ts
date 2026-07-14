@@ -199,6 +199,23 @@ describe('WebTransportServer', () => {
         expect(wt.reliability).toBe('supports-unreliable');
     });
 
+    it('accepts sendOrder / sendGroup on stream creation and exposes them', async () => {
+        const url = await echoServer();
+        const wt = connect(url);
+        await wt.ready;
+        const group = wt.createSendGroup();
+        const stream = await wt.createBidirectionalStream({ sendOrder: 7, sendGroup: group });
+        expect(stream.writable.sendOrder).toBe(7);
+        expect(stream.writable.sendGroup).toBe(group);
+        // Mutable per the W3C API.
+        stream.writable.sendOrder = 3;
+        expect(stream.writable.sendOrder).toBe(3);
+
+        const uni = await wt.createUnidirectionalStream({ sendOrder: 1 });
+        expect(uni.sendOrder).toBe(1);
+        expect(uni.sendGroup).toBeNull();
+    });
+
     it('getStats reports connection statistics', async () => {
         const url = await echoServer();
         const wt = connect(url);

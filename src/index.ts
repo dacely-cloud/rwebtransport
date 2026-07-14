@@ -89,6 +89,8 @@ export {
     WebTransportBidirectionalStream,
     WebTransportReceiveStream,
     WebTransportSendStream,
+    WebTransportSendGroup,
+    type WebTransportSendStreamOptions,
 } from './streams.js';
 /**
  * The {@link WebTransportDatagramDuplexStream} class forwarded from
