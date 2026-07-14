@@ -6,7 +6,9 @@
 //! that. A long-lived committed fixture cannot satisfy it, so the test cert is
 //! minted fresh (13-day validity) on every run instead.
 //!
-//! Usage: `gen-test-cert <cert.pem> <key.pem> [days]` (days defaults to 13).
+//! Usage: `gen-test-cert <cert.pem> <key.pem> [days] [keyType]`. `days` defaults
+//! to 13; `keyType` is `ec` (P-256, the default) or `rsa` (used by tests that
+//! assert a non-P-256 pinned cert is rejected).
 
 use std::fs;
 
@@ -16,6 +18,7 @@ use boring::ec::{EcGroup, EcKey};
 use boring::hash::MessageDigest;
 use boring::nid::Nid;
 use boring::pkey::PKey;
+use boring::rsa::Rsa;
 use boring::x509::extension::SubjectAlternativeName;
 use boring::x509::{X509NameBuilder, X509};
 
@@ -24,17 +27,23 @@ fn main() {
     let (cert_path, key_path) = match (args.next(), args.next()) {
         (Some(c), Some(k)) => (c, k),
         _ => {
-            eprintln!("usage: gen-test-cert <cert.pem> <key.pem> [days]");
+            eprintln!("usage: gen-test-cert <cert.pem> <key.pem> [days] [ec|rsa]");
             std::process::exit(2);
         }
     };
     // Validity span in days; 13 keeps within the 14-day pinning ceiling. A larger
     // value is used by tests that assert the client rejects an over-long cert.
     let days: u32 = args.next().and_then(|d| d.parse().ok()).unwrap_or(13);
+    let key_type = args.next().unwrap_or_else(|| "ec".to_string());
 
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256 group");
-    let ec = EcKey::generate(&group).expect("generate EC key");
-    let pkey = PKey::from_ec_key(ec).expect("wrap EC key");
+    let pkey = if key_type == "rsa" {
+        let rsa = Rsa::generate(2048).expect("generate RSA key");
+        PKey::from_rsa(rsa).expect("wrap RSA key")
+    } else {
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).expect("P-256 group");
+        let ec = EcKey::generate(&group).expect("generate EC key");
+        PKey::from_ec_key(ec).expect("wrap EC key")
+    };
 
     let mut name = X509NameBuilder::new().expect("name builder");
     name.append_entry_by_text("CN", "localhost").expect("CN");

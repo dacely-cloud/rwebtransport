@@ -13,6 +13,8 @@ use std::cmp::Ordering;
 
 use boring::asn1::Asn1Time;
 use boring::hash::MessageDigest;
+use boring::nid::Nid;
+use boring::pkey::Id;
 use boring::ssl::{
     SslAlert, SslContextBuilder, SslMethod, SslVerifyError, SslVerifyMode, SslVersion,
 };
@@ -95,6 +97,10 @@ pub fn build_client_tls(verify: &CertVerification) -> Result<SslContextBuilder, 
                 // a matching fingerprint alone is not sufficient.
                 verify_pinned_cert_validity(&cert)
                     .map_err(|_| SslVerifyError::Invalid(SslAlert::CERTIFICATE_EXPIRED))?;
+                // It must also use an ECDSA key on the NIST P-256 curve.
+                if !is_ecdsa_p256(&cert) {
+                    return Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE));
+                }
                 Ok(())
             });
         }
@@ -134,4 +140,20 @@ fn verify_pinned_cert_validity(cert: &X509Ref) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Whether a pinned leaf certificate uses an ECDSA key on the NIST P-256
+/// (secp256r1) curve, as the WebTransport `serverCertificateHashes` contract
+/// requires. Any other key type or curve returns `false`.
+fn is_ecdsa_p256(cert: &X509Ref) -> bool {
+    let Ok(pkey) = cert.public_key() else {
+        return false;
+    };
+    if pkey.id() != Id::EC {
+        return false;
+    }
+    match pkey.ec_key() {
+        Ok(ec) => ec.group().curve_name() == Some(Nid::X9_62_PRIME256V1),
+        Err(_) => false,
+    }
 }
