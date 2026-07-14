@@ -16,7 +16,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const CERT = join(ROOT, 'test', 'fixtures', 'cert.pem');
 const KEY = join(ROOT, 'test', 'fixtures', 'key.pem');
 const certHash = new Uint8Array(
-    createHash('sha256').update(new X509Certificate(readFileSync(CERT)).raw).digest(),
+    createHash('sha256')
+        .update(new X509Certificate(readFileSync(CERT)).raw)
+        .digest(),
 );
 
 // Watchdog: never let the benchmark hang the box.
@@ -64,7 +66,6 @@ function connect() {
 
 const fmt = (n, d = 1) => n.toLocaleString('en-US', { maximumFractionDigits: d });
 
-// --- Handshake rate -------------------------------------------------------
 // Close each session right after it establishes so we do not accumulate live
 // connections (that is a load test, not a handshake-latency measurement).
 async function benchHandshake(n) {
@@ -79,7 +80,6 @@ async function benchHandshake(n) {
     return { rate: n / (ms / 1000), each: ms / n };
 }
 
-// --- Bidi throughput (round-trip echo) ------------------------------------
 async function benchThroughput(totalBytes, chunkSize) {
     const wt = connect();
     await wt.ready;
@@ -109,7 +109,6 @@ async function benchThroughput(totalBytes, chunkSize) {
     };
 }
 
-// --- RTT (sequential request/response on one stream) ----------------------
 async function benchRtt(n, size) {
     const wt = connect();
     await wt.ready;
@@ -132,7 +131,6 @@ async function benchRtt(n, size) {
     return { rttMs: ms / n, rate: n / (ms / 1000) };
 }
 
-// --- Datagram rate --------------------------------------------------------
 async function benchDatagrams(n, size) {
     const wt = connect();
     await wt.ready;
@@ -156,7 +154,9 @@ async function benchDatagrams(n, size) {
     return { sendRate: n / (sendMs / 1000), echoed, sent: n };
 }
 
-console.log(`\nrwebtransport benchmark: node ${process.version}, ${process.platform}/${process.arch}`);
+console.log(
+    `\nrwebtransport benchmark: node ${process.version}, ${process.platform}/${process.arch}`,
+);
 console.log('peer: our WebTransportServer over loopback (127.0.0.1)\n');
 
 const hs = await benchHandshake(100);

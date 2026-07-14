@@ -411,7 +411,6 @@ export interface NativeAddon {
      */
     shutdown(handle: NativeHandle): void;
 
-    // ---- server ----
     /**
      * Start a WebTransport server: bind a UDP socket and begin accepting sessions.
      *
@@ -905,8 +904,6 @@ export class SessionCore {
         return this.nextRequestId++;
     }
 
-    // ---- outbound commands ----------------------------------------------------
-
     /**
      * Open an outbound stream and await its assigned id.
      *
@@ -1038,8 +1035,6 @@ export class SessionCore {
         return new WebTransportError('session is closed', { source: 'session' });
     }
 
-    // ---- registration ---------------------------------------------------------
-
     /**
      * Register a sink to receive a stream's inbound data/fin/reset events.
      *
@@ -1090,8 +1085,6 @@ export class SessionCore {
     public setDatagramSink(sink: DatagramSink): void {
         this.datagramSink = sink;
     }
-
-    // ---- event dispatch -------------------------------------------------------
 
     /**
      * Route one native event to the appropriate promise, sink, or handler.

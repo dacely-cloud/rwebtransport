@@ -10,18 +10,15 @@
 
 use quiche::h3::{Header, NameValue};
 
-// ---- HTTP/3 unidirectional stream types (RFC 9114) --------------------------
 pub const H3_CONTROL_STREAM_TYPE: u64 = 0x00;
 pub const QPACK_ENCODER_STREAM_TYPE: u64 = 0x02;
 pub const QPACK_DECODER_STREAM_TYPE: u64 = 0x03;
 
-// ---- HTTP/3 frame types -----------------------------------------------------
 pub const FRAME_DATA: u64 = 0x00;
 pub const FRAME_HEADERS: u64 = 0x01;
 pub const FRAME_SETTINGS: u64 = 0x04;
 pub const FRAME_GOAWAY: u64 = 0x07;
 
-// ---- HTTP/3 SETTINGS identifiers --------------------------------------------
 pub const SETTINGS_QPACK_MAX_TABLE_CAPACITY: u64 = 0x01;
 pub const SETTINGS_MAX_FIELD_SECTION_SIZE: u64 = 0x06;
 pub const SETTINGS_QPACK_BLOCKED_STREAMS: u64 = 0x07;
@@ -32,7 +29,6 @@ pub const SETTINGS_WT_MAX_SESSIONS: u64 = 0x14e9_cd29;
 /// Older draft `SETTINGS_ENABLE_WEBTRANSPORT` (kept for maximum compatibility).
 pub const SETTINGS_ENABLE_WEBTRANSPORT: u64 = 0x2b60_3742;
 
-// ---- WebTransport-over-HTTP/3 stream signals & capsules ---------------------
 /// Unidirectional WebTransport stream type prefix.
 pub const WT_UNI_STREAM_TYPE: u64 = 0x54;
 /// Bidirectional WebTransport stream signal (first frame type on the stream).
@@ -44,8 +40,6 @@ pub const WT_DRAIN_SESSION_CAPSULE: u64 = 0x78ae;
 
 /// Largest QPACK header block we will decode from a peer.
 pub const MAX_HEADER_BLOCK: u64 = 64 * 1024;
-
-// ---- Variable-length integers (RFC 9000 §16) --------------------------------
 
 /// Try to read a varint from the front of `buf`. Returns `(value, len)` or
 /// `None` if the buffer does not yet hold a complete varint.

@@ -285,8 +285,6 @@ impl WtSession {
         self.ready
     }
 
-    // ---- handshake -----------------------------------------------------------
-
     /// Called once the QUIC connection is established: open the HTTP/3
     /// control-plane streams and advertise SETTINGS. A client also sends the
     /// Extended CONNECT immediately; a server waits for the client's CONNECT on
@@ -346,8 +344,6 @@ impl WtSession {
             );
         }
     }
-
-    // ---- reads ---------------------------------------------------------------
 
     /// Process a readable QUIC stream. `backpressured` is a global signal that
     /// the JS thread is behind; when set, resolved WebTransport data streams are
@@ -873,8 +869,6 @@ impl WtSession {
         }
     }
 
-    // ---- datagrams -----------------------------------------------------------
-
     pub fn on_datagrams(&mut self, conn: &mut quiche::Connection, ev: &mut Vec<Ev>) {
         let mut buf = [0u8; 65_536];
         loop {
@@ -912,8 +906,6 @@ impl WtSession {
         // Subtract the 1-byte quarter-stream-id prefix (session id 0 → varint 0).
         conn.dgram_max_writable_len().unwrap_or(0).saturating_sub(1)
     }
-
-    // ---- application commands -------------------------------------------------
 
     pub fn open_stream(&mut self, bidi: bool, request_id: u64, ev: &mut Vec<Ev>) {
         let id = if bidi {
@@ -989,8 +981,6 @@ impl WtSession {
             });
         }
     }
-
-    // ---- flush ---------------------------------------------------------------
 
     /// Flush pending outbound stream data and drive the graceful-close sequence.
     /// Returns an optional `(code, reason)` if the QUIC connection should now be
@@ -1122,8 +1112,6 @@ impl WtSession {
             st.fin_sent = true;
         }
     }
-
-    // ---- lifecycle -----------------------------------------------------------
 
     pub fn mark_closed(&mut self, ev: &mut Vec<Ev>, code: u32, reason: Vec<u8>, remote: bool) {
         if self.closed {

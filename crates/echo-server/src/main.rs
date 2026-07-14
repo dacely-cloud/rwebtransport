@@ -51,8 +51,6 @@ impl Mode {
     }
 }
 
-// ---- server-side WebTransport session state --------------------------------
-
 const CONNECT_ID: u64 = 0;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -468,8 +466,6 @@ fn classify(id: u64) -> Role {
         _ => Role::Ignored,
     }
 }
-
-// ---- main / accept loop -----------------------------------------------------
 
 fn main() {
     let mut cert = String::new();

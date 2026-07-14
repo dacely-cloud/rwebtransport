@@ -74,7 +74,6 @@ export interface WebTransportOptions {
      */
     congestionControl?: WebTransportCongestionControl;
 
-    // ---- Node-specific extensions ----
     /**
      * Disable ALL certificate verification. Development only, never use against a
      * server you do not control. Ignored when `serverCertificateHashes` is set.

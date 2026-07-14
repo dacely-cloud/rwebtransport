@@ -70,7 +70,6 @@ function Test-Tool($name) {
     return [bool](Get-Command $name -ErrorAction SilentlyContinue)
 }
 
-# ---- winget (resolve; a missing winget is NOT fatal) -----------------------
 # winget is usually on PATH, but the App Installer execution alias
 # (%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe) is sometimes missing from a
 # given shell's PATH, so fall back to it before giving up.
@@ -133,7 +132,6 @@ Install-Tool 'cmake' 'Kitware.CMake' 'CMake' 'https://cmake.org/download/'
 Install-Tool 'go' 'GoLang.Go' 'Go' 'https://go.dev/dl/'
 Install-Tool 'nasm' 'NASM.NASM' 'NASM' 'https://www.nasm.us/'
 
-# ---- Rust MSVC toolchain ----------------------------------------------------
 if (Test-Tool 'rustup') {
     Write-Step 'Ensuring the MSVC Rust toolchain (boring-sys needs MSVC, not GNU)'
     rustup toolchain install stable-x86_64-pc-windows-msvc | Out-Null
@@ -147,7 +145,6 @@ if (Test-Tool 'rustup') {
     Write-Ok 'MSVC Rust toolchain ready'
 }
 
-# ---- NASM discovery + the ASM_NASM fix -------------------------------------
 Write-Step 'Pointing cmake at NASM (the ASM_NASM environment variable)'
 
 function Find-Nasm {
@@ -192,7 +189,6 @@ if ($nasm) {
     Write-Note 'NASM was not found. Install it from https://www.nasm.us/ and re-run this script.'
 }
 
-# ---- MSVC C++ build tools ---------------------------------------------------
 Write-Step 'Checking for the MSVC C++ build tools'
 $hasVc = Test-Tool 'cl'
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -213,7 +209,6 @@ or add that workload from the Visual Studio Installer.
 '@
 }
 
-# ---- Node.js ----------------------------------------------------------------
 Write-Step 'Checking Node.js (rwebtransport supports 24 and 26 only)'
 if (Test-Tool 'node') {
     $nodeVer = (& node -v).TrimStart('v')
@@ -227,7 +222,6 @@ if (Test-Tool 'node') {
     Write-Note 'Node.js was not found. Install Node 24 or 26 from https://nodejs.org.'
 }
 
-# ---- Done -------------------------------------------------------------------
 Write-Host ''
 Write-Step 'Setup finished.'
 Write-Host 'Open a NEW terminal so the updated environment is picked up, then run:' -ForegroundColor Cyan

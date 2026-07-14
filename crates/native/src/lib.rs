@@ -114,8 +114,6 @@ impl EventSink for NeonSink {
     }
 }
 
-// ---- URL parsing ------------------------------------------------------------
-
 struct ParsedUrl {
     host: String,
     port: u16,
@@ -207,8 +205,6 @@ fn to_request_id(v: f64) -> u64 {
         0
     }
 }
-
-// ---- connect ----------------------------------------------------------------
 
 fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     let url = cx.argument::<JsString>(0)?.value(&mut cx);
@@ -317,8 +313,6 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     }))
 }
 
-// ---- command functions ------------------------------------------------------
-
 fn open_stream(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let handle = cx.argument::<JsBox<SessionHandle>>(0)?;
     let bidi = cx.argument::<JsBoolean>(1)?.value(&mut cx);
@@ -408,8 +402,6 @@ fn shutdown(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     handle.send(Command::Shutdown);
     Ok(cx.undefined())
 }
-
-// ---- server -----------------------------------------------------------------
 
 use server::{ServerCommand, ServerEventSink, ServerMsg, ServerSetup};
 
@@ -660,8 +652,6 @@ fn server_msg_to_js<'a>(cx: &mut TaskContext<'a>, msg: &ServerMsg) -> JsResult<'
         }
     }
 }
-
-// ---- event → JS -------------------------------------------------------------
 
 fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
     let obj = cx.empty_object();
