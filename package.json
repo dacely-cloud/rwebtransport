@@ -1,6 +1,6 @@
 {
   "name": "rwebtransport",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "A fully-compatible WebTransport client and server for Node.js, powered by Cloudflare quiche + BoringSSL via neon.",
   "author": "Dacely Cloud",
   "homepage": "https://github.com/dacely-cloud/rwebtransport#readme",
