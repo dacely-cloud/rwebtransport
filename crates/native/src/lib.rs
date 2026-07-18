@@ -76,17 +76,32 @@ impl Finalize for SessionHandle {
     }
 }
 
+/// Decrement the in-flight batch counter once the JS thread has dequeued (or failed to schedule) a
+/// batch, and WAKE the driver when this decrement crosses back below the cap. Back-pressure
+/// ([`driver::MAX_INFLIGHT_BATCHES`]) is set on the driver thread but cleared here on the JS thread, so
+/// without this wake the driver would keep withholding stream data (a completed stream's terminal
+/// bytes stranded in quiche, its JS consumer hung) until some unrelated event happened to run another
+/// driver iteration. `fetch_sub` returns the PREVIOUS value, so `== cap` is exactly the crossing.
+fn release_inflight_batch(shared: &DriverShared, waker: &mio::Waker) {
+    if shared.inflight.fetch_sub(1, Ordering::Relaxed) == driver::MAX_INFLIGHT_BATCHES {
+        let _ = waker.wake();
+    }
+}
+
 /// Bridges driver events onto the JS event loop.
 struct NeonSink {
     channel: Channel,
     callback: Arc<Root<JsFunction>>,
     shared: Arc<DriverShared>,
+    /// Wakes the driver thread when a dequeued batch clears back-pressure (see `release_inflight_batch`).
+    waker: Arc<mio::Waker>,
 }
 
 impl EventSink for NeonSink {
     fn emit(&self, events: Vec<Ev>) {
         let cb = self.callback.clone();
         let shared = self.shared.clone();
+        let waker = self.waker.clone();
         // Count this batch as in flight to the JS loop; the driver reads this to
         // back off from pulling more data out of quiche when JS falls behind.
         self.shared.inflight.fetch_add(1, Ordering::Relaxed);
@@ -96,8 +111,9 @@ impl EventSink for NeonSink {
         // behaviour that aborts the process on some platforms). Failing the emit
         // silently is the correct behaviour during teardown.
         let result = self.channel.try_send(move |mut cx| {
-            // Dequeued by the JS loop: no longer contributing to queue depth.
-            shared.inflight.fetch_sub(1, Ordering::Relaxed);
+            // Dequeued by the JS loop: no longer contributing to queue depth. Wake
+            // the driver if this cleared back-pressure so it re-drains withheld data.
+            release_inflight_batch(&shared, &waker);
             let f = cb.to_inner(&mut cx);
             for ev in &events {
                 let obj = ev_to_js(&mut cx, ev)?;
@@ -109,7 +125,7 @@ impl EventSink for NeonSink {
         });
         if result.is_err() {
             // The callback will never run, so undo the in-flight increment here.
-            self.shared.inflight.fetch_sub(1, Ordering::Relaxed);
+            release_inflight_batch(&self.shared, &self.waker);
         }
     }
 }
@@ -294,6 +310,7 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
         channel: cx.channel(),
         callback: Arc::new(callback.root(&mut cx)),
         shared: shared.clone(),
+        waker: waker.clone(),
     });
 
     let setup = driver::SessionSetup {
@@ -483,19 +500,23 @@ struct NeonServerSink {
     channel: Channel,
     callback: Arc<Root<JsFunction>>,
     shared: Arc<DriverShared>,
+    /// Wakes the server driver when a dequeued batch clears back-pressure (see `release_inflight_batch`).
+    waker: Arc<mio::Waker>,
 }
 
 impl ServerEventSink for NeonServerSink {
     fn emit(&self, messages: Vec<ServerMsg>) {
         let cb = self.callback.clone();
         let shared = self.shared.clone();
+        let waker = self.waker.clone();
         // Balance every emit (setup, teardown, and per-loop batches) so the
         // backpressure counter can never underflow and silently disable itself.
         self.shared.inflight.fetch_add(1, Ordering::Relaxed);
         // `try_send`, not `send`: see NeonSink::emit. `send` would panic across
         // the N-API boundary if the environment is shutting down.
         let result = self.channel.try_send(move |mut cx| {
-            shared.inflight.fetch_sub(1, Ordering::Relaxed);
+            // Dequeued: decrement and, if this cleared back-pressure, wake the driver.
+            release_inflight_batch(&shared, &waker);
             let f = cb.to_inner(&mut cx);
             for msg in &messages {
                 let obj = server_msg_to_js(&mut cx, msg)?;
@@ -506,7 +527,7 @@ impl ServerEventSink for NeonServerSink {
             Ok(())
         });
         if result.is_err() {
-            self.shared.inflight.fetch_sub(1, Ordering::Relaxed);
+            release_inflight_batch(&self.shared, &self.waker);
         }
     }
 }
@@ -569,6 +590,7 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
         channel: cx.channel(),
         callback: Arc::new(callback.root(&mut cx)),
         shared: shared.clone(),
+        waker: waker.clone(),
     });
 
     let setup = ServerSetup {
@@ -1010,4 +1032,45 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serverExportKeyingMaterial", server_export_keying_material)?;
     cx.export_function("serverShutdown", server_shutdown)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_with_inflight(n: i64) -> Arc<DriverShared> {
+        let shared = Arc::new(DriverShared::default());
+        shared.inflight.store(n, Ordering::Relaxed);
+        shared
+    }
+
+    /// Whether the driver's waker fired: poll with a zero timeout and look for `WAKE_TOKEN`.
+    fn waker_fired(poll: &mut mio::Poll) -> bool {
+        let mut events = mio::Events::with_capacity(4);
+        poll.poll(&mut events, Some(std::time::Duration::from_millis(0)))
+            .expect("poll");
+        events.iter().any(|e| e.token() == driver::WAKE_TOKEN)
+    }
+
+    // Back-pressure is set on the driver thread but cleared here on the JS thread, so releasing a batch
+    // must wake the driver EXACTLY when the decrement crosses back below the cap: not while still at or
+    // above it (still back-pressured), and not when already below it (a spurious wake). Getting this
+    // wrong is the stranded-terminal-frame hang.
+    #[test]
+    fn release_wakes_only_when_the_decrement_clears_backpressure() {
+        let mut poll = mio::Poll::new().expect("poll");
+        let waker = mio::Waker::new(poll.registry(), driver::WAKE_TOKEN).expect("waker");
+
+        // Already below the cap: not back-pressured, so no wake.
+        release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES - 1), &waker);
+        assert!(!waker_fired(&mut poll), "no wake when already below the cap");
+
+        // Still at/above the cap after the decrement: still back-pressured, so no wake.
+        release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES + 1), &waker);
+        assert!(!waker_fired(&mut poll), "no wake while still at or above the cap");
+
+        // Exactly at the cap: the decrement crosses below it, clearing back-pressure -> wake.
+        release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES), &waker);
+        assert!(waker_fired(&mut poll), "wake exactly when back-pressure clears");
+    }
 }

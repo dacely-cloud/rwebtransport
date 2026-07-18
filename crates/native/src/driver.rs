@@ -23,7 +23,12 @@ pub const WAKE_TOKEN: Token = Token(1);
 /// server flooding datagrams or stream data cannot grow it without limit (OOM).
 /// When exceeded, unread stream data stays in quiche (flow-controlling the peer)
 /// and excess datagrams are dropped by quiche's bounded recv queue.
-const MAX_INFLIGHT_BATCHES: i64 = 128;
+///
+/// `pub` so the neon sinks can wake the driver the moment a batch is dequeued and the counter crosses
+/// back below this cap: back-pressure is set on the driver thread but cleared on the JS thread, so
+/// without that wake the driver would keep withholding data (including a terminal frame) until an
+/// unrelated event happened to run another loop iteration.
+pub const MAX_INFLIGHT_BATCHES: i64 = 128;
 
 /// State shared between the driver thread and the JS-facing handle so that
 /// synchronous property reads (e.g. `datagrams.maxDatagramSize`) don't require a
