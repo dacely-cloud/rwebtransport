@@ -120,7 +120,9 @@ All scripts are defined in [`../package.json`](../package.json):
 | `npm run build`            | `build:rust` then `build:ts` (the full build).                                             |
 | `npm run build:rust`       | Release build of the native addon via [`../scripts/build.js`](../scripts/build.js).        |
 | `npm run build:rust:debug` | Faster debug build (`node scripts/build.js --debug`), no optimization or LTO.              |
-| `npm run build:ts`         | Bundles the TypeScript layer to `dist/` (tsup for CJS + ESM, then `tsc` for declarations). |
+| `npm run build:ts`         | Bundles the TypeScript layer to `dist/` (esbuild for CJS + ESM, then TypeScript 7 `tsc` for declarations). |
+
+`npm run typecheck` uses TypeScript 7. `npm run lint` and `npm run lint:fix` use Oxlint with type-aware rules from `oxlint-tsgolint`, configured in [`../.oxlintrc.json`](../.oxlintrc.json).
 
 ### What `scripts/build.js` does
 

@@ -1,80 +1,83 @@
 {
-  "name": "rwebtransport",
-  "version": "0.2.2",
-  "description": "A fully-compatible WebTransport client and server for Node.js, powered by Cloudflare quiche + BoringSSL via neon.",
-  "author": "Dacely Cloud",
-  "homepage": "https://github.com/dacely-cloud/rwebtransport#readme",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/dacely-cloud/rwebtransport.git"
-  },
-  "bugs": {
-    "url": "https://github.com/dacely-cloud/rwebtransport/issues"
-  },
-  "type": "commonjs",
-  "main": "./dist/index.js",
-  "module": "./dist/index.mjs",
-  "types": "./dist/index.d.ts",
-  "exports": {
-    ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
-    }
-  },
-  "files": [
-    "dist",
-    "prebuilds",
-    "scripts",
-    "crates",
-    "vendor",
-    "Cargo.toml",
-    "Cargo.lock",
-    "README.md",
-    "NOTICE"
-  ],
-  "engines": {
-    "node": ">=24 <25 || >=26 <27"
-  },
-  "scripts": {
-    "build": "npm run build:rust && npm run build:ts",
-    "build:rust": "node scripts/build.js",
-    "build:rust:debug": "node scripts/build.js --debug",
-    "build:ts": "tsup src/index.ts --format cjs,esm --sourcemap --clean --shims --out-dir dist && tsc -p tsconfig.build.json",
-    "build:echo": "cargo build --release -p rwebtransport-echo-server",
-    "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
-    "setup:unix": "bash scripts/setup-unix.sh",
-    "postinstall": "node scripts/postinstall.js",
-    "pretest": "npm run build:rust && npm run build:ts && npm run build:echo",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "lint": "eslint .",
-    "lint:fix": "eslint . --fix",
-    "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
-    "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\""
-  },
-  "devDependencies": {
-    "@eslint/js": "^10.0.1",
-    "@types/node": "^26.1.1",
-    "@vitest/coverage-v8": "^4.1.10",
-    "esbuild": "^0.28.1",
-    "eslint": "^10.7.0",
-    "prettier": "^3.9.5",
-    "tsup": "^8.5.1",
-    "typescript": "^6.0.3",
-    "typescript-eslint": "^8.64.0",
-    "vitest": "^4.1.10"
-  },
-  "overrides": {
-    "esbuild": "^0.28.1"
-  },
-  "keywords": [
-    "webtransport",
-    "quic",
-    "http3",
-    "quiche",
-    "neon"
-  ],
-  "license": "Apache-2.0"
+    "name": "rwebtransport",
+    "version": "0.2.2",
+    "description": "A fully-compatible WebTransport client and server for Node.js, powered by Cloudflare quiche + BoringSSL via neon.",
+    "author": "Dacely Cloud",
+    "homepage": "https://github.com/dacely-cloud/rwebtransport#readme",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/dacely-cloud/rwebtransport.git"
+    },
+    "bugs": {
+        "url": "https://github.com/dacely-cloud/rwebtransport/issues"
+    },
+    "type": "commonjs",
+    "main": "./dist/index.js",
+    "module": "./dist/index.mjs",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.mjs",
+            "require": "./dist/index.js"
+        }
+    },
+    "files": [
+        "dist",
+        "prebuilds",
+        "scripts",
+        "crates",
+        "vendor",
+        "Cargo.toml",
+        "Cargo.lock",
+        "README.md",
+        "NOTICE"
+    ],
+    "engines": {
+        "node": ">=24 <25 || >=26 <27"
+    },
+    "scripts": {
+        "build": "npm run build:rust && npm run build:ts",
+        "build:rust": "node scripts/build.js",
+        "build:rust:debug": "node scripts/build.js --debug",
+        "build:ts": "node scripts/build-ts.js && tsc -p tsconfig.build.json",
+        "build:echo": "cargo build --release -p rwebtransport-echo-server",
+        "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
+        "setup:unix": "bash scripts/setup-unix.sh",
+        "postinstall": "node scripts/postinstall.js",
+        "pretest": "npm run build:rust && npm run build:ts && npm run build:echo",
+        "test": "vitest run",
+        "test:watch": "vitest",
+        "typecheck": "tsc --noEmit",
+        "lint": "oxlint .",
+        "lint:fix": "oxlint . --fix",
+        "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
+        "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
+        "test:browser": "toiljs test --browser",
+        "test:all": "toiljs test --all",
+        "test:coverage": "toiljs test --all --coverage"
+    },
+    "devDependencies": {
+        "@types/node": "^26.6.5",
+        "@vitest/coverage-v8": "^5.0.4",
+        "esbuild": "^0.28.2",
+        "oxlint": "^1.87.0",
+        "oxlint-tsgolint": "^7.0.2004",
+        "prettier": "^3.9.10",
+        "typescript": "^7.0.2",
+        "vitest": "^5.0.4",
+        "@vitest/browser-webdriverio": "^5.0.0",
+        "webdriverio": "^10.0.2"
+    },
+    "overrides": {
+        "esbuild": "$esbuild"
+    },
+    "keywords": [
+        "webtransport",
+        "quic",
+        "http3",
+        "quiche",
+        "neon"
+    ],
+    "license": "Apache-2.0"
 }
