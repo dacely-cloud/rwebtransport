@@ -25,8 +25,11 @@
 
 mod config;
 mod driver;
+mod parser_memory;
 mod server;
 mod session;
+#[cfg(test)]
+mod test_support;
 mod tls;
 
 use std::net::IpAddr;
@@ -142,52 +145,28 @@ struct ParsedUrl {
 /// Parse a WebTransport URL WITHOUT resolving DNS (resolution is deferred to the
 /// driver thread so it never blocks the JS event loop).
 fn parse_url(url: &str) -> Result<ParsedUrl, String> {
-    let rest = url
-        .strip_prefix("https://")
-        .ok_or_else(|| "WebTransport URL must use the https:// scheme".to_string())?;
-
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], rest[i..].to_string()),
-        None => (rest, "/".to_string()),
-    };
-    if authority.is_empty() {
-        return Err("WebTransport URL has an empty authority".to_string());
+    let parsed = url::Url::parse(url).map_err(|e| format!("invalid WebTransport URL: {e}"))?;
+    if parsed.scheme() != "https"
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err("WebTransport URL must use HTTPS without credentials or a fragment".into());
     }
-
-    // Split host and port, handling IPv6 literals.
-    let (host, port): (String, u16) = if let Some(hstr) = authority.strip_prefix('[') {
-        let end = hstr
-            .find(']')
-            .ok_or_else(|| "malformed IPv6 authority".to_string())?;
-        let host = hstr[..end].to_string();
-        let after = &hstr[end + 1..];
-        let port = after
-            .strip_prefix(':')
-            .map(|p| p.parse::<u16>().map_err(|_| "invalid port".to_string()))
-            .transpose()?
-            .unwrap_or(443);
-        (host, port)
-    } else if let Some(i) = authority.rfind(':') {
-        let host = authority[..i].to_string();
-        let port = authority[i + 1..]
-            .parse::<u16>()
-            .map_err(|_| "invalid port".to_string())?;
-        (host, port)
-    } else {
-        (authority.to_string(), 443)
+    let host = match parsed.host().ok_or("WebTransport URL has no host")? {
+        url::Host::Domain(name) => name.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => ip.to_string(),
     };
-
-    let sni = if host.parse::<IpAddr>().is_ok() {
-        None
-    } else {
-        Some(host.clone())
-    };
-
+    let port = parsed.port_or_known_default().ok_or("invalid port")?;
+    let authority = parsed[url::Position::BeforeHost..url::Position::AfterPort].to_string();
+    let path = parsed[url::Position::BeforePath..url::Position::AfterQuery].to_string();
+    let sni = host.parse::<IpAddr>().is_err().then(|| host.clone());
     Ok(ParsedUrl {
         host,
         port,
         sni,
-        authority: authority.to_string(),
+        authority,
         path,
     })
 }
@@ -288,6 +267,7 @@ fn connect(mut cx: FunctionContext) -> JsResult<JsBox<SessionHandle>> {
     };
 
     let params = ClientConfigParams {
+        expected_ip: parsed.host.parse().ok(),
         verify,
         ..ClientConfigParams::default()
     };
@@ -445,7 +425,11 @@ fn export_keying_material(mut cx: FunctionContext) -> JsResult<JsUndefined> {
     let request_id = to_request_id(cx.argument::<JsNumber>(1)?.value(&mut cx));
     let label = cx.argument::<JsTypedArray<u8>>(2)?.as_slice(&cx).to_vec();
     let context = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
-    let length = cx.argument::<JsNumber>(4)?.value(&mut cx) as u32;
+    let length = cx.argument::<JsNumber>(4)?.value(&mut cx);
+    if !length.is_finite() || length.fract() != 0.0 || !(1.0..=4096.0).contains(&length) {
+        return cx.throw_range_error("outputLength must be an integer between 1 and 4096");
+    }
+    let length = length as u32;
     handle.send(Command::ExportKeyingMaterial {
         request_id,
         label,
@@ -745,7 +729,11 @@ fn server_export_keying_material(mut cx: FunctionContext) -> JsResult<JsUndefine
     let request_id = to_request_id(cx.argument::<JsNumber>(2)?.value(&mut cx));
     let label = cx.argument::<JsTypedArray<u8>>(3)?.as_slice(&cx).to_vec();
     let context = cx.argument::<JsTypedArray<u8>>(4)?.as_slice(&cx).to_vec();
-    let length = cx.argument::<JsNumber>(5)?.value(&mut cx) as u32;
+    let length = cx.argument::<JsNumber>(5)?.value(&mut cx);
+    if !length.is_finite() || length.fract() != 0.0 || !(1.0..=4096.0).contains(&length) {
+        return cx.throw_range_error("outputLength must be an integer between 1 and 4096");
+    }
+    let length = length as u32;
     handle.send(ServerCommand::ExportKeyingMaterial {
         session,
         request_id,
@@ -1057,20 +1045,56 @@ mod tests {
     // above it (still back-pressured), and not when already below it (a spurious wake). Getting this
     // wrong is the stranded-terminal-frame hang.
     #[test]
+    fn urls_are_canonicalized_without_credentials_or_fragments() {
+        let parsed = super::parse_url("https://example.com:8443?query=1").unwrap();
+        assert_eq!(parsed.host, "example.com");
+        assert_eq!(parsed.port, 8443);
+        assert_eq!(parsed.path, "/?query=1");
+        let parsed = super::parse_url("https://[::1]:8443/a?b=2").unwrap();
+        assert_eq!(parsed.host, "::1");
+        assert_eq!(parsed.authority, "[::1]:8443");
+        assert_eq!(parsed.path, "/a?b=2");
+        assert!(parsed.sni.is_none());
+        for url in [
+            "http://example.com/",
+            "https://user:password@example.com/",
+            "https://example.com/#",
+            "https://[::1]garbage/",
+        ] {
+            assert!(super::parse_url(url).is_err());
+        }
+    }
+
+    #[test]
     fn release_wakes_only_when_the_decrement_clears_backpressure() {
         let mut poll = mio::Poll::new().expect("poll");
         let waker = mio::Waker::new(poll.registry(), driver::WAKE_TOKEN).expect("waker");
 
         // Already below the cap: not back-pressured, so no wake.
-        release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES - 1), &waker);
-        assert!(!waker_fired(&mut poll), "no wake when already below the cap");
+        release_inflight_batch(
+            &shared_with_inflight(driver::MAX_INFLIGHT_BATCHES - 1),
+            &waker,
+        );
+        assert!(
+            !waker_fired(&mut poll),
+            "no wake when already below the cap"
+        );
 
         // Still at/above the cap after the decrement: still back-pressured, so no wake.
-        release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES + 1), &waker);
-        assert!(!waker_fired(&mut poll), "no wake while still at or above the cap");
+        release_inflight_batch(
+            &shared_with_inflight(driver::MAX_INFLIGHT_BATCHES + 1),
+            &waker,
+        );
+        assert!(
+            !waker_fired(&mut poll),
+            "no wake while still at or above the cap"
+        );
 
         // Exactly at the cap: the decrement crosses below it, clearing back-pressure -> wake.
         release_inflight_batch(&shared_with_inflight(driver::MAX_INFLIGHT_BATCHES), &waker);
-        assert!(waker_fired(&mut poll), "wake exactly when back-pressure clears");
+        assert!(
+            waker_fired(&mut poll),
+            "wake exactly when back-pressure clears"
+        );
     }
 }

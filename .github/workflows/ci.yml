@@ -75,5 +75,12 @@ jobs:
       - name: Lint
         run: npm run lint
 
+      - name: Native protocol regressions
+        run: cargo test --release -p rwebtransport-native -p rwebtransport-wtcore
+
       - name: Test
         run: npm test
+
+      - name: Chrome interoperability
+        if: runner.os == 'Linux' && matrix.node == 26
+        run: npm run test:browser

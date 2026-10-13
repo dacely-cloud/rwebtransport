@@ -20,6 +20,9 @@ import type {
     WebTransportConnectionStats,
 } from './types.js';
 
+// A high-water mark alone is advisory: check it before allocating each wrapper.
+const MAX_PENDING_INCOMING_STREAMS = 128;
+
 /**
  * Normalize a {@link BinarySource} into a `Uint8Array` view over the same
  * memory, without copying.
@@ -55,8 +58,31 @@ function toBytes(src: BinarySource): Uint8Array {
  * @internal
  */
 function buildConfig(url: string, options: WebTransportOptions): ConnectConfig {
-    if (typeof url !== 'string' || !url.startsWith('https://')) {
+    let parsed: URL;
+    try {
+        parsed = new URL(url);
+    } catch {
         throw new WebTransportError(`invalid WebTransport URL: ${url}`, { source: 'session' });
+    }
+    if (
+        typeof url !== 'string' ||
+        parsed.protocol !== 'https:' ||
+        parsed.hash ||
+        url.includes('#') ||
+        parsed.username ||
+        parsed.password
+    ) {
+        throw new WebTransportError(`invalid WebTransport URL: ${url}`, { source: 'session' });
+    }
+
+    const protocols = options.protocols ?? [];
+    if (
+        new Set(protocols).size !== protocols.length ||
+        protocols.some((protocol) => !/^[\x20-\x7e]{1,512}$/.test(protocol))
+    ) {
+        throw new WebTransportError('protocols must be distinct ASCII strings of 1 to 512 bytes', {
+            source: 'session',
+        });
     }
 
     const hashes: Uint8Array[] = [];
@@ -85,13 +111,13 @@ function buildConfig(url: string, options: WebTransportOptions): ConnectConfig {
     }
 
     return {
-        url,
+        url: parsed.href,
         hashes,
         insecure: options.insecure ?? false,
         origin: options.origin ?? null,
         headerNames,
         headerValues,
-        protocols: options.protocols ?? [],
+        protocols,
     };
 }
 
@@ -154,6 +180,8 @@ export class WebTransportSession {
      * constructs the two incoming-stream `ReadableStream`s and captures their
      * controllers via the `start` callback. Registers an incoming handler on
      * `core` so each peer-opened bidi/uni stream is wrapped and enqueued;
+     * checks the 128-stream queue limit before allocating each wrapper and
+     * aborts the session on overflow. Cancelled directions stop new peer streams.
      * `enqueue` is wrapped in try/catch because it throws once the consumer has
      * cancelled the reader, and that error must not escape native event dispatch.
      * Finally it observes `core.closed`: on clean close both controllers are
@@ -166,19 +194,42 @@ export class WebTransportSession {
 
         let bidiController!: ReadableStreamDefaultController<WebTransportBidirectionalStream>;
         let uniController!: ReadableStreamDefaultController<WebTransportReceiveStream>;
-        this.incomingBidirectionalStreams = new ReadableStream<WebTransportBidirectionalStream>({
-            start: (c) => {
-                bidiController = c;
+        let bidiCancelled = false;
+        let uniCancelled = false;
+        this.incomingBidirectionalStreams = new ReadableStream<WebTransportBidirectionalStream>(
+            {
+                start: (c) => {
+                    bidiController = c;
+                },
+                cancel: () => {
+                    bidiCancelled = true;
+                },
             },
-        });
-        this.incomingUnidirectionalStreams = new ReadableStream<WebTransportReceiveStream>({
-            start: (c) => {
-                uniController = c;
+            new CountQueuingStrategy({ highWaterMark: MAX_PENDING_INCOMING_STREAMS }),
+        );
+        this.incomingUnidirectionalStreams = new ReadableStream<WebTransportReceiveStream>(
+            {
+                start: (c) => {
+                    uniController = c;
+                },
+                cancel: () => {
+                    uniCancelled = true;
+                },
             },
-        });
+            new CountQueuingStrategy({ highWaterMark: MAX_PENDING_INCOMING_STREAMS }),
+        );
 
         core.setIncomingHandler({
             onBidi: (id) => {
+                if (bidiCancelled) {
+                    core.stopSending(id, 0);
+                    core.resetStream(id, 0);
+                    return;
+                }
+                if ((bidiController.desiredSize ?? 0) <= 0) {
+                    core.abort('incoming stream queue limit exceeded (bidirectional)');
+                    return;
+                }
                 // Guard: enqueue throws if the consumer already cancelled the
                 // reader, and that must not escape the native event dispatch.
                 try {
@@ -188,6 +239,14 @@ export class WebTransportSession {
                 }
             },
             onUni: (id) => {
+                if (uniCancelled) {
+                    core.stopSending(id, 0);
+                    return;
+                }
+                if ((uniController.desiredSize ?? 0) <= 0) {
+                    core.abort('incoming stream queue limit exceeded (unidirectional)');
+                    return;
+                }
                 try {
                     uniController.enqueue(new WebTransportReceiveStream(core, id));
                 } catch {

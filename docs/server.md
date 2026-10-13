@@ -101,6 +101,8 @@ try {
 server.incomingSessions; // ReadableStream<WebTransportServerSession>
 ```
 
+The queue holds at most 128 unread sessions, including sessions that have already closed. Additional sessions are closed until the application drains the queue. Cancelling `incomingSessions` closes subsequently established peers.
+
 Established sessions arrive on `incomingSessions`, a standard WHATWG `ReadableStream`. Drain it with a reader loop, and hand each session off to your own handler without blocking the loop, so you keep accepting new clients while existing ones are being served:
 
 ```ts
@@ -211,6 +213,10 @@ dw.releaseLock();
 ```
 
 `write()` on a stream resolves once the bytes are accepted into the QUIC send buffer, which gives you natural backpressure. One caveat that is universal to stream APIs: if you write a large bidirectional stream and never read its `readable` half, the peer can flow-control you and the write can wedge. Read (or cancel) the readable half concurrently. See [streams.md](./streams.md) for the backpressure model.
+
+Each session can queue at most 128 unread incoming streams per direction. Exceeding this limit rejects that session's `closed` promise and errors its incoming stream queues with a `WebTransportError`; the server continues serving other sessions. Consume the directions you use and cancel the ones you do not, for example `await session.incomingUnidirectionalStreams.cancel()`. New streams in a cancelled direction are stopped without allocating stream wrappers.
+
+HTTP/3 and capsule receive parsers have an 8 MiB allocation budget per connection and share a 64 MiB budget across the server. These budgets include retained buffer capacity and frame/capsule copies. A connection that cannot reserve memory is terminated, and its parser allocations are released immediately. Completed parsing also releases empty buffers, so these limits apply to simultaneous allocations rather than cumulative traffic.
 
 ## Closing the server
 

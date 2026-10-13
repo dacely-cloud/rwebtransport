@@ -15,6 +15,8 @@ import {
 } from './native.js';
 import { WebTransportSession } from './webtransport.js';
 
+const MAX_PENDING_SESSIONS = 128;
+
 /**
  * A promise paired with its externally callable `resolve` and `reject`, so a
  * value can be settled from outside the executor (for example from a native
@@ -198,6 +200,7 @@ export class WebTransportServer {
     private boundPort = 0;
     /** Guards {@link close} so shutdown is issued at most once. */
     private closeCalled = false;
+    private incomingCancelled = false;
 
     /**
      * The sessions clients open, delivered as they are established. Each pull
@@ -224,11 +227,17 @@ export class WebTransportServer {
         void this.readyD.promise.catch(() => {});
         void this.closedD.promise.catch(() => {});
 
-        this.incomingSessions = new ReadableStream<WebTransportServerSession>({
-            start: (c) => {
-                this.incomingController = c;
+        this.incomingSessions = new ReadableStream<WebTransportServerSession>(
+            {
+                start: (c) => {
+                    this.incomingController = c;
+                },
+                cancel: () => {
+                    this.incomingCancelled = true;
+                },
             },
-        });
+            new CountQueuingStrategy({ highWaterMark: MAX_PENDING_SESSIONS }),
+        );
 
         const responseHeaderNames: string[] = [];
         const responseHeaderValues: string[] = [];
@@ -326,10 +335,28 @@ export class WebTransportServer {
         // Session-scoped event.
         const sessionId = ev.session;
         if (ev.type === NativeEventType.ServerReady) {
+            // Refuse before allocating a core or any stream wrappers. Finished
+            // sessions also occupy the unread queue until the application pulls.
+            if (
+                this.closeCalled ||
+                this.incomingCancelled ||
+                (this.incomingController.desiredSize ?? 0) <= 0
+            ) {
+                this.native.serverCloseSession(
+                    this.handle,
+                    sessionId,
+                    0,
+                    new TextEncoder().encode('incoming session queue limit exceeded'),
+                );
+                return;
+            }
             const core = new SessionCore();
             core.attach(new ServerTransport(this.native, this.handle, sessionId));
             this.sessions.set(sessionId, core);
-            void core.closed.promise.finally(() => this.sessions.delete(sessionId));
+            const forget = () => {
+                this.sessions.delete(sessionId);
+            };
+            void core.closed.promise.then(forget, forget);
             const session = new WebTransportServerSession(core, {
                 authority: ev.authority,
                 path: ev.path,
@@ -356,7 +383,7 @@ export class WebTransportServer {
      *
      * @remarks Dispatches a synthetic clean `closed` event (code `0`, empty
      *   reason, `remote: false`) to each session core, then clears the map. The
-     *   per-core `closed.finally` handler registered in {@link onEvent} would
+     *   per-core `closed.then` handlers registered in {@link onEvent} would
      *   also remove entries, but the map is cleared here unconditionally.
      */
     private finishAllSessions(): void {

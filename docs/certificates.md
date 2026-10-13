@@ -39,7 +39,7 @@ Because pinning wins over `insecure`, setting `insecure: true` alongside `server
 
 ### Default: full PKI plus hostname validation
 
-When you pass neither `serverCertificateHashes` nor `insecure`, the client performs standard public-key infrastructure validation: it builds and verifies the certificate chain against the system trust store and checks that the certificate is valid for the hostname in the URL. On Linux the trust anchors are read from `/etc/ssl/certs`. The hostname check compares the host in your `https://host:port/path` URL against the certificate's subjectAltName, exactly like a browser.
+When you pass neither `serverCertificateHashes` nor `insecure`, the client performs standard public-key infrastructure validation: it builds and verifies the certificate chain against the system trust store and checks that the certificate is valid for the hostname in the URL. Trust anchors are loaded from the platform's native certificate store on Linux, macOS, and Windows. `SSL_CERT_FILE` and `SSL_CERT_DIR` can override the root locations. DNS hosts are checked against the certificate's DNS subjectAltName; IPv4 and IPv6 literals must match an IP subjectAltName.
 
 ```ts
 import { WebTransport } from 'rwebtransport';

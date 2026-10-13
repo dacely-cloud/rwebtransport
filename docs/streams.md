@@ -200,6 +200,8 @@ window, and that window only grows as the peer reads. So if the peer stops
 reading, the window stops opening, quiche stops accepting, and your `write()`
 stops resolving. The producer is paused until the peer catches up.
 
+Aborting a writer immediately resets its native stream and rejects any pending write, even when the peer is withholding flow-control credit.
+
 The send stream has a byte-based high-water mark (1 MiB by default). You can
 observe the pressure through the writer without awaiting every write:
 
@@ -233,8 +235,18 @@ nothing to make this happen; simply not reading is the backpressure.
 
 The practical consequence: to relieve a peer that is sending fast, read faster
 (or `pipeTo()` a sink). To slow a peer down deliberately, read slower. And if you
-never consume `incomingBidirectionalStreams` / `incomingUnidirectionalStreams`
-or never read an accepted stream, the peer is flow-controlled on that data.
+never read an accepted stream, the peer is flow-controlled on that data.
+
+The incoming stream queues themselves each have a hard limit of 128 unread
+streams, on both clients and server sessions. If the peer exceeds it, the session
+terminates with a `WebTransportError` and the queued streams are released. A
+high-water mark alone would not enforce this limit: peers can finish many small
+streams while the application leaves their wrappers unread. Consume an incoming
+direction or explicitly cancel it if you do not use it:
+
+```ts
+await session.incomingUnidirectionalStreams.cancel();
+```
 
 ---
 

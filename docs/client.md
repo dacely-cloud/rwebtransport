@@ -424,6 +424,8 @@ wt.close({ closeCode: 17, reason: 'done' }); // with an application code
 
 ## `exportKeyingMaterial()`
 
+`outputLength` must be an integer from 1 through 4096 bytes. Invalid lengths reject with a `RangeError` before native allocation.
+
 ```ts
 exportKeyingMaterial(
     label: BufferSource,

@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //! Vitest global setup: mint a fresh short-lived EC P-256 test certificate
-//! before the suite runs.
+//! when no usable shared fixture exists.
 //!
 //! The client enforces the WebTransport `serverCertificateHashes` contract,
 //! which caps a pinned leaf at 14 days of validity, so a long-lived committed
@@ -9,7 +9,8 @@
 //! keeps the fixture valid on every run.
 
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync } from 'node:fs';
+import { X509Certificate } from 'node:crypto';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -26,6 +27,23 @@ export default function setup(): void {
     }
     const fixtures = join(ROOT, 'test', 'fixtures');
     mkdirSync(fixtures, { recursive: true });
+    // Node and browser projects share this fixture. Reuse a still-valid
+    // short-lived pair so concurrent project setup cannot change its pin after
+    // a server has already loaded the certificate.
+    try {
+        const cert = new X509Certificate(readFileSync(join(fixtures, 'cert.pem')));
+        const remaining = Date.parse(cert.validTo) - Date.now();
+        const span = Date.parse(cert.validTo) - Date.parse(cert.validFrom);
+        if (
+            Date.parse(cert.validFrom) <= Date.now() &&
+            remaining > 86_400_000 &&
+            span <= 14 * 86_400_000 &&
+            existsSync(join(fixtures, 'key.pem'))
+        )
+            return;
+    } catch {
+        /* Missing or invalid fixtures are regenerated below. */
+    }
     execFileSync(bin, [join(fixtures, 'cert.pem'), join(fixtures, 'key.pem')], {
         stdio: 'inherit',
     });

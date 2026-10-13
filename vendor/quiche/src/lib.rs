@@ -5687,6 +5687,21 @@ impl<F: BufFactory> Connection<F> {
         self.stream_recv_buf(stream_id, out)
     }
 
+    /// Returns the receive-side final size before stream state is collected.
+    /// This is needed for WebTransport session flow control after RESET_STREAM.
+    pub fn stream_recv_final_size(&self, stream_id: u64) -> Option<u64> {
+        self.streams
+            .get(stream_id)
+            .and_then(|stream| stream.recv.final_size())
+    }
+
+    /// Returns the send-side final size, including locally or remotely reset streams.
+    pub fn stream_send_final_size(&self, stream_id: u64) -> Option<u64> {
+        self.streams
+            .get(stream_id)
+            .and_then(|stream| stream.send.final_size())
+    }
+
     /// Reads contiguous data from a stream into the provided [`bytes::BufMut`].
     ///
     /// **NOTE**:

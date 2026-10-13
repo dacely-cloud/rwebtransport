@@ -12,6 +12,7 @@ pub const H3_ALPN: &[u8] = b"h3";
 #[derive(Clone, Debug)]
 pub struct ClientConfigParams {
     pub verify: CertVerification,
+    pub expected_ip: Option<std::net::IpAddr>,
     pub max_idle_timeout_ms: u64,
     pub max_udp_payload_size: usize,
     pub initial_max_data: u64,
@@ -26,6 +27,7 @@ impl Default for ClientConfigParams {
     fn default() -> Self {
         Self {
             verify: CertVerification::PkiDefault,
+            expected_ip: None,
             max_idle_timeout_ms: 30_000,
             max_udp_payload_size: 1350,
             initial_max_data: 10 * 1024 * 1024,
@@ -42,7 +44,36 @@ impl Default for ClientConfigParams {
 
 /// Build a ready-to-use quiche client [`quiche::Config`].
 pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
-    let builder = build_client_tls(&p.verify)?;
+    let mut builder = build_client_tls(&p.verify)?;
+    if matches!(p.verify, CertVerification::PkiDefault) {
+        let roots = rustls_native_certs::load_native_certs();
+        let mut loaded = 0;
+        for der in roots.certs {
+            if let Ok(cert) = boring::x509::X509::from_der(der.as_ref()) {
+                if builder.cert_store_mut().add_cert(cert).is_ok() {
+                    loaded += 1;
+                }
+            }
+        }
+        if loaded == 0 {
+            return Err("system certificate store contains no usable roots".into());
+        }
+        if let Some(ip) = p.expected_ip {
+            let bytes: Vec<u8> = match ip {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            // The context owns the verification parameter; BoringSSL copies it
+            // into the connection and copies the address supplied here.
+            let ok = unsafe {
+                let param = boring_sys::SSL_CTX_get0_param(builder.as_ptr());
+                boring_sys::X509_VERIFY_PARAM_set1_ip(param, bytes.as_ptr(), bytes.len())
+            };
+            if ok != 1 {
+                return Err("failed to configure certificate IP verification".into());
+            }
+        }
+    }
     let mut config = quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder)
         .map_err(|e| format!("quiche config: {e:?}"))?;
 
@@ -56,12 +87,6 @@ pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
             // it a trust anchor set. Hostname verification is wired by quiche's
             // `set_host_name` (X509_VERIFY_PARAM_set1_host).
             config.verify_peer(true);
-            #[cfg(unix)]
-            {
-                // Best-effort system roots. If neither path exists the handshake
-                // will fail closed, which is the correct default.
-                let _ = config.load_verify_locations_from_directory("/etc/ssl/certs");
-            }
         }
         CertVerification::Hashes(_) | CertVerification::Insecure => {
             // Verification is fully handled on the SSL context (custom callback /
@@ -126,4 +151,28 @@ pub fn build_server_config(cert_path: &str, key_path: &str) -> Result<quiche::Co
     config.enable_dgram(true, p.dgram_recv_queue, p.dgram_send_queue);
 
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn certificate_identity_checks_dns_and_ip_sans() {
+        use crate::test_support::{exchange, pair};
+        for (expected_ip, name, ip_san, accepted) in [
+            (Some("127.0.0.1".parse().unwrap()), None, false, false),
+            (Some("127.0.0.1".parse().unwrap()), None, true, true),
+            (Some("::1".parse().unwrap()), None, false, false),
+            (Some("::1".parse().unwrap()), None, true, true),
+            (None, Some("localhost"), false, false),
+            (None, Some("wrong.example"), false, true),
+        ] {
+            let (mut client, mut server) = pair(expected_ip, name, ip_san);
+            exchange(&mut client, &mut server);
+            assert_eq!(
+                client.is_established(),
+                accepted,
+                "IP={expected_ip:?}, DNS={name:?}, ip_san={ip_san}"
+            );
+        }
+    }
 }

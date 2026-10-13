@@ -22,6 +22,7 @@ use wtcore::h3;
 
 use crate::config::build_server_config;
 use crate::driver::{DriverShared, SOCKET_TOKEN};
+use crate::parser_memory::ParserMemory;
 use crate::session::{Ev, WtSession};
 
 const LOCAL_CONN_ID_LEN: usize = 16;
@@ -30,6 +31,10 @@ const MAX_INFLIGHT_BATCHES: i64 = 128;
 /// Hard cap on concurrent QUIC connections so a hostile client (or spoofed
 /// source addresses) cannot grow the connection table without bound.
 const MAX_CONNECTIONS: usize = 16_384;
+
+/// Aggregate allocation capacity of HTTP/3, classification and capsule parser
+/// buffers across all connections, including handshakes and draining sessions.
+const MAX_PARSER_MEMORY: usize = 64 * 1024 * 1024;
 
 /// Maximum UDP packets read per event-loop wake before yielding to the rest of
 /// the loop (timeouts, commands, reaping). Bounds per-wake work so a sustained
@@ -319,7 +324,12 @@ fn run_inner(
     sink: &dyn ServerEventSink,
     shared: &Arc<DriverShared>,
 ) {
-    let bind: SocketAddr = match format!("{}:{}", setup.host, setup.port).parse() {
+    let bind: SocketAddr = match setup
+        .host
+        .trim_matches(['[', ']'])
+        .parse::<std::net::IpAddr>()
+        .map(|ip| SocketAddr::new(ip, setup.port))
+    {
         Ok(a) => a,
         Err(e) => {
             sink.emit(vec![ServerMsg::ServerError(format!(
@@ -367,6 +377,7 @@ fn run_inner(
     let mut routing: HashMap<Vec<u8>, Vec<u8>> = HashMap::new();
     let mut sessions: HashMap<u64, Vec<u8>> = HashMap::new();
     let mut next_session_id: u64 = 1;
+    let parser_memory = ParserMemory::new(MAX_PARSER_MEMORY);
 
     // Per-process secret keying the stateless Retry token (see mint_token).
     let token_secret = random_secret();
@@ -407,7 +418,9 @@ fn run_inner(
                         continue;
                     }
                     // Cap concurrent connections to bound memory under a flood.
-                    if clients.len() >= MAX_CONNECTIONS {
+                    if clients.len() >= MAX_CONNECTIONS
+                        || shared.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_BATCHES
+                    {
                         continue;
                     }
 
@@ -460,6 +473,7 @@ fn run_inner(
                                 setup.supported_protocols.clone(),
                                 setup.allowed_origins.clone(),
                                 setup.response_headers.clone(),
+                                parser_memory.clone(),
                             ),
                             session_id,
                             closed_emitted: false,
@@ -536,6 +550,9 @@ fn run_inner(
             }
 
             for ev in evs {
+                if std::env::var_os("RWT_DEBUG").is_some() && matches!(ev, Ev::Error(_)) {
+                    eprintln!("[rwt-server] {ev:?}");
+                }
                 out.push(ServerMsg::Session(server.session_id, ev));
             }
 

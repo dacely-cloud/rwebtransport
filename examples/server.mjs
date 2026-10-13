@@ -59,6 +59,9 @@ async function echoDatagrams(session) {
 
 async function handleSession(session) {
     console.log(`session opened: path=${session.path} authority=${session.authority}`);
+    // This example echoes bidi streams and datagrams. Explicitly decline the
+    // unused uni direction rather than leaving incoming streams queued.
+    void session.incomingUnidirectionalStreams.cancel().catch(() => {});
     try {
         await greet(session);
     } catch (err) {

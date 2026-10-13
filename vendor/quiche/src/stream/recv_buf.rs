@@ -291,6 +291,11 @@ impl RecvBuf {
         Ok((len, self.is_fin()))
     }
 
+    /// The final size supplied by FIN or RESET_STREAM, if known.
+    pub fn final_size(&self) -> Option<u64> {
+        self.fin_off
+    }
+
     /// Resets the stream at the given offset.
     pub fn reset(
         &mut self, error_code: u64, final_size: u64,

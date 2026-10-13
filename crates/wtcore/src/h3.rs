@@ -225,15 +225,29 @@ impl PeerSettings {
 }
 
 /// Parse a SETTINGS frame payload. Unknown identifiers are ignored (as required).
-pub fn parse_settings(mut payload: &[u8]) -> PeerSettings {
+pub fn parse_settings(mut payload: &[u8]) -> Result<PeerSettings, String> {
+    let mut seen = std::collections::HashSet::new();
     let mut s = PeerSettings::default();
     while !payload.is_empty() {
-        let Some((id, n1)) = read_varint(payload) else {
-            break;
-        };
-        let Some((val, n2)) = read_varint(&payload[n1..]) else {
-            break;
-        };
+        let (id, n1) = read_varint(payload).ok_or("truncated SETTINGS identifier")?;
+        let (val, n2) = read_varint(&payload[n1..]).ok_or("truncated SETTINGS value")?;
+        if !seen.insert(id) || matches!(id, 0x2..=0x5) {
+            return Err("duplicate or reserved SETTINGS identifier".into());
+        }
+        if matches!(
+            id,
+            SETTINGS_ENABLE_CONNECT_PROTOCOL | SETTINGS_H3_DATAGRAM | SETTINGS_ENABLE_WEBTRANSPORT
+        ) && val > 1
+        {
+            return Err("invalid boolean SETTINGS value".into());
+        }
+        if matches!(
+            id,
+            SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI | SETTINGS_WT_INITIAL_MAX_STREAMS_UNI
+        ) && val > (1 << 60)
+        {
+            return Err("invalid WebTransport stream limit".into());
+        }
         match id {
             SETTINGS_ENABLE_CONNECT_PROTOCOL => s.enable_connect_protocol = val != 0,
             SETTINGS_H3_DATAGRAM => s.h3_datagram = val != 0,
@@ -246,7 +260,7 @@ pub fn parse_settings(mut payload: &[u8]) -> PeerSettings {
         }
         payload = &payload[n1 + n2..];
     }
-    s
+    Ok(s)
 }
 
 /// Request header carrying the client's offered WebTransport subprotocols
@@ -313,37 +327,29 @@ pub fn serialize_sf_string_list(items: &[String]) -> String {
 /// Parse a single RFC 9651 Structured-Field String item (a double-quoted,
 /// backslash-escaped token). Returns `None` if it is not a well-formed sf-string.
 pub fn parse_sf_string_item(value: &str) -> Option<String> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 2 || bytes[0] != b'"' {
-        return None;
+    let item: sfv::Item = sfv::Parser::new(value).parse().ok()?;
+    match item.bare_item {
+        sfv::BareItem::String(value) => Some(value.to_string()),
+        _ => None,
     }
-    let mut out = String::new();
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                i += 1;
-                match bytes.get(i) {
-                    Some(&e) if e == b'"' || e == b'\\' => out.push(e as char),
-                    _ => return None,
-                }
-            }
-            b'"' => return (i == bytes.len() - 1).then_some(out),
-            b @ 0x20..=0x7e => out.push(b as char),
-            _ => return None,
-        }
-        i += 1;
-    }
-    None
 }
 
-/// Parse an RFC 9651 Structured-Field List of Strings into tokens, tolerating
-/// surrounding whitespace and skipping malformed items.
+/// Parse an RFC 9651 Structured-Field List of Strings into tokens, ignoring item parameters.
+/// A malformed field is ignored in its entirety.
 pub fn parse_sf_string_list(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .filter_map(|part| parse_sf_string_item(part.trim()))
-        .collect()
+    let Ok(list) = sfv::Parser::new(value).parse::<sfv::List>() else {
+        return Vec::new();
+    };
+    list.into_iter()
+        .map(|entry| match entry {
+            sfv::ListEntry::Item(item) => match item.bare_item {
+                sfv::BareItem::String(value) => Some(value.to_string()),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default()
 }
 
 /// Find the first header value for a (lowercase) name.
@@ -353,7 +359,11 @@ pub fn header_value<'a>(headers: &'a [Header], name: &[u8]) -> Option<&'a [u8]> 
 
 /// Parse the `wt-protocol` response header into the selected subprotocol token.
 pub fn wt_protocol_of(headers: &[Header]) -> Option<String> {
-    let v = header_value(headers, WT_PROTOCOL)?;
+    let mut values = headers.iter().filter(|h| h.name() == WT_PROTOCOL);
+    let v = values.next()?.value();
+    if values.next().is_some() {
+        return None;
+    }
     parse_sf_string_item(std::str::from_utf8(v).ok()?.trim())
 }
 
@@ -409,6 +419,44 @@ pub fn status_of(headers: &[Header]) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_reject_truncation_duplicates_and_invalid_boolean_values() {
+        for pairs in [
+            vec![(SETTINGS_ENABLE_CONNECT_PROTOCOL, 2)],
+            vec![(SETTINGS_H3_DATAGRAM, 1), (SETTINGS_H3_DATAGRAM, 1)],
+            vec![(SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, (1 << 60) + 1)],
+            vec![(0x2, 0)],
+        ] {
+            let mut payload = Vec::new();
+            for (id, value) in pairs {
+                put_varint(id, &mut payload);
+                put_varint(value, &mut payload);
+            }
+            assert!(parse_settings(&payload).is_err());
+        }
+        assert!(parse_settings(&[0x40]).is_err());
+        assert!(parse_settings(&[0x1]).is_err());
+    }
+
+    #[test]
+    fn structured_fields_preserve_commas_ignore_parameters_and_reject_whole_invalid_lists() {
+        assert_eq!(
+            parse_sf_string_list(r#""a,b";q=1, "c";ignored="x,y""#),
+            vec!["a,b", "c"]
+        );
+        assert_eq!(
+            parse_sf_string_item(r#""a,b";ignored=?1"#).as_deref(),
+            Some("a,b")
+        );
+        for value in [
+            r#""valid", invalid"#,
+            r#""valid", "unterminated"#,
+            r#""valid", ("inner")"#,
+        ] {
+            assert!(parse_sf_string_list(value).is_empty());
+        }
+    }
 
     #[test]
     fn error_code_mapping_roundtrips() {
@@ -476,7 +524,7 @@ mod tests {
 
     #[test]
     fn settings_advertise_and_parse_wt_flow_control() {
-        let s = parse_settings(&settings_payload());
+        let s = parse_settings(&settings_payload()).unwrap();
         assert!(s.webtransport_ok());
         assert_eq!(s.wt_max_sessions, 256);
         assert_eq!(s.wt_initial_max_data, WT_INITIAL_MAX_DATA);

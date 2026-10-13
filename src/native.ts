@@ -979,7 +979,7 @@ export class SessionCore {
     /** Pending {@link SessionCore.openStream} requests, keyed by request id. */
     private readonly opens = new Map<number, Deferred<number>>();
     /** Pending {@link SessionCore.write} requests, keyed by request id. */
-    private readonly writes = new Map<number, Deferred<void>>();
+    private readonly writes = new Map<number, { streamId: number; deferred: Deferred<void> }>();
     /** Pending {@link SessionCore.sendDatagram} requests, keyed by request id. */
     private readonly datagramAcks = new Map<number, Deferred<boolean>>();
     /** Pending getStats() requests, keyed by request id. */
@@ -1102,7 +1102,7 @@ export class SessionCore {
         if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<void>();
-        this.writes.set(requestId, d);
+        this.writes.set(requestId, { streamId, deferred: d });
         this.transport!.write(streamId, chunk, requestId);
         return d.promise;
     }
@@ -1124,6 +1124,17 @@ export class SessionCore {
      */
     public resetStream(streamId: number, code: number): void {
         this.transport?.reset(streamId, code >>> 0);
+        for (const [requestId, write] of this.writes) {
+            if (write.streamId === streamId) {
+                write.deferred.reject(
+                    new WebTransportError('stream aborted', {
+                        source: 'stream',
+                        streamErrorCode: code >>> 0,
+                    }),
+                );
+                this.writes.delete(requestId);
+            }
+        }
     }
 
     /**
@@ -1180,6 +1191,13 @@ export class SessionCore {
         this.transport.closeSession(code >>> 0, new TextEncoder().encode(reason));
     }
 
+    /** End a session that exceeded a local resource limit, releasing its sinks. */
+    public abort(message: string): void {
+        if (this.closedState) return;
+        this.close(0, message);
+        this.finish(null, new WebTransportError(message, { source: 'session' }));
+    }
+
     /** Tell the peer this session is draining (send a DRAIN capsule). */
     public drain(): void {
         this.transport?.drain();
@@ -1215,6 +1233,11 @@ export class SessionCore {
         context: Uint8Array,
         length: number,
     ): Promise<Uint8Array> {
+        if (!Number.isInteger(length) || length < 1 || length > 4096) {
+            return Promise.reject(
+                new RangeError('outputLength must be an integer between 1 and 4096'),
+            );
+        }
         if (!this.usable()) return Promise.reject(this.deadError());
         const requestId = this.nextId();
         const d = deferred<Uint8Array>();
@@ -1316,6 +1339,8 @@ export class SessionCore {
      * for their `requestId`.
      */
     public dispatch(ev: NativeEvent): void {
+        // A native batch may contain more stream events after a local abort.
+        if (this.closedState) return;
         switch (ev.type) {
             case NativeEventType.Ready: {
                 this.readyState = true;
@@ -1375,7 +1400,7 @@ export class SessionCore {
                 break;
             }
             case NativeEventType.WriteAck: {
-                this.writes.get(ev.requestId)?.resolve();
+                this.writes.get(ev.requestId)?.deferred.resolve();
                 this.writes.delete(ev.requestId);
                 break;
             }
@@ -1469,7 +1494,7 @@ export class SessionCore {
 
         const err = error ?? new WebTransportError('session closed', { source: 'session' });
         for (const d of this.opens.values()) d.reject(err);
-        for (const d of this.writes.values()) d.reject(err);
+        for (const write of this.writes.values()) write.deferred.reject(err);
         for (const d of this.datagramAcks.values()) d.resolve(false);
         for (const d of this.statsRequests.values()) d.reject(err);
         for (const d of this.keyingMaterialRequests.values()) d.reject(err);

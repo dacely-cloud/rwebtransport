@@ -308,6 +308,11 @@ fn run_inner(
         loop {
             match socket.recv_from(&mut recv_buf) {
                 Ok((len, from)) => {
+                    // UDP permits empty datagrams. They carry no QUIC packet
+                    // and must not become fatal errors before authentication.
+                    if len == 0 {
+                        continue;
+                    }
                     got_packet = true;
                     if debug {
                         eprintln!("[rwt-driver] recv {len} bytes from {from}");

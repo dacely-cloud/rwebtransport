@@ -46,16 +46,16 @@
         "setup:unix": "bash scripts/setup-unix.sh",
         "postinstall": "node scripts/postinstall.js",
         "pretest": "npm run build:rust && npm run build:ts && npm run build:echo",
-        "test": "vitest run",
-        "test:watch": "vitest",
+        "test": "vitest run --project node",
+        "test:watch": "vitest --project node",
         "typecheck": "tsc --noEmit",
         "lint": "oxlint .",
         "lint:fix": "oxlint . --fix",
         "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
         "format:check": "prettier --check \"src/**/*.ts\" \"test/**/*.ts\"",
-        "test:browser": "toiljs test --browser",
-        "test:all": "toiljs test --all",
-        "test:coverage": "toiljs test --all --coverage"
+        "test:browser": "npm run pretest && vitest run --project browser",
+        "test:all": "npm run pretest && vitest run",
+        "test:coverage": "npm run pretest && vitest run --coverage"
     },
     "devDependencies": {
         "@types/node": "^26.6.5",

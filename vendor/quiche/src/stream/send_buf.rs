@@ -460,6 +460,11 @@ impl<F: BufFactory> SendBuf<F> {
         Ok(self.reset())
     }
 
+    /// Returns the final offset after FIN or a reset.
+    pub fn final_size(&self) -> Option<u64> {
+        self.fin_off
+    }
+
     /// Returns the largest offset of data buffered.
     pub fn off_back(&self) -> u64 {
         self.off

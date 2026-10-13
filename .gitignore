@@ -32,3 +32,5 @@ examples/*.pem
 # Test certificate, minted fresh each run by the vitest global setup so it stays
 # within the serverCertificateHashes 14-day validity window.
 test/fixtures/*.pem
+coverage
+.vitest

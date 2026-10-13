@@ -203,10 +203,23 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
         options: WebTransportSendStreamOptions = {},
     ) {
         let controller!: WritableStreamDefaultController;
+        let reset = false;
+        const abortNative = (reason: unknown) => {
+            if (reset) return;
+            reset = true;
+            session.resetStream(streamId, errorCode(reason));
+            session.unregisterSend(streamId);
+        };
         super(
             {
                 start(c) {
                     controller = c;
+                    // The underlying abort callback waits for an in-flight
+                    // write. The signal is immediate, so reset and reject that
+                    // write now instead of waiting for the peer's credit.
+                    c.signal.addEventListener('abort', () => abortNative(c.signal.reason), {
+                        once: true,
+                    });
                 },
                 write(chunk) {
                     return session.write(streamId, chunk);
@@ -216,8 +229,7 @@ export class WebTransportSendStream extends WritableStream<Uint8Array> {
                     session.unregisterSend(streamId);
                 },
                 abort(reason) {
-                    session.resetStream(streamId, errorCode(reason));
-                    session.unregisterSend(streamId);
+                    abortNative(reason);
                 },
             },
             new ByteLengthQueuingStrategy({ highWaterMark: 1024 * 1024 }),

@@ -554,7 +554,7 @@ The suite covers the QUIC handshake, Extended CONNECT, bidirectional and unidire
 The native core treats the peer and the caller as untrusted, on both the client and the server:
 
 - **A panic can never crash Node.** The entire driver thread runs inside a panic boundary; a panic (or a fatal setup error) is surfaced as an `error` event that rejects `ready`/`closed`. It never aborts the process and never silently hangs the session.
-- **Bounded memory under flood.** A hostile peer cannot grow memory without limit: event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), the datagram queue is bounded, HTTP/3 frame buffers are capped, and finished streams are pruned.
+- **Bounded receive queues and parsers.** Event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), servers queue at most 128 unread sessions, each incoming stream direction queues at most 128 unread streams, and finished native streams are pruned. HTTP/3 and capsule parser allocations are limited to 8 MiB per connection and 64 MiB across a server. Exceeding a queue or parser budget terminates the affected session.
 - **No blocking on the event loop.** DNS resolution, the socket bind, and the QUIC handshake all run on the driver thread, so the constructor never blocks Node.
 - **Hostile input is fail-closed.** Malformed HTTP/3, bad QPACK, oversized frames, unexpected resets, and out-of-range numbers from JS are handled by rejecting or closing cleanly rather than panicking.
 
@@ -575,3 +575,7 @@ Certificate verification follows the WebTransport model: full PKI validation by 
 <div align="center">
 <sub>Built by <a href="https://github.com/dacely-cloud">Dacely Cloud</a>.</sub>
 </div>
+
+### Development checks
+
+`npm test` runs the Node suite. `npm run test:browser` runs Chrome interoperability tests against the native server; Chrome must be installed, and WebdriverIO manages the driver. `npm run test:all` runs both suites. `npm run test:coverage` runs both with V8 coverage reports in `coverage/`. These commands build the native addon, TypeScript output, and Rust test fixtures first. Native protocol regressions run with `cargo test --release -p rwebtransport-native -p rwebtransport-wtcore`.

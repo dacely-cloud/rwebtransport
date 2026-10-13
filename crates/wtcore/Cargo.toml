@@ -13,3 +13,4 @@ path = "src/lib.rs"
 [dependencies]
 quiche.workspace = true
 octets.workspace = true
+sfv = "0.16"

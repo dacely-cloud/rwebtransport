@@ -21,3 +21,5 @@ log.workspace = true
 mio.workspace = true
 getrandom.workspace = true
 socket2.workspace = true
+rustls-native-certs = "0.8.4"
+url = "2.5"
