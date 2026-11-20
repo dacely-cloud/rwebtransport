@@ -333,6 +333,12 @@ fn run_inner(
                     }
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if is_udp_port_unreachable(e) => {
+                    if debug {
+                        eprintln!("[rwt-driver] UDP port unreachable: {e}");
+                    }
+                    continue;
+                }
                 Err(e) => {
                     evs.push(Ev::Error(format!("socket recv: {e}")));
                     break;
@@ -466,6 +472,13 @@ fn run_inner(
     }
 }
 
+/// Winsock may report an ICMP Port Unreachable for an earlier UDP send. Let QUIC
+/// determine connection liveness after loss rather than retiring the session from recv_from.
+fn is_udp_port_unreachable(error: &std::io::Error) -> bool {
+    const WSAECONNRESET: i32 = 10054;
+    cfg!(windows) && error.raw_os_error() == Some(WSAECONNRESET)
+}
+
 /// Drain quiche's send queue to the socket.
 fn flush_send(conn: &mut quiche::Connection, socket: &UdpSocket, out: &mut [u8], debug: bool) {
     loop {
@@ -548,4 +561,20 @@ fn closure_info(conn: &quiche::Connection) -> (u32, Vec<u8>, bool, Option<String
         true,
         Some("connection closed abnormally".to_string()),
     )
+}
+
+#[cfg(test)]
+mod receive_error_tests {
+    use super::is_udp_port_unreachable;
+    use std::io::Error;
+
+    #[test]
+    fn the_winsock_udp_notification_keeps_the_quic_session_alive() {
+        assert_eq!(
+            is_udp_port_unreachable(&Error::from_raw_os_error(10054)),
+            cfg!(windows)
+        );
+        assert!(!is_udp_port_unreachable(&Error::from_raw_os_error(10053)));
+        assert!(!is_udp_port_unreachable(&Error::from_raw_os_error(10038)));
+    }
 }
