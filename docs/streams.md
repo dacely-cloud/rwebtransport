@@ -224,14 +224,10 @@ zero or negative under pressure).
 
 ### Read backpressure
 
-Inbound bytes are enqueued into the receive stream's internal queue (a count
-high-water mark of 32 chunks by default). While you keep reading, the queue
-stays low and the native side keeps draining quiche, which keeps issuing
-flow-control credit to the peer. The moment you stop reading, the queue fills,
-the native side stops draining quiche, quiche stops extending the peer's window,
-and the peer is flow-controlled: it cannot send more until you resume. When you
-call `read()` again the queue drains, the window reopens, and data flows. You do
-nothing to make this happen; simply not reading is the backpressure.
+Each pull requests one native chunk of up to 16 KiB. Unread bytes stay in
+QUIC. If the application stops reading, QUIC stops extending the peer's
+flow-control window once it fills. Calling `read()` or resuming a pipe drains
+the receive buffer and allows QUIC to issue more credit.
 
 The practical consequence: to relieve a peer that is sending fast, read faster
 (or `pipeTo()` a sink). To slow a peer down deliberately, read slower. And if you

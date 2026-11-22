@@ -57,6 +57,36 @@ const MAX_SESSION_PARSER_MEMORY: usize = 8 * 1024 * 1024;
 const WT_GRANT_MAX_DATA: u64 = 1 << 34;
 const WT_GRANT_MAX_STREAMS: u64 = 1 << 20;
 
+/// Receive work admitted to one native event batch, shared by all connections
+/// on a listener. Count reads as well as bytes so tiny messages are bounded.
+pub struct ReceiveBudget {
+    bytes: usize,
+    items: usize,
+}
+
+impl ReceiveBudget {
+    pub fn new() -> Self {
+        Self {
+            bytes: 256 * 1024,
+            items: 128,
+        }
+    }
+
+    pub fn exhausted(&self) -> bool {
+        self.bytes == 0 || self.items == 0
+    }
+
+    #[cfg(test)]
+    fn blocked() -> Self {
+        Self { bytes: 0, items: 0 }
+    }
+
+    fn record(&mut self, bytes: usize) {
+        self.bytes = self.bytes.saturating_sub(bytes);
+        self.items -= 1;
+    }
+}
+
 /// Events the session emits for the driver to forward to JS.
 #[derive(Debug)]
 pub enum Ev {
@@ -95,6 +125,8 @@ pub enum Ev {
     Error(String),
     /// A WebTransport datagram was received.
     Datagram(Vec<u8>),
+    /// Updated maximum datagram payload for one server connection.
+    DatagramSize(usize),
     /// The peer opened a WebTransport stream.
     IncomingStream { id: u64, bidi: bool },
     /// Application data arrived on a WebTransport stream.
@@ -108,7 +140,7 @@ pub enum Ev {
     /// A locally requested stream open completed; `id` is the QUIC stream id.
     StreamOpened { request_id: u64, id: u64 },
     /// A write's bytes were fully handed to quiche (backpressure signal).
-    WriteAck { request_id: u64 },
+    WriteAck { request_id: u64, accepted: bool },
     /// A datagram send request was processed (sent or intentionally dropped).
     DatagramAck { request_id: u64, sent: bool },
     /// Result of a getStats() request.
@@ -154,31 +186,6 @@ pub fn build_stats(conn: &quiche::Connection, request_id: u64) -> Ev {
         rtt_variation_ms: to_ms(rttvar),
         min_rtt_ms: to_ms(min_rtt),
     }
-}
-
-/// Export `length` bytes of TLS keying material (RFC 5705) into a
-/// [`Ev::KeyingMaterial`] for `request_id`. `data` is `None` if the export
-/// failed. WebTransport always supplies a context, so it is passed through even
-/// when empty (an empty context differs from no context per RFC 5705).
-pub fn build_keying_material(
-    conn: &mut quiche::Connection,
-    request_id: u64,
-    label: &[u8],
-    context: &[u8],
-    length: u32,
-) -> Ev {
-    if !(1..=4096).contains(&length) {
-        return Ev::KeyingMaterial {
-            request_id,
-            data: None,
-        };
-    }
-    let mut out = vec![0u8; length as usize];
-    let data = match conn.export_keying_material(&mut out, label, Some(context)) {
-        Ok(()) => Some(out),
-        Err(_) => None,
-    };
-    Ev::KeyingMaterial { request_id, data }
 }
 
 /// One queued outbound chunk on a stream.
@@ -227,6 +234,7 @@ struct Stream {
     /// Application asked to FIN once `out` drains.
     fin_queued: bool,
     fin_sent: bool,
+    reset_pending: Option<u64>,
     /// Peer already reset/finished, stop touching recv.
     recv_dead: bool,
     recv_payload: u64,
@@ -242,10 +250,11 @@ impl Stream {
             class_buf: ParserBuffer::new(memory.clone()),
             frames: FrameParser::new(memory),
             headers_done: false,
-            paused: false,
+            paused: matches!(role, Role::WtData { .. }),
             out: VecDeque::new(),
             fin_queued: false,
             fin_sent: false,
+            reset_pending: None,
             recv_dead: false,
             recv_payload: 0,
             recv_prefix: 0,
@@ -353,6 +362,7 @@ pub struct WtSession {
     pending_opens: VecDeque<(bool, u64)>,
 
     setup_sent: bool,
+    latest_protocol: bool,
     ready: bool,
     closed: bool,
     /// Client role only: the Extended CONNECT is built but deferred until the
@@ -392,6 +402,7 @@ pub struct WtSession {
     peer_settings: Option<h3::PeerSettings>,
 
     streams: HashMap<u64, Stream>,
+    next_read_stream: u64,
 
     close_req: Option<CloseReq>,
     /// Set once the QUIC connection should be closed (after connect FIN flush).
@@ -408,6 +419,33 @@ pub struct WtSession {
 }
 
 impl WtSession {
+    pub fn build_keying_material(
+        &self,
+        conn: &mut quiche::Connection,
+        request_id: u64,
+        label: &[u8],
+        context: &[u8],
+        length: u32,
+    ) -> Ev {
+        let data = (|| {
+            if !self.ready || self.closed || !(1..=4096).contains(&length) {
+                return None;
+            }
+            let mut out = vec![0; length as usize];
+            let context_buf;
+            let (label, context) = if self.latest_protocol {
+                context_buf = h3::exporter_context(CONNECT_ID, label, context)?;
+                (h3::WT_EXPORTER_LABEL, context_buf.as_slice())
+            } else {
+                (label, context)
+            };
+            conn.export_keying_material(&mut out, label, Some(context))
+                .ok()?;
+            Some(out)
+        })();
+        Ev::KeyingMaterial { request_id, data }
+    }
+
     /// A client-role session that will send an Extended CONNECT.
     pub fn new_client(
         authority: String,
@@ -431,6 +469,7 @@ impl WtSession {
             next_uni: CLIENT_FIRST_WT_UNI_ID,
             pending_opens: VecDeque::new(),
             setup_sent: false,
+            latest_protocol: false,
             ready: false,
             closed: false,
             connect_pending: false,
@@ -453,6 +492,7 @@ impl WtSession {
             parser_memory,
             peer_settings: None,
             streams: HashMap::new(),
+            next_read_stream: 0,
             close_req: None,
             want_quic_close: None,
             close_deferred_once: false,
@@ -486,6 +526,7 @@ impl WtSession {
             next_uni: SERVER_FIRST_WT_UNI_ID,
             pending_opens: VecDeque::new(),
             setup_sent: false,
+            latest_protocol: false,
             ready: false,
             closed: false,
             connect_pending: false,
@@ -508,6 +549,7 @@ impl WtSession {
             parser_memory,
             peer_settings: None,
             streams: HashMap::new(),
+            next_read_stream: 0,
             close_req: None,
             want_quic_close: None,
             close_deferred_once: false,
@@ -524,7 +566,7 @@ impl WtSession {
     /// control-plane streams and advertise SETTINGS. A client waits for the
     /// server's SETTINGS before sending CONNECT; a server waits for the client's
     /// CONNECT on bidi stream 0.
-    pub fn on_established(&mut self) {
+    pub fn on_established(&mut self, reliable_reset: bool) {
         if self.setup_sent {
             return;
         }
@@ -541,7 +583,7 @@ impl WtSession {
             control_id,
             Stream::with_prefix(
                 Role::LocalControlPlane,
-                h3::control_stream_prefix(),
+                h3::control_stream_prefix_for(reliable_reset),
                 self.parser_memory.clone(),
             ),
         );
@@ -574,15 +616,21 @@ impl WtSession {
         }
     }
 
-    /// Process a readable QUIC stream. `backpressured` is a global signal that
-    /// the JS thread is behind; when set, resolved WebTransport data streams are
-    /// left unread (flow-controlling the peer) while control-plane streams still
-    /// drain.
-    pub fn on_readable(
+    #[cfg(test)]
+    fn on_readable(&mut self, conn: &mut quiche::Connection, id: u64, ev: &mut Vec<Ev>) {
+        let mut budget = ReceiveBudget::new();
+        self.read_stream(conn, id, &mut budget, ev);
+        if !self.closed && self.streams.get(&id).is_some_and(|s| s.paused) {
+            self.set_paused(id, false);
+            self.read_stream(conn, id, &mut budget, ev);
+        }
+    }
+
+    fn read_stream(
         &mut self,
         conn: &mut quiche::Connection,
         id: u64,
-        backpressured: bool,
+        budget: &mut ReceiveBudget,
         ev: &mut Vec<Ev>,
     ) {
         if self.closed {
@@ -593,54 +641,52 @@ impl WtSession {
             Stream::new(classify_new(id, is_server), self.parser_memory.clone())
         });
 
-        // Respect per-stream and global read backpressure for resolved data
-        // streams (leave the bytes in quiche so the peer is flow-controlled).
-        let (paused, is_data, recv_dead) = {
-            let st = &self.streams[&id];
-            (
-                st.paused,
-                matches!(st.role, Role::WtData { .. }),
-                st.recv_dead,
-            )
-        };
-        if recv_dead {
+        let st = &self.streams[&id];
+        if st.recv_dead {
             return;
         }
-        if (paused || backpressured) && is_data {
+        if !self.ready && st.role == Role::PendingBidi {
             return;
         }
 
-        // Pending bidi streams are application data. Under global pressure,
-        // classify uni stream types one byte at a time, then leave WT headers
-        // and payload in QUIC while allowing critical streams to drain.
-        if backpressured && matches!(self.streams[&id].role, Role::PendingBidi) {
-            return;
-        }
-
-        // Drain everything quiche currently has for this stream.
         let mut reset: Option<u64> = None;
         let mut buf = [0u8; 16 * 1024];
-        loop {
-            let st = &self.streams[&id];
-            if backpressured
-                && (matches!(st.role, Role::WtData { .. })
-                    || (matches!(st.role, Role::PendingUni)
-                        && h3::read_varint(&st.class_buf)
-                            .is_some_and(|(ty, _)| ty == h3::WT_UNI_STREAM_TYPE)))
-            {
+        while !budget.exhausted() {
+            let Some(st) = self.streams.get(&id) else {
+                return;
+            };
+            if st.paused && !conn.stream_finished(id) {
+                // Leave data in QUIC until the JS reader asks for one chunk.
+                // Empty FIN and RESET_STREAM do not require read credit.
                 return;
             }
-            let read_len = if backpressured && matches!(st.role, Role::PendingUni) {
+            let read_len = if matches!(st.role, Role::PendingUni | Role::PendingBidi) {
+                // Classify the stream without consuming WebTransport payload
+                // before CONNECT has been accepted and reported to Node.
+                if !self.ready
+                    && h3::read_varint(&st.class_buf)
+                        .is_some_and(|(ty, _)| ty == h3::WT_UNI_STREAM_TYPE)
+                {
+                    return;
+                }
                 1
             } else {
-                buf.len()
+                buf.len().min(budget.bytes)
             };
             let final_size = conn.stream_recv_final_size(id);
             match conn.stream_recv(id, &mut buf[..read_len]) {
                 Ok((n, f)) => {
+                    budget.record(n);
                     // Parse bounded chunks immediately. Do not build an entire
                     // stream-sized scratch allocation outside the parser budget.
+                    let was_ready = self.ready;
                     self.process_recv(conn, id, buf[..n].to_vec(), f, ev);
+                    if !was_ready && self.ready {
+                        // Decoded headers can span reads and expand on decode.
+                        budget.bytes = budget
+                            .bytes
+                            .saturating_sub(4 * h3::MAX_HEADER_BLOCK as usize);
+                    }
                     if self.closed {
                         return;
                     }
@@ -653,6 +699,7 @@ impl WtSession {
                 }
                 Err(quiche::Error::Done) => break,
                 Err(quiche::Error::StreamReset(code)) => {
+                    budget.record(0);
                     if let Some(size) = final_size {
                         let st = &self.streams[&id];
                         if matches!(st.role, Role::WtData { .. }) {
@@ -696,10 +743,18 @@ impl WtSession {
                     }
                     self.mark_closed(ev, code as u32, Vec::new(), true);
                 }
+                Some(Role::PendingBidi | Role::PendingUni) => self.ignore_stream(conn, id),
                 _ => {}
             }
-            return;
         }
+    }
+
+    fn ignore_stream(&mut self, conn: &mut quiche::Connection, id: u64) {
+        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+        if id & 2 == 0 {
+            let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+        }
+        self.streams.remove(&id);
     }
 
     fn process_recv(
@@ -789,6 +844,7 @@ impl WtSession {
                     return;
                 }
                 if !chunk.is_empty() {
+                    self.streams.get_mut(&id).unwrap().paused = true;
                     ev.push(Ev::StreamData { id, data: chunk });
                 }
                 if fin {
@@ -845,13 +901,19 @@ impl WtSession {
                 // otherwise reject the session.
                 if self.connect_pending {
                     self.connect_pending = false;
-                    if settings.webtransport_ok() {
+                    self.latest_protocol = settings.enable_connect_protocol
+                        && settings.h3_datagram
+                        && (settings.wt_enabled || settings.wt_enabled_draft15)
+                        && conn.dgram_max_writable_len().is_some()
+                        && conn.reliable_stream_reset_negotiated();
+                    if self.latest_protocol || settings.webtransport_ok() {
                         self.queue_connect(ev);
                     } else {
                         ev.push(Ev::Error(
                             "server does not advertise WebTransport support".to_string(),
                         ));
                         self.mark_closed(ev, 0, b"webtransport not supported".to_vec(), false);
+                        let _ = conn.close(true, h3::H3_NO_ERROR, b"webtransport not supported");
                     }
                 }
                 if self.is_server && self.streams.contains_key(&CONNECT_ID) {
@@ -876,7 +938,12 @@ impl WtSession {
     /// Build and queue the client's Extended CONNECT on the session (bidi 0)
     /// stream. Called once the server's SETTINGS have confirmed WebTransport.
     fn queue_connect(&mut self, ev: &mut Vec<Ev>) {
-        let headers = h3::connect_headers(
+        let headers = h3::connect_headers_for(
+            if self.latest_protocol {
+                h3::WT_H3_TOKEN
+            } else {
+                h3::LEGACY_WT_TOKEN
+            },
             &self.authority,
             &self.path,
             self.origin.as_deref(),
@@ -908,12 +975,23 @@ impl WtSession {
                 eprintln!("[rwt-session] connect frame ty={ty} len={}", payload.len());
             }
             if ty == h3::FRAME_HEADERS && !headers_done {
-                if let Some(st) = self.streams.get_mut(&id) {
-                    st.headers_done = true;
-                }
                 match h3::decode_header_block(&payload) {
                     Ok(headers) => {
-                        let status = h3::status_of(&headers).unwrap_or(0);
+                        let Some(status) = h3::status_of(&headers) else {
+                            self.protocol_error(
+                                conn,
+                                ev,
+                                0x10e,
+                                "malformed CONNECT response headers",
+                            );
+                            return;
+                        };
+                        if (100..200).contains(&status) {
+                            continue;
+                        }
+                        if let Some(st) = self.streams.get_mut(&id) {
+                            st.headers_done = true;
+                        }
                         if dbg_on() {
                             eprintln!("[rwt-session] CONNECT response status={status}");
                         }
@@ -948,12 +1026,20 @@ impl WtSession {
                         }
                     }
                     Err(e) => {
-                        ev.push(Ev::Error(format!("failed to decode CONNECT response: {e}")));
+                        self.protocol_error(
+                            conn,
+                            ev,
+                            0x10e,
+                            &format!("failed to decode CONNECT response: {e}"),
+                        );
+                        return;
                     }
                 }
-            } else if ty == h3::FRAME_DATA {
-                // Capsule-protocol content. Best-effort scan for a session close.
+            } else if ty == h3::FRAME_DATA && self.ready {
                 self.scan_capsules(&payload, ev);
+            } else if ty == h3::FRAME_DATA || ty == h3::FRAME_HEADERS {
+                self.protocol_error(conn, ev, 0x105, "unexpected frame on CONNECT stream");
+                return;
             }
         }
     }
@@ -1020,6 +1106,9 @@ impl WtSession {
                     | h3::WT_STREAMS_BLOCKED_BIDI_CAPSULE
                     | h3::WT_STREAMS_BLOCKED_UNI_CAPSULE
             ) {
+                if self.latest_protocol && !self.uses_session_flow_control() {
+                    continue;
+                }
                 let Some((v, n)) = h3::read_varint(&value) else {
                     self.flow_error(ev, "truncated flow-control capsule");
                     return;
@@ -1060,15 +1149,7 @@ impl WtSession {
         if self.peer_settings.is_none() {
             return;
         }
-        let settings = self.peer_settings.unwrap();
-        // ENABLE_CONNECT_PROTOCOL is advertised by the server; browsers need
-        // not advertise it when acting as clients.
-        if !settings.h3_datagram || !(settings.enable_webtransport || settings.wt_max_sessions > 0)
-        {
-            self.reject_connect(conn, id, 400, ev);
-            return;
-        }
-        while !self.closed {
+        while !self.closed && (self.ready || self.close_req.is_none()) {
             let (frame, headers_done) = {
                 let Some(st) = self.streams.get_mut(&id) else {
                     return;
@@ -1088,8 +1169,11 @@ impl WtSession {
                         self.reject_connect(conn, id, 400, ev);
                     }
                 }
-            } else if ty == h3::FRAME_DATA {
+            } else if ty == h3::FRAME_DATA && self.ready {
                 self.scan_capsules(&payload, ev);
+            } else if ty == h3::FRAME_DATA || ty == h3::FRAME_HEADERS {
+                self.protocol_error(conn, ev, 0x105, "unexpected frame on CONNECT stream");
+                return;
             }
         }
     }
@@ -1102,22 +1186,30 @@ impl WtSession {
         ev: &mut Vec<Ev>,
     ) {
         use quiche::h3::NameValue;
-        let mut method: Option<&[u8]> = None;
-        let mut protocol: Option<&[u8]> = None;
-        let mut authority = String::new();
-        let mut path = String::from("/");
-        let mut origin: Option<String> = None;
+        let Some(target) = h3::validate_connect_headers(headers) else {
+            self.reject_connect(conn, id, 400, ev);
+            return;
+        };
+        let Some(settings) = self.peer_settings else {
+            return;
+        };
+        let latest = target.protocol == h3::WT_H3_TOKEN
+            && conn.reliable_stream_reset_negotiated()
+            && conn.dgram_max_writable_len().is_some();
+        let legacy = target.protocol == h3::LEGACY_WT_TOKEN
+            && (settings.enable_webtransport || settings.wt_max_sessions > 0);
+        if !settings.h3_datagram || !(latest || legacy) {
+            self.reject_connect(conn, id, 400, ev);
+            return;
+        }
+        self.latest_protocol = latest;
         let mut protocol_fields: Vec<String> = Vec::new();
         let mut extra: Vec<(String, String)> = Vec::new();
         for h in headers {
             let name = h.name();
             let value = h.value();
             match name {
-                b":method" => method = Some(value),
-                b":protocol" => protocol = Some(value),
-                b":authority" => authority = String::from_utf8_lossy(value).into_owned(),
-                b":path" => path = String::from_utf8_lossy(value).into_owned(),
-                b"origin" => origin = Some(String::from_utf8_lossy(value).into_owned()),
+                b"origin" => {}
                 _ if name == h3::WT_AVAILABLE_PROTOCOLS => {
                     protocol_fields.push(String::from_utf8_lossy(value).into_owned());
                 }
@@ -1130,17 +1222,12 @@ impl WtSession {
         }
 
         let requested_protocols = h3::parse_sf_string_list(&protocol_fields.join(", "));
-        let ok = method == Some(b"CONNECT".as_ref()) && protocol == Some(b"webtransport".as_ref());
-        if !ok {
-            self.reject_connect(conn, id, 400, ev);
-            return;
-        }
 
         // Origin verification (draft-ietf-webtrans-http3 3.3): if an allowlist is
         // configured, the request's origin must be present in it.
         if let Some(allowed) = &self.allowed_origins {
-            let permitted = origin
-                .as_deref()
+            let permitted = target
+                .origin
                 .map(|o| allowed.iter().any(|a| a == o))
                 .unwrap_or(false);
             if !permitted {
@@ -1185,9 +1272,9 @@ impl WtSession {
                     None => (String::new(), 0),
                 };
                 ev.push(Ev::ServerReady {
-                    authority,
-                    path,
-                    origin,
+                    authority: target.authority.to_owned(),
+                    path: target.path.to_owned(),
+                    origin: target.origin.map(str::to_owned),
                     headers: extra,
                     requested_protocols,
                     protocol: selected,
@@ -1221,7 +1308,13 @@ impl WtSession {
         if !self.ready && !self.closed {
             ev.push(Ev::Error(format!("rejected CONNECT with status {status}")));
         }
-        self.mark_closed(ev, 0, Vec::new(), false);
+        // Keep the queued HTTP response until it has been flushed. Marking
+        // the session closed here would clear CONNECT's send queue.
+        self.close_req = Some(CloseReq {
+            code: 0,
+            reason: Vec::new(),
+            capsule_queued: true,
+        });
         let _ = conn;
     }
 
@@ -1297,12 +1390,7 @@ impl WtSession {
                     return; // need session id
                 };
                 if session != CONNECT_ID {
-                    let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-                    let Some(st) = self.streams.get_mut(&id) else {
-                        return;
-                    };
-                    st.role = Role::Ignored;
-                    st.class_buf.clear();
+                    self.ignore_stream(conn, id);
                     return;
                 }
                 let data = buf[n + n2..].to_vec();
@@ -1311,6 +1399,7 @@ impl WtSession {
                         return;
                     };
                     st.role = Role::WtData { bidi: false };
+                    st.paused = true;
                     st.class_buf.clear();
                 }
                 self.streams.get_mut(&id).unwrap().recv_prefix = (n + n2) as u64;
@@ -1330,13 +1419,7 @@ impl WtSession {
                     ev.push(Ev::StreamFinished { id });
                 }
             }
-            _ => {
-                let Some(st) = self.streams.get_mut(&id) else {
-                    return;
-                };
-                st.role = Role::Ignored;
-                st.class_buf.clear();
-            }
+            _ => self.ignore_stream(conn, id),
         }
     }
 
@@ -1359,35 +1442,25 @@ impl WtSession {
             st.class_buf.to_vec()
         };
         let Some((signal, n)) = h3::read_varint(&buf) else {
-            // Peer FIN'd before we could classify: reclaim the entry.
+            // Peer FIN'd before we could classify: release both halves.
             if fin {
-                self.streams.remove(&id);
+                self.ignore_stream(conn, id);
             }
             return;
         };
         if signal != h3::WT_BIDI_FRAME_TYPE {
-            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-            let Some(st) = self.streams.get_mut(&id) else {
-                return;
-            };
-            st.role = Role::Ignored;
-            st.class_buf.clear();
+            self.ignore_stream(conn, id);
             return;
         }
         let Some((session, n2)) = h3::read_varint(&buf[n..]) else {
-            // Peer FIN'd mid-header: reclaim the entry instead of leaking.
+            // Peer FIN'd mid-header: release both halves.
             if fin {
-                self.streams.remove(&id);
+                self.ignore_stream(conn, id);
             }
             return;
         };
         if session != CONNECT_ID {
-            let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
-            let Some(st) = self.streams.get_mut(&id) else {
-                return;
-            };
-            st.role = Role::Ignored;
-            st.class_buf.clear();
+            self.ignore_stream(conn, id);
             return;
         }
         let data = buf[n + n2..].to_vec();
@@ -1396,9 +1469,13 @@ impl WtSession {
                 return;
             };
             st.role = Role::WtData { bidi: true };
+            st.paused = true;
             st.class_buf.clear();
         }
         self.streams.get_mut(&id).unwrap().recv_prefix = (n + n2) as u64;
+        if self.latest_protocol {
+            let _ = conn.stream_set_reliable_reset(id, 0);
+        }
         if !self.account_incoming(true, ev) || !self.account_receive(id, data.len() as u64, ev) {
             return;
         }
@@ -1414,11 +1491,45 @@ impl WtSession {
         }
     }
 
-    pub fn on_datagrams(&mut self, conn: &mut quiche::Connection, ev: &mut Vec<Ev>) {
-        let mut buf = [0u8; 65_536];
-        loop {
+    /// Read reliable data before datagrams so the latter cannot starve streams.
+    pub fn read_pending(
+        &mut self,
+        conn: &mut quiche::Connection,
+        budget: &mut ReceiveBudget,
+        ev: &mut Vec<Ev>,
+    ) {
+        if self.closed || (!self.ready && self.close_req.is_some()) || budget.exhausted() {
+            return;
+        }
+        let mut readable: Vec<_> = conn.readable().collect();
+        // Start with the remaining streams from the previous pass when a busy
+        // connection exhausted the budget before reaching the end of the list.
+        readable.sort_unstable();
+        let start = readable.partition_point(|&id| id < self.next_read_stream);
+        readable.rotate_left(start);
+        for id in readable {
+            self.read_stream(conn, id, budget, ev);
+            if budget.exhausted() {
+                self.next_read_stream = id + 1;
+                return;
+            }
+        }
+        if self.ready && !self.closed {
+            self.on_datagrams(conn, budget, ev);
+        }
+    }
+
+    fn on_datagrams(
+        &mut self,
+        conn: &mut quiche::Connection,
+        budget: &mut ReceiveBudget,
+        ev: &mut Vec<Ev>,
+    ) {
+        let mut buf = [0u8; crate::driver::MAX_RECV_UDP_PAYLOAD];
+        while !budget.exhausted() {
             match conn.dgram_recv(&mut buf) {
                 Ok(n) => {
+                    budget.record(n);
                     let data = &buf[..n];
                     if let Some((qsi, off)) = h3::read_varint(data) {
                         // quarter-stream-id for our session is CONNECT_ID / 4 = 0.
@@ -1458,8 +1569,15 @@ impl WtSession {
     }
 
     fn uses_session_flow_control(&self) -> bool {
-        self.peer_settings
-            .is_some_and(|settings| settings.wt_max_sessions > 0)
+        self.peer_settings.is_some_and(|settings| {
+            if self.latest_protocol {
+                settings.wt_initial_max_data != 0
+                    || settings.wt_initial_max_streams_bidi != 0
+                    || settings.wt_initial_max_streams_uni != 0
+            } else {
+                settings.wt_max_sessions > 0
+            }
+        })
     }
 
     fn release_pending_opens(&mut self, ev: &mut Vec<Ev>) {
@@ -1520,12 +1638,15 @@ impl WtSession {
 
     pub fn stream_write(&mut self, id: u64, data: Vec<u8>, request_id: u64, ev: &mut Vec<Ev>) {
         match self.streams.get_mut(&id) {
-            Some(st) => st.out.push_back(OutChunk {
+            Some(st) if !st.fin_sent && st.reset_pending.is_none() => st.out.push_back(OutChunk {
                 data,
                 off: 0,
                 request_id: Some(request_id),
             }),
-            None => ev.push(Ev::WriteAck { request_id }),
+            _ => ev.push(Ev::WriteAck {
+                request_id,
+                accepted: false,
+            }),
         }
     }
 
@@ -1536,10 +1657,17 @@ impl WtSession {
     }
 
     pub fn stream_reset(&mut self, conn: &mut quiche::Connection, id: u64, code: u64) {
+        let h = h3::webtransport_code_to_http_code(code);
+        if self.latest_protocol {
+            if let Some(st) = self.streams.get_mut(&id) {
+                st.out.retain(|chunk| chunk.request_id.is_none());
+                st.reset_pending.get_or_insert(h);
+            }
+            return;
+        }
         if self.streams.contains_key(&id) {
             // The QUIC RESET_STREAM code must be the WebTransport application code
             // mapped into the HTTP/3 error space.
-            let h = h3::webtransport_code_to_http_code(code);
             let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, h);
             self.reconcile_send_final_size(conn, id);
             if let Some(st) = self.streams.get_mut(&id) {
@@ -1629,7 +1757,11 @@ impl WtSession {
         // connection-level flow control is the real limit; granting a large WT
         // credit here keeps a strict peer that honors our advertised session
         // limits from stalling, while QUIC does the actual enforcement.
-        if self.ready && !self.fc_credit_granted && !self.closed {
+        if self.ready
+            && !self.fc_credit_granted
+            && !self.closed
+            && (!self.latest_protocol || self.uses_session_flow_control())
+        {
             self.fc_credit_granted = true;
             self.fc_max_data_local = WT_GRANT_MAX_DATA;
             self.fc_max_streams_local = [WT_GRANT_MAX_STREAMS; 2];
@@ -1846,6 +1978,17 @@ impl WtSession {
         // chunks) counts toward WT_MAX_DATA; the stream-signal prefix and CONNECT
         // capsules do not.
         let is_wt_data = matches!(st.role, Role::WtData { .. });
+        if is_wt_data {
+            if let Err(quiche::Error::StreamStopped(code)) = conn.stream_capacity(id) {
+                if !st.fin_sent {
+                    let app = h3::http_code_to_webtransport_code(code).unwrap_or(code);
+                    ev.push(Ev::StreamStopSending { id, code: app });
+                    st.out.clear();
+                    st.fin_sent = true;
+                }
+                return;
+            }
+        }
         // Note: we call `stream_send` directly rather than pre-checking
         // `stream_capacity`, because a stream does not exist in quiche until its
         // first `stream_send`, and `stream_capacity` errors (InvalidStreamState)
@@ -1874,7 +2017,12 @@ impl WtSession {
                     if front.off >= front.data.len() {
                         let done = st.out.pop_front().unwrap();
                         if let Some(rid) = done.request_id {
-                            ev.push(Ev::WriteAck { request_id: rid });
+                            ev.push(Ev::WriteAck {
+                                request_id: rid,
+                                accepted: true,
+                            });
+                        } else if is_wt_data && self.latest_protocol {
+                            let _ = conn.stream_set_reliable_reset(id, st.send_prefix);
                         }
                     }
                     if sent < remaining_len {
@@ -1883,23 +2031,18 @@ impl WtSession {
                 }
                 Err(quiche::Error::Done) => return,
                 Err(quiche::Error::StreamLimit) => return, // no stream credit yet; retry next loop
-                Err(quiche::Error::StreamStopped(code)) => {
-                    let app = h3::http_code_to_webtransport_code(code).unwrap_or(code);
-                    ev.push(Ev::StreamStopSending { id, code: app });
-                    // Settle every queued write's promise so a stalled write()
-                    // (and its WritableStream) cannot hang forever.
-                    for chunk in st.out.drain(..) {
-                        if let Some(rid) = chunk.request_id {
-                            ev.push(Ev::WriteAck { request_id: rid });
-                        }
-                    }
-                    st.fin_sent = true;
-                    return;
-                }
                 Err(_) => return,
             }
         }
 
+        if let Some(code) = st.reset_pending.take() {
+            let reset = conn.stream_shutdown(id, quiche::Shutdown::Write, code);
+            st.fin_sent = true;
+            if reset.is_ok() {
+                self.reconcile_send_final_size(conn, id);
+            }
+            return;
+        }
         if st.out.is_empty()
             && st.fin_queued
             && !st.fin_sent
@@ -1917,11 +2060,8 @@ impl WtSession {
         // Closed connections can linger during QUIC draining. Release receive
         // allocations immediately rather than tying the budget to that timer.
         self.capsule_buf.clear();
-        for stream in self.streams.values_mut() {
-            stream.frames.buf.clear();
-            stream.class_buf.clear();
-            stream.recv_dead = true;
-        }
+        self.streams.clear();
+        self.pending_opens.clear();
         ev.push(Ev::Closed {
             code,
             reason,
@@ -2084,7 +2224,7 @@ mod tests {
         let mut session = server_with_connect(ParserMemory::new(64 * 1024 * 1024));
         session.ready = false;
         session.peer_settings = None;
-        session.on_established();
+        session.on_established(false);
         let mut control = vec![0];
         control.extend_from_slice(&h3::frame(h3::FRAME_SETTINGS, &settings));
         client.stream_send(2, &control, false).unwrap();
@@ -2095,9 +2235,9 @@ mod tests {
         crate::test_support::exchange(&mut client, &mut server);
         let mut events = Vec::new();
         // Exercise out-of-order arrival: CONNECT must wait for SETTINGS.
-        session.on_readable(&mut server, 0, false, &mut events);
+        session.on_readable(&mut server, 0, &mut events);
         assert!(!session.ready);
-        session.on_readable(&mut server, 2, false, &mut events);
+        session.on_readable(&mut server, 2, &mut events);
         assert!(session.ready);
         (client, server, session)
     }
@@ -2134,7 +2274,7 @@ mod tests {
         h3::put_varint(0, &mut prefix);
         client.stream_send(14, &prefix, false).unwrap();
         crate::test_support::exchange(&mut client, &mut server);
-        session.on_readable(&mut server, 14, false, &mut Vec::new());
+        session.on_readable(&mut server, 14, &mut Vec::new());
         client.stream_send(14, &[5; 8192], false).unwrap();
         // Serialize the bytes into QUIC without delivering them to the app.
         crate::test_support::exchange(&mut client, &mut server);
@@ -2143,7 +2283,7 @@ mod tests {
             .unwrap();
         crate::test_support::exchange(&mut client, &mut server);
         let mut events = Vec::new();
-        session.on_readable(&mut server, 14, false, &mut events);
+        session.on_readable(&mut server, 14, &mut events);
         assert_eq!(session.fc_data_received, 8192);
         assert!(events
             .iter()
@@ -2167,11 +2307,14 @@ mod tests {
             client.stream_send(14, &stream, true).unwrap();
             crate::test_support::exchange(&mut client, &mut server);
             let mut events = Vec::new();
-            session.on_readable(&mut server, 14, false, &mut events);
+            session.on_readable(&mut server, 14, &mut events);
             assert!(session.closed);
-            assert!(!events
-                .iter()
-                .any(|e| matches!(e, Ev::IncomingStream { .. } | Ev::StreamData { .. })));
+            assert!(!events.iter().any(|e| matches!(e, Ev::StreamData { .. })));
+            if !data_limit {
+                assert!(!events
+                    .iter()
+                    .any(|e| matches!(e, Ev::IncomingStream { .. })));
+            }
         }
     }
 
@@ -2195,7 +2338,7 @@ mod tests {
                 let id = if bidi { 4 + i * 4 } else { 14 + i * 4 };
                 client.stream_send(id, &prefix, true).unwrap();
                 crate::test_support::exchange(&mut client, &mut server);
-                session.on_readable(&mut server, id, true, &mut events);
+                session.read_pending(&mut server, &mut ReceiveBudget::blocked(), &mut events);
                 session.flush(&mut server, &mut Vec::new());
                 crate::test_support::exchange(&mut client, &mut server);
             }
@@ -2203,10 +2346,13 @@ mod tests {
                 events.is_empty(),
                 "application events leaked while backpressured"
             );
+            session.read_pending(&mut server, &mut ReceiveBudget::new(), &mut events);
+            assert!(!events.iter().any(|e| matches!(e, Ev::StreamData { .. })));
             for i in 0..20 {
                 let id = if bidi { 4 + i * 4 } else { 14 + i * 4 };
-                session.on_readable(&mut server, id, false, &mut events);
+                session.set_paused(id, false);
             }
+            session.read_pending(&mut server, &mut ReceiveBudget::new(), &mut events);
             let bytes: usize = events
                 .iter()
                 .filter_map(|e| match e {
@@ -2279,7 +2425,7 @@ mod tests {
         assert!(!fin);
         assert!(!events
             .iter()
-            .any(|e| matches!(e, Ev::WriteAck { request_id: 13 })));
+            .any(|e| matches!(e, Ev::WriteAck { request_id: 13, .. })));
         session.scan_capsules(&capsule(h3::WT_MAX_DATA_CAPSULE, 8), &mut events);
         session.scan_capsules(&capsule(h3::WT_MAX_STREAMS_BIDI_CAPSULE, 1), &mut events);
         session.flush(&mut server, &mut events);
@@ -2291,7 +2437,13 @@ mod tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|e| matches!(e, Ev::WriteAck { request_id: 13 }))
+                .filter(|e| matches!(
+                    e,
+                    Ev::WriteAck {
+                        request_id: 13,
+                        accepted: true
+                    }
+                ))
                 .count(),
             1
         );
@@ -2367,7 +2519,7 @@ mod tests {
             .unwrap();
         crate::test_support::exchange(&mut client, &mut server);
         let mut events = Vec::new();
-        session.on_readable(&mut server, 2, false, &mut events);
+        session.on_readable(&mut server, 2, &mut events);
         assert!(session.closed);
         assert!(events
             .iter()

@@ -166,7 +166,7 @@ impl BoundedNonEmptyConnectionIdVecDeque {
                     return Err(Error::IdLimit);
                 }
                 self.inner.push_back(e);
-            },
+            }
         };
         Ok(())
     }
@@ -179,23 +179,43 @@ impl BoundedNonEmptyConnectionIdVecDeque {
 
     /// Removes the element in the collection having the provided `seq`.
     ///
-    /// If this method is called when there remains a single element in the
-    /// collection, this method raises an [`OutOfIdentifiers`].
+    /// If the element is the last one remaining in the collection, this method
+    /// raises an [`OutOfIdentifiers`].
     ///
     /// Returns `Some` if the element was in the collection and removed, or
     /// `None` if it was not and nothing was modified.
     ///
     /// [`OutOfIdentifiers`]: enum.Error.html#OutOfIdentifiers
     fn remove(&mut self, seq: u64) -> Result<Option<ConnectionIdEntry>> {
+        let index = match self.inner.iter().position(|e| e.seq == seq) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+
         if self.inner.len() <= 1 {
             return Err(Error::OutOfIdentifiers);
         }
 
-        Ok(self
-            .inner
-            .iter()
-            .position(|e| e.seq == seq)
-            .and_then(|index| self.inner.remove(index)))
+        Ok(self.inner.remove(index))
+    }
+
+    /// Removes all elements in the collection with sequence numbers less than
+    /// `retire_prior_to`. The inspect closure is run on each element before it
+    /// is removed.
+    ///
+    /// The deque is in arrival order (not necessarily sorted by seq), so we
+    /// have to check each entry.
+    fn retire_prior_to<F>(&mut self, retire_prior_to: u64, mut inspect: F)
+    where
+        F: FnMut(&mut ConnectionIdEntry),
+    {
+        self.inner.retain_mut(|e| {
+            if e.seq < retire_prior_to {
+                inspect(e);
+                return false;
+            }
+            true
+        });
     }
 }
 
@@ -244,8 +264,10 @@ impl ConnectionIdentifiers {
     /// connection ID limit and initial source Connection ID. The destination
     /// Connection ID is set to the empty one.
     pub fn new(
-        mut destination_conn_id_limit: usize, initial_scid: &ConnectionId,
-        initial_path_id: usize, reset_token: Option<u128>,
+        mut destination_conn_id_limit: usize,
+        initial_scid: &ConnectionId,
+        initial_path_id: usize,
+        reset_token: Option<u128>,
     ) -> ConnectionIdentifiers {
         // It must be at least 2.
         if destination_conn_id_limit < 2 {
@@ -258,8 +280,7 @@ impl ConnectionIdentifiers {
         // Record the zero-length SCID status.
         let zero_length_scid = initial_scid.is_empty();
 
-        let initial_scid =
-            ConnectionId::from_ref(initial_scid.as_ref()).into_owned();
+        let initial_scid = ConnectionId::from_ref(initial_scid.as_ref()).into_owned();
 
         // We need to track up to (2 * source_conn_id_limit - 1) source
         // Connection IDs when the host wants to force their renewal.
@@ -284,8 +305,7 @@ impl ConnectionIdentifiers {
         );
 
         // Guard against overflow.
-        let value =
-            (destination_conn_id_limit as u64) * RETIRED_CONN_ID_LIMIT_MULTIPLIER;
+        let value = (destination_conn_id_limit as u64) * RETIRED_CONN_ID_LIMIT_MULTIPLIER;
         let size = cmp::min(usize::MAX as u64, value) as usize;
         // Because we already inserted the initial SCID.
         let next_scid_seq = 1;
@@ -357,8 +377,12 @@ impl ConnectionIdentifiers {
     /// [`InvalidState`]: enum.Error.html#InvalidState
     /// [`IdLimit`]: enum.Error.html#IdLimit
     pub fn new_scid(
-        &mut self, cid: ConnectionId<'static>, reset_token: Option<u128>,
-        advertise: bool, path_id: Option<usize>, retire_if_needed: bool,
+        &mut self,
+        cid: ConnectionId<'static>,
+        reset_token: Option<u128>,
+        advertise: bool,
+        path_id: Option<usize>,
+        retire_if_needed: bool,
     ) -> Result<u64> {
         if self.zero_length_scid {
             return Err(Error::InvalidState);
@@ -406,7 +430,9 @@ impl ConnectionIdentifiers {
 
     /// Sets the initial destination identifier.
     pub fn set_initial_dcid(
-        &mut self, cid: ConnectionId<'static>, reset_token: Option<u128>,
+        &mut self,
+        cid: ConnectionId<'static>,
+        reset_token: Option<u128>,
         path_id: Option<usize>,
     ) {
         // Record the zero-length DCID status.
@@ -429,8 +455,12 @@ impl ConnectionIdentifiers {
     /// sequence number of retired DCIDs that were linked to their respective
     /// Path ID.
     pub fn new_dcid(
-        &mut self, cid: ConnectionId<'static>, seq: u64, reset_token: u128,
-        retire_prior_to: u64, retired_path_ids: &mut SmallVec<[(u64, usize); 1]>,
+        &mut self,
+        cid: ConnectionId<'static>,
+        seq: u64,
+        reset_token: u128,
+        retire_prior_to: u64,
+        retired_path_ids: &mut SmallVec<[(u64, usize); 1]>,
     ) -> Result<()> {
         if self.zero_length_dcid {
             return Err(Error::InvalidState);
@@ -442,10 +472,8 @@ impl ConnectionIdentifiers {
         // sequence number is used for different connection IDs, the endpoint
         // MAY treat that receipt as a connection error of type
         // PROTOCOL_VIOLATION.
-        if let Some(e) = self.dcids.iter().find(|e| e.cid == cid || e.seq == seq)
-        {
-            if e.cid != cid || e.seq != seq || e.reset_token != Some(reset_token)
-            {
+        if let Some(e) = self.dcids.iter().find(|e| e.cid == cid || e.seq == seq) {
+            if e.cid != cid || e.seq != seq || e.reset_token != Some(reset_token) {
                 return Err(Error::InvalidFrame);
             }
             // The identifier is already there, nothing to do.
@@ -490,8 +518,8 @@ impl ConnectionIdentifiers {
         // After processing a NEW_CONNECTION_ID frame and adding and retiring
         // active connection IDs, if the number of active connection IDs exceeds
         // the value advertised in its active_connection_id_limit transport
-        // parameter, an endpoint MUST close the connection with an error of type
-        // CONNECTION_ID_LIMIT_ERROR.
+        // parameter, an endpoint MUST close the connection with an error of
+        // type CONNECTION_ID_LIMIT_ERROR.
         if retire_prior_to > self.largest_peer_retire_prior_to {
             let retired = &mut self.retire_dcid_seqs;
 
@@ -503,23 +531,18 @@ impl ConnectionIdentifiers {
 
             // To avoid exceeding the capacity of the inner `VecDeque`, we first
             // remove the elements and then insert the new one.
-            let index = self
-                .dcids
-                .inner
-                .partition_point(|e| e.seq < retire_prior_to);
-
-            for e in self.dcids.inner.drain(..index) {
+            self.dcids.retire_prior_to(retire_prior_to, |e| {
                 if let Some(pid) = e.path_id {
                     retired_path_ids.push((e.seq, pid));
                 }
 
                 if let Err(e) = retired.insert(e.seq) {
-                    // Delay propagating the error as we need to try to insert
-                    // the new DCID first.
-                    retired_dcid_queue_err = Some(e);
-                    break;
+                    // Keep the first error we encounter and report it _after_
+                    // inserting the new DCID. We still have to process the
+                    // remaining retired DCIDs.
+                    retired_dcid_queue_err.get_or_insert(e);
                 }
-            }
+            });
 
             self.largest_peer_retire_prior_to = retire_prior_to;
         }
@@ -547,9 +570,7 @@ impl ConnectionIdentifiers {
     /// Returns the path ID that was associated to the retired CID, if any.
     ///
     /// [`InvalidState`]: enum.Error.html#InvalidState
-    pub fn retire_scid(
-        &mut self, seq: u64, pkt_dcid: &ConnectionId,
-    ) -> Result<Option<usize>> {
+    pub fn retire_scid(&mut self, seq: u64, pkt_dcid: &ConnectionId) -> Result<Option<usize>> {
         if seq >= self.next_scid_seq {
             return Err(Error::InvalidState);
         }
@@ -606,9 +627,7 @@ impl ConnectionIdentifiers {
 
     /// Updates the Source Connection ID entry with the provided sequence number
     /// to indicate that it is now linked to the provided path ID.
-    pub fn link_scid_to_path_id(
-        &mut self, dcid_seq: u64, path_id: usize,
-    ) -> Result<()> {
+    pub fn link_scid_to_path_id(&mut self, dcid_seq: u64, path_id: usize) -> Result<()> {
         let e = self.scids.get_mut(dcid_seq).ok_or(Error::InvalidState)?;
         e.path_id = Some(path_id);
         Ok(())
@@ -616,9 +635,7 @@ impl ConnectionIdentifiers {
 
     /// Updates the Destination Connection ID entry with the provided sequence
     /// number to indicate that it is now linked to the provided path ID.
-    pub fn link_dcid_to_path_id(
-        &mut self, dcid_seq: u64, path_id: usize,
-    ) -> Result<()> {
+    pub fn link_dcid_to_path_id(&mut self, dcid_seq: u64, path_id: usize) -> Result<()> {
         let e = self.dcids.get_mut(dcid_seq).ok_or(Error::InvalidState)?;
         e.path_id = Some(path_id);
         Ok(())
@@ -660,9 +677,7 @@ impl ConnectionIdentifiers {
     /// Finds the sequence number of the Source Connection ID having the
     /// provided value and the identifier of the path using it, if any.
     #[inline]
-    pub fn find_scid_seq(
-        &self, scid: &ConnectionId,
-    ) -> Option<(u64, Option<usize>)> {
+    pub fn find_scid_seq(&self, scid: &ConnectionId) -> Option<(u64, Option<usize>)> {
         self.scids.iter().find_map(|e| {
             if e.cid == *scid {
                 Some((e.seq, e.path_id))
@@ -716,9 +731,7 @@ impl ConnectionIdentifiers {
     /// source Connection ID set that need to be advertised to the peer through
     /// NEW_CONNECTION_ID frames.
     #[inline]
-    pub fn mark_advertise_new_scid_seq(
-        &mut self, scid_seq: u64, advertise: bool,
-    ) {
+    pub fn mark_advertise_new_scid_seq(&mut self, scid_seq: u64, advertise: bool) {
         if advertise {
             self.advertise_new_scid_seqs.push_back(scid_seq);
         } else if let Some(index) = self
@@ -734,9 +747,7 @@ impl ConnectionIdentifiers {
     /// retired destination Connection ID set that need to be advertised to the
     /// peer through RETIRE_CONNECTION_ID frames.
     #[inline]
-    pub fn mark_retire_dcid_seq(
-        &mut self, dcid_seq: u64, retire: bool,
-    ) -> Result<()> {
+    pub fn mark_retire_dcid_seq(&mut self, dcid_seq: u64, retire: bool) -> Result<()> {
         if retire {
             self.retire_dcid_seqs.insert(dcid_seq)?;
         } else {
@@ -794,9 +805,7 @@ impl ConnectionIdentifiers {
 
     /// Gets the NEW_CONNECTION_ID frame related to the source connection ID
     /// with sequence `seq_num`.
-    pub fn get_new_connection_id_frame_for(
-        &self, seq_num: u64,
-    ) -> Result<frame::Frame> {
+    pub fn get_new_connection_id_frame_for(&self, seq_num: u64) -> Result<frame::Frame> {
         let e = self.scids.get(seq_num).ok_or(Error::InvalidState)?;
         Ok(frame::Frame::NewConnectionId {
             seq_num,
@@ -957,6 +966,8 @@ mod tests {
 
         // Trying to remove the last DCID triggers an error.
         assert_eq!(ids.retire_dcid(2), Err(Error::OutOfIdentifiers));
+        assert_eq!(ids.retire_dcid(0), Err(Error::InvalidState));
+        assert_eq!(ids.retire_dcid(1), Err(Error::InvalidState));
         assert_eq!(ids.available_dcids(), 0);
         assert!(!ids.has_retire_dcids());
         assert_eq!(ids.dcids.len(), 1);
@@ -988,15 +999,18 @@ mod tests {
         assert!(ids.new_dcid(dcid, 4, rt, 3, &mut retired_path_ids).is_ok());
         assert_eq!(ids.dcids.len(), 2);
 
-        // Insert DCID #1 (e.g due to packet reordering).
+        // Insert DCID #1 (e.g due to packet reordering). It should be discarded
+        // due to `largest_peer_retire_prior_to`.
         let (dcid, rt) = create_cid_and_reset_token(16);
         assert!(ids.new_dcid(dcid, 1, rt, 0, &mut retired_path_ids).is_ok());
         assert_eq!(ids.dcids.len(), 2);
+        assert!(ids.get_dcid(1).is_err());
 
         // Try inserting DCID #1 again (e.g. due to retransmission).
         let (dcid, rt) = create_cid_and_reset_token(16);
         assert!(ids.new_dcid(dcid, 1, rt, 0, &mut retired_path_ids).is_ok());
         assert_eq!(ids.dcids.len(), 2);
+        assert!(ids.get_dcid(1).is_err());
     }
 
     #[test]
@@ -1033,12 +1047,57 @@ mod tests {
 
         // Retire prior to DCID that was just retired.
         //
-        // This is largely to test that the `partition_point()` call above
-        // returns a meaningful value even if the actual sequence that is
-        // searched isn't present in the list.
+        // This is largely to test that `retire_prior_to()` works correctly even
+        // if the actual sequence that is searched isn't present in the list.
         let (dcid, rt) = create_cid_and_reset_token(16);
         assert!(ids.new_dcid(dcid, 5, rt, 3, &mut retired_path_ids).is_ok());
         assert_eq!(ids.dcids.len(), 2);
+
+        // Retire all current DCIDs while adding a new one
+        let (dcid, rt) = create_cid_and_reset_token(16);
+        assert!(ids.new_dcid(dcid, 6, rt, 6, &mut retired_path_ids).is_ok());
+        assert_eq!(ids.dcids.len(), 1);
+    }
+
+    #[test]
+    fn new_dcid_partial_retire_out_of_order() {
+        let (scid, _) = create_cid_and_reset_token(16);
+        let (dcid, _) = create_cid_and_reset_token(16);
+
+        let mut retired_path_ids = SmallVec::new();
+
+        let mut ids = ConnectionIdentifiers::new(5, &scid, 0, None);
+        ids.set_initial_dcid(dcid, None, Some(0));
+
+        assert_eq!(ids.available_dcids(), 0);
+        assert_eq!(ids.dcids.len(), 1);
+
+        // Insert 5 DCIDs where some are out of order
+        let seq_nums = [5, 3, 2, 19, 8];
+        for &seq in &seq_nums {
+            let (dcid, rt) = create_cid_and_reset_token(16);
+            assert!(ids
+                .new_dcid(dcid, seq, rt, 1, &mut retired_path_ids)
+                .is_ok());
+        }
+        assert_eq!(ids.dcids.len(), 5);
+
+        // Trigger a retire of sequence numbers 2 and 3, inserting #20
+        let (dcid, rt) = create_cid_and_reset_token(16);
+        assert!(ids.new_dcid(dcid, 20, rt, 4, &mut retired_path_ids).is_ok());
+        assert_eq!(ids.dcids.len(), 4);
+        assert!(ids.get_dcid(20).is_ok());
+
+        for &seq in &seq_nums {
+            let dcid = ids.get_dcid(seq);
+            assert_eq!(dcid.is_ok(), seq >= 4);
+        }
+
+        // Check that the DCID deque maintains insertion order
+        let seq_iter = ids.dcids.inner.iter().map(|e| e.seq);
+        for (seq, expected) in seq_iter.zip([5, 19, 8, 20]) {
+            assert_eq!(seq, expected);
+        }
     }
 
     #[test]
@@ -1072,8 +1131,17 @@ mod tests {
         assert_eq!(ids.pop_retired_scid(), None);
 
         assert_eq!(ids.retire_scid(1, &scid3), Ok(None));
+        assert_eq!(ids.scids.len(), 1);
+
+        // The peer may retransmit RETIRE_CONNECTION_ID.
+        assert_eq!(ids.retire_scid(1, &scid3), Ok(None));
+        assert_eq!(ids.scids.len(), 1);
 
         assert_eq!(ids.pop_retired_scid(), Some(scid2));
         assert_eq!(ids.pop_retired_scid(), None);
+
+        // The last SCID cannot be retired.
+        assert_eq!(ids.retire_scid(2, &scid3), Err(Error::OutOfIdentifiers));
+        assert_eq!(ids.scids.len(), 1);
     }
 }

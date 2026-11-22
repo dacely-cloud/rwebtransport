@@ -14,6 +14,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mio::net::UdpSocket;
 use mio::{Events, Interest, Poll};
@@ -21,25 +22,22 @@ use mio::{Events, Interest, Poll};
 use wtcore::h3;
 
 use crate::config::build_server_config;
-use crate::driver::{DriverShared, SOCKET_TOKEN};
+use crate::driver::{
+    is_udp_port_unreachable, DriverShared, MAX_INFLIGHT_BATCHES, MAX_RECV_PER_WAKE,
+    MAX_RECV_UDP_PAYLOAD, SOCKET_TOKEN,
+};
 use crate::parser_memory::ParserMemory;
-use crate::session::{Ev, WtSession};
+use crate::session::{Ev, ReceiveBudget, WtSession};
 
 const LOCAL_CONN_ID_LEN: usize = 16;
-const MAX_INFLIGHT_BATCHES: i64 = 128;
 
-/// Hard cap on concurrent QUIC connections so a hostile client (or spoofed
-/// source addresses) cannot grow the connection table without bound.
-const MAX_CONNECTIONS: usize = 16_384;
+/// Cap live transport state, including incomplete handshakes and draining connections.
+const MAX_CONNECTIONS: usize = 256;
+const SESSION_SETUP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Aggregate allocation capacity of HTTP/3, classification and capsule parser
 /// buffers across all connections, including handshakes and draining sessions.
 const MAX_PARSER_MEMORY: usize = 64 * 1024 * 1024;
-
-/// Maximum UDP packets read per event-loop wake before yielding to the rest of
-/// the loop (timeouts, commands, reaping). Bounds per-wake work so a sustained
-/// inbound flood cannot starve `Shutdown` handling or idle-connection reaping.
-const MAX_RECV_PER_WAKE: usize = 1024;
 
 /// Everything the server thread needs to start listening.
 pub struct ServerSetup {
@@ -165,7 +163,8 @@ struct ServerConn {
     conn: quiche::Connection,
     session: WtSession,
     session_id: u64,
-    closed_emitted: bool,
+    setup_deadline: Option<Instant>,
+    max_datagram_size: usize,
 }
 
 /// Server thread entry point, wrapped in a panic boundary.
@@ -202,10 +201,17 @@ const TOKEN_TAG_LEN: usize = 16;
 /// token is bound to. A spoofed source can never receive the Retry, and the tag
 /// is keyed by a per-process secret it does not know, so it cannot forge one.
 fn addr_identity(src: &SocketAddr) -> Vec<u8> {
-    let mut id = match src.ip() {
-        std::net::IpAddr::V4(a) => a.octets().to_vec(),
-        std::net::IpAddr::V6(a) => a.octets().to_vec(),
-    };
+    let mut id = Vec::with_capacity(19);
+    match src.ip() {
+        std::net::IpAddr::V4(a) => {
+            id.push(4);
+            id.extend_from_slice(&a.octets());
+        }
+        std::net::IpAddr::V6(a) => {
+            id.push(6);
+            id.extend_from_slice(&a.octets());
+        }
+    }
     id.extend_from_slice(&src.port().to_be_bytes());
     id
 }
@@ -236,85 +242,55 @@ fn hmac_sha256(secret: &[u8], data: &[u8]) -> [u8; 32] {
     boring::sha::sha256(&outer)
 }
 
-/// Constant-time byte comparison so token validation does not leak the tag via
-/// timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+struct RetryTokens {
+    secret: [u8; 32],
+    started: Instant,
 }
 
-/// Mint a stateless Retry token that authenticates the client's source address
-/// and carries the original destination connection id. The token is
-/// `b"rwt1" || orig_dcid || HMAC(secret, addr || orig_dcid)[..16]`. Because the
-/// tag is keyed by a secret known only to this process, a spoofed source cannot
-/// forge a token it never received, which is what makes the Retry actually
-/// prevent source-address spoofing (reflection) and state exhaustion rather than
-/// just being a formality.
-fn mint_token(secret: &[u8], orig_dcid: &[u8], src: &SocketAddr) -> Vec<u8> {
-    let mut mac_input = addr_identity(src);
-    mac_input.extend_from_slice(orig_dcid);
-    let tag = hmac_sha256(secret, &mac_input);
-    let mut token = Vec::with_capacity(4 + orig_dcid.len() + TOKEN_TAG_LEN);
-    token.extend_from_slice(b"rwt1");
-    token.extend_from_slice(orig_dcid);
-    token.extend_from_slice(&tag[..TOKEN_TAG_LEN]);
-    token
-}
+impl RetryTokens {
+    const TTL: Duration = Duration::from_secs(10);
 
-/// Validate a Retry token against `src` and recover the original destination
-/// connection id. Fails closed on any mismatch (forged/replayed/truncated).
-fn validate_token<'a>(
-    secret: &[u8],
-    src: &SocketAddr,
-    token: &'a [u8],
-) -> Option<quiche::ConnectionId<'a>> {
-    let rest = token.strip_prefix(b"rwt1")?;
-    if rest.len() < TOKEN_TAG_LEN {
-        return None;
+    /// Authenticate the timestamp and original DCID, binding the token to both
+    /// the source address and the DCID that this Retry issued.
+    fn tag(&self, src: &SocketAddr, retry_scid: &[u8], body: &[u8]) -> [u8; 32] {
+        let mut input = addr_identity(src);
+        input.extend_from_slice(retry_scid);
+        input.extend_from_slice(body);
+        hmac_sha256(&self.secret, &input)
     }
-    let (orig_dcid, tag) = rest.split_at(rest.len() - TOKEN_TAG_LEN);
-    let mut mac_input = addr_identity(src);
-    mac_input.extend_from_slice(orig_dcid);
-    let expected = hmac_sha256(secret, &mac_input);
-    if !constant_time_eq(&expected[..TOKEN_TAG_LEN], tag) {
-        return None;
-    }
-    Some(quiche::ConnectionId::from_ref(orig_dcid))
-}
 
-/// A per-process random secret keying the Retry-token HMAC. Regenerated on every
-/// start, so tokens are unforgeable and do not survive a restart.
-fn random_secret() -> [u8; 32] {
-    let mut b = [0u8; 32];
-    if getrandom::getrandom(&mut b).is_err() {
-        let seed: u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let s = seed.to_le_bytes();
-        for (i, slot) in b.iter_mut().enumerate() {
-            *slot = s[i % s.len()];
+    fn mint(&self, src: &SocketAddr, retry_scid: &[u8], orig_dcid: &[u8]) -> Vec<u8> {
+        let mut token = self.started.elapsed().as_secs().to_be_bytes().to_vec();
+        token.extend_from_slice(orig_dcid);
+        token.extend_from_slice(&self.tag(src, retry_scid, &token)[..TOKEN_TAG_LEN]);
+        token
+    }
+
+    fn validate<'a>(
+        &self,
+        src: &SocketAddr,
+        retry_scid: &[u8],
+        token: &'a [u8],
+    ) -> Option<quiche::ConnectionId<'a>> {
+        const TIMESTAMP_LEN: usize = size_of::<u64>();
+        if retry_scid.len() != LOCAL_CONN_ID_LEN
+            || !(TIMESTAMP_LEN + 8 + TOKEN_TAG_LEN
+                ..=TIMESTAMP_LEN + quiche::MAX_CONN_ID_LEN + TOKEN_TAG_LEN)
+                .contains(&token.len())
+        {
+            return None;
         }
+        let (body, tag) = token.split_at(token.len() - TOKEN_TAG_LEN);
+        let (issued, orig_dcid) = body.split_at(TIMESTAMP_LEN);
+        let issued = u64::from_be_bytes(issued.try_into().ok()?);
+        let age = self.started.elapsed().as_secs().checked_sub(issued)?;
+        if age > Self::TTL.as_secs()
+            || !boring::memcmp::eq(&self.tag(src, retry_scid, body)[..TOKEN_TAG_LEN], tag)
+        {
+            return None;
+        }
+        Some(quiche::ConnectionId::from_ref(orig_dcid))
     }
-    b
-}
-
-fn random_scid() -> [u8; LOCAL_CONN_ID_LEN] {
-    let mut b = [0u8; LOCAL_CONN_ID_LEN];
-    if getrandom::getrandom(&mut b).is_err() {
-        let seed: u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        b.copy_from_slice(&seed.to_le_bytes());
-    }
-    b
 }
 
 fn run_inner(
@@ -367,6 +343,17 @@ fn run_inner(
         return;
     }
 
+    let mut secret = [0; 32];
+    if let Err(e) = getrandom::fill(&mut secret) {
+        sink.emit(vec![ServerMsg::ServerError(format!(
+            "Retry key generation: {e}"
+        ))]);
+        return;
+    }
+    let tokens = RetryTokens {
+        secret,
+        started: Instant::now(),
+    };
     sink.emit(vec![ServerMsg::Listening(local_addr.port())]);
 
     let mut events = Events::with_capacity(1024);
@@ -379,32 +366,51 @@ fn run_inner(
     let mut next_session_id: u64 = 1;
     let parser_memory = ParserMemory::new(MAX_PARSER_MEMORY);
 
-    // Per-process secret keying the stateless Retry token (see mint_token).
-    let token_secret = random_secret();
+    let mut udp_pending = false;
+    let mut read_pending = false;
+    let mut next_connection: usize = 0;
 
     loop {
-        let timeout = clients.values().filter_map(|c| c.conn.timeout()).min();
-        if poll.poll(&mut events, timeout).is_err() {
-            continue;
+        let can_read = shared.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT_BATCHES;
+        let timeout = if udp_pending || (read_pending && can_read) {
+            Some(Duration::ZERO)
+        } else {
+            let now = Instant::now();
+            clients
+                .values()
+                .flat_map(|c| {
+                    [
+                        c.conn.timeout(),
+                        c.setup_deadline.map(|d| d.saturating_duration_since(now)),
+                    ]
+                })
+                .flatten()
+                .min()
+        };
+        if let Err(e) = poll.poll(&mut events, timeout) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            sink.emit(vec![ServerMsg::ServerError(format!("poll error: {e}"))]);
+            return;
         }
 
         let mut out: Vec<ServerMsg> = Vec::new();
 
         // 1. Read datagrams and route them, up to a per-wake budget so a flood
         // cannot starve the rest of the loop (commands, timeouts, reaping).
-        let mut got_packet = false;
         let mut budget = MAX_RECV_PER_WAKE;
-        loop {
-            if budget == 0 {
-                break;
-            }
+        while budget > 0 {
             budget -= 1;
             let (len, from) = match socket.recv_from(&mut recv_buf) {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if is_udp_port_unreachable(e) => continue,
                 Err(_) => break,
             };
-            got_packet = true;
+            if len > MAX_RECV_UDP_PAYLOAD {
+                continue;
+            }
             let pkt = &mut recv_buf[..len];
             let hdr = match quiche::Header::from_slice(pkt, LOCAL_CONN_ID_LEN) {
                 Ok(h) => h,
@@ -414,7 +420,11 @@ fn run_inner(
             let scid = match routing.get(&hdr.dcid.to_vec()).cloned() {
                 Some(s) => s,
                 None => {
-                    if hdr.ty != quiche::Type::Initial {
+                    if hdr.ty != quiche::Type::Initial
+                        || len < 1200
+                        || !quiche::version_is_supported(hdr.version)
+                        || hdr.dcid.len() < 8
+                    {
                         continue;
                     }
                     // Cap concurrent connections to bound memory under a flood.
@@ -429,9 +439,12 @@ fn run_inner(
                         // No address validation yet: reply with a stateless Retry.
                         // We create no connection state (and do not amplify) for a
                         // source that has not proven it owns its address.
-                        let new_scid = random_scid();
+                        let mut new_scid = [0; LOCAL_CONN_ID_LEN];
+                        if getrandom::fill(&mut new_scid).is_err() {
+                            continue;
+                        }
                         let new_scid_id = quiche::ConnectionId::from_ref(&new_scid);
-                        let retry_token = mint_token(&token_secret, &hdr.dcid, &from);
+                        let retry_token = tokens.mint(&from, &new_scid, &hdr.dcid);
                         if let Ok(len) = quiche::retry(
                             &hdr.scid,
                             &hdr.dcid,
@@ -447,7 +460,7 @@ fn run_inner(
 
                     // The client echoed a Retry token: validate it before we
                     // allocate any connection state.
-                    let Some(odcid) = validate_token(&token_secret, &from, token) else {
+                    let Some(odcid) = tokens.validate(&from, &hdr.dcid, token) else {
                         continue;
                     };
                     // Our Retry SCID, echoed back as this Initial's DCID.
@@ -476,7 +489,8 @@ fn run_inner(
                                 parser_memory.clone(),
                             ),
                             session_id,
-                            closed_emitted: false,
+                            setup_deadline: Some(Instant::now() + SESSION_SETUP_TIMEOUT),
+                            max_datagram_size: 0,
                         },
                     );
                     key
@@ -491,13 +505,24 @@ fn run_inner(
                 let _ = server.conn.recv(pkt, info);
             }
         }
+        udp_pending = budget == 0;
 
         // 2. Fire elapsed timeouts for every connection. quiche's on_timeout is a
         // no-op unless a timer is actually due, and it must run even while packets
         // keep arriving so idle/half-open connections are reaped under a flood.
-        let _ = got_packet;
+        let now = Instant::now();
         for server in clients.values_mut() {
             server.conn.on_timeout();
+            if server
+                .setup_deadline
+                .is_some_and(|deadline| now >= deadline)
+            {
+                // The deadline covers both QUIC handshake and Extended CONNECT.
+                server.setup_deadline = None;
+                let _ = server
+                    .conn
+                    .close(true, h3::H3_NO_ERROR, b"session setup timed out");
+            }
         }
 
         // 3. Drain commands.
@@ -518,20 +543,34 @@ fn run_inner(
         }
 
         // 4. Drive every connection.
-        let backpressured = shared.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_BATCHES;
-        for server in clients.values_mut() {
+        let can_read = shared.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT_BATCHES;
+        let mut budget = ReceiveBudget::new();
+        let mut ordered: Vec<_> = clients.values_mut().collect();
+        let start = next_connection.checked_rem(ordered.len()).unwrap_or(0);
+        ordered.rotate_left(start);
+        read_pending = false;
+        for (index, server) in ordered.into_iter().enumerate() {
+            if server.conn.is_closed() || server.conn.local_error().is_some() {
+                flush_send(&mut server.conn, &socket, &mut send_buf);
+                continue;
+            }
             let mut evs: Vec<Ev> = Vec::new();
             if server.conn.is_established() {
-                server.session.on_established();
-            }
-            if !backpressured {
-                server.session.on_datagrams(&mut server.conn, &mut evs);
-            }
-            let readable: Vec<u64> = server.conn.readable().collect();
-            for id in readable {
                 server
                     .session
-                    .on_readable(&mut server.conn, id, backpressured, &mut evs);
+                    .on_established(server.conn.reliable_stream_reset_negotiated());
+            }
+            if can_read && !budget.exhausted() {
+                server
+                    .session
+                    .read_pending(&mut server.conn, &mut budget, &mut evs);
+                if budget.exhausted() {
+                    next_connection = start + index + 1;
+                    read_pending = true;
+                }
+            }
+            if server.session.is_ready() {
+                server.setup_deadline = None;
             }
             server.session.flush(&mut server.conn, &mut evs);
 
@@ -543,10 +582,12 @@ fn run_inner(
                 let _ = server.conn.close(true, h3::H3_NO_ERROR, b"");
             }
 
-            if let Some(sz) = server.conn.dgram_max_writable_len() {
-                shared
-                    .max_datagram_size
-                    .store(sz.saturating_sub(1), Ordering::Relaxed);
+            if server.session.is_ready() && !server.session.is_closed() {
+                let size = server.session.max_datagram_size(&server.conn);
+                if size != server.max_datagram_size {
+                    server.max_datagram_size = size;
+                    evs.push(Ev::DatagramSize(size));
+                }
             }
 
             for ev in evs {
@@ -561,24 +602,21 @@ fn run_inner(
 
         // 5. Reap closed connections (emit a final Closed for the session).
         for server in clients.values_mut() {
-            if server.conn.is_closed() && !server.closed_emitted {
-                server.closed_emitted = true;
-                if !server.session.is_closed() {
-                    let mut evs = Vec::new();
-                    if let Some((code, reason)) = server.session.local_close_info() {
-                        // Locally initiated graceful WebTransport close: surface the
-                        // WT code/reason (the wire close used H3_NO_ERROR).
-                        server.session.mark_closed(&mut evs, code, reason, false);
-                    } else {
-                        let (code, reason, remote, err) = closure_info(&server.conn);
-                        if let Some(msg) = err {
-                            evs.push(Ev::Error(msg));
-                        }
-                        server.session.mark_closed(&mut evs, code, reason, remote);
+            if server.conn.is_closed() && server.session.is_ready() && !server.session.is_closed() {
+                let mut evs = Vec::new();
+                if let Some((code, reason)) = server.session.local_close_info() {
+                    // Locally initiated graceful WebTransport close: surface the
+                    // WT code/reason (the wire close used H3_NO_ERROR).
+                    server.session.mark_closed(&mut evs, code, reason, false);
+                } else {
+                    let (code, reason, remote, err) = closure_info(&server.conn);
+                    if let Some(msg) = err {
+                        evs.push(Ev::Error(msg));
                     }
-                    for ev in evs {
-                        out.push(ServerMsg::Session(server.session_id, ev));
-                    }
+                    server.session.mark_closed(&mut evs, code, reason, remote);
+                }
+                for ev in evs {
+                    out.push(ServerMsg::Session(server.session_id, ev));
                 }
             }
         }
@@ -665,7 +703,7 @@ fn apply_command(
             context,
             length,
             ..
-        } => evs.push(crate::session::build_keying_material(
+        } => evs.push(server.session.build_keying_material(
             &mut server.conn,
             request_id,
             &label,
@@ -759,54 +797,31 @@ mod tests {
     }
 
     #[test]
-    fn token_roundtrip_recovers_dcid() {
-        let secret = [7u8; 32];
-        let dcid = b"\x11\x22\x33\x44\x55\x66\x77\x88";
+    fn retry_token_authenticates_address_and_connection() {
+        let mut tokens = RetryTokens {
+            secret: [7; 32],
+            started: Instant::now(),
+        };
         let src = addr("192.0.2.10:4433");
-        let token = mint_token(&secret, dcid, &src);
-        let recovered = validate_token(&secret, &src, &token).expect("valid token");
-        assert_eq!(recovered.as_ref(), &dcid[..]);
-    }
-
-    #[test]
-    fn token_rejected_for_different_source_address() {
-        let secret = [7u8; 32];
-        let dcid = b"abcdefghij";
-        let token = mint_token(&secret, dcid, &addr("192.0.2.10:4433"));
-        // Spoofed source IP: the whole point of the Retry.
-        assert!(validate_token(&secret, &addr("192.0.2.11:4433"), &token).is_none());
-        // Same IP, different port: still not the address the token was minted for.
-        assert!(validate_token(&secret, &addr("192.0.2.10:5555"), &token).is_none());
-    }
-
-    #[test]
-    fn token_rejected_under_a_different_secret() {
-        let dcid = b"abcdefghij";
-        let src = addr("198.51.100.7:443");
-        let token = mint_token(&[1u8; 32], dcid, &src);
-        // A server that restarted (new secret) rejects the stale token.
-        assert!(validate_token(&[2u8; 32], &src, &token).is_none());
-    }
-
-    #[test]
-    fn forged_and_truncated_tokens_are_rejected() {
-        let secret = [9u8; 32];
-        let src = addr("198.51.100.7:443");
-        // Attacker who does not know the secret guesses the layout with a zero tag.
-        let mut forged = Vec::new();
-        forged.extend_from_slice(b"rwt1");
-        forged.extend_from_slice(b"deadbeefdcid");
-        forged.extend_from_slice(&[0u8; TOKEN_TAG_LEN]);
-        assert!(validate_token(&secret, &src, &forged).is_none());
-        // Too short to hold a tag, wrong prefix, empty.
-        assert!(validate_token(&secret, &src, b"rwt1short").is_none());
-        assert!(validate_token(&secret, &src, b"nope").is_none());
-        assert!(validate_token(&secret, &src, b"").is_none());
-        // A valid token with a single tag byte flipped.
-        let mut token = mint_token(&secret, b"abcdefghij", &src);
-        let last = token.len() - 1;
-        token[last] ^= 0xff;
-        assert!(validate_token(&secret, &src, &token).is_none());
+        let dcid = b"original id";
+        let scid = [42; LOCAL_CONN_ID_LEN];
+        let token = tokens.mint(&src, &scid, dcid);
+        assert_eq!(tokens.validate(&src, &scid, &token).unwrap().as_ref(), dcid);
+        assert!(tokens
+            .validate(&addr("192.0.2.11:4433"), &scid, &token)
+            .is_none());
+        assert!(tokens
+            .validate(&addr("192.0.2.10:1234"), &scid, &token)
+            .is_none());
+        assert!(tokens
+            .validate(&src, &[41; LOCAL_CONN_ID_LEN], &token)
+            .is_none());
+        assert!(tokens.validate(&src, &scid, &token[..7]).is_none());
+        let mut altered = token.clone();
+        *altered.last_mut().unwrap() ^= 1;
+        assert!(tokens.validate(&src, &scid, &altered).is_none());
+        tokens.started -= RetryTokens::TTL + Duration::from_secs(1);
+        assert!(tokens.validate(&src, &scid, &token).is_none());
     }
 
     #[test]

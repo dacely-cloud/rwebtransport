@@ -28,6 +28,7 @@ impl ParserMemory {
         })
     }
 
+    #[allow(deprecated)] // Use the atomic API available on older Rust toolchains.
     fn reserve(&self, bytes: usize) -> bool {
         let reserved = self
             .used

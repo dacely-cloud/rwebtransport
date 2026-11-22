@@ -59,11 +59,16 @@ impl ModeImpl for Startup {
     }
 
     fn on_congestion_event(
-        mut self, _prior_in_flight: usize, event_time: Instant,
-        _acked_packets: &[Acked], _lost_packets: &[Lost],
+        mut self,
+        _prior_in_flight: usize,
+        event_time: Instant,
+        _acked_packets: &[Acked],
+        _lost_packets: &[Lost],
         congestion_event: &mut BBRv2CongestionEvent,
-        _target_bytes_inflight: usize, params: &Params,
-        recovery_stats: &mut RecoveryStats, cwnd: usize,
+        _target_bytes_inflight: usize,
+        params: &Params,
+        recovery_stats: &mut RecoveryStats,
+        cwnd: usize,
     ) -> Mode {
         if self.model.full_bandwidth_reached() {
             return self.into_drain(event_time, Some(congestion_event), params);
@@ -73,8 +78,7 @@ impl ModeImpl for Startup {
             return Mode::Startup(self);
         }
 
-        let has_bandwidth_growth =
-            self.model.has_bandwidth_growth(congestion_event, params);
+        let has_bandwidth_growth = self.model.has_bandwidth_growth(congestion_event, params);
         if self.model.full_bandwidth_reached() {
             recovery_stats.set_startup_exit(StartupExit::new(
                 cwnd,
@@ -83,8 +87,7 @@ impl ModeImpl for Startup {
             ));
         }
 
-        let check_persisten_queue =
-            params.max_startup_queue_rounds > 0 && !has_bandwidth_growth;
+        let check_persisten_queue = params.max_startup_queue_rounds > 0 && !has_bandwidth_growth;
         if check_persisten_queue {
             // https://github.com/google/quiche/blob/27eca0257490df89d2bd2c2a8bcea15565e7831c/quiche/quic/core/congestion_control/bbr2_startup.cc#L60-L62
             // 1.75 is less than the 2x CWND gain, but substantially more than
@@ -101,8 +104,8 @@ impl ModeImpl for Startup {
         }
 
         // TCP BBR always exits upon excessive losses. QUIC BBRv1 does not exit
-        // upon excessive losses, if enough bandwidth growth is observed or if the
-        // sample was app limited.
+        // upon excessive losses if enough bandwidth growth is observed or the
+        // sample was app-limited.
         let check_for_excessive_loss = !congestion_event.last_packet_send_state.is_app_limited &&
                 !has_bandwidth_growth &&
                 // check for excessive loss only if not exiting for other reasons
@@ -135,22 +138,24 @@ impl ModeImpl for Startup {
     }
 
     fn on_exit_quiescence(
-        self, _now: Instant, _quiescence_start_time: Instant, _params: &Params,
+        self,
+        _now: Instant,
+        _quiescence_start_time: Instant,
+        _params: &Params,
     ) -> Mode {
         Mode::Startup(self)
     }
 
     fn enter(
-        &mut self, _now: Instant,
-        _congestion_event: Option<&BBRv2CongestionEvent>, _params: &Params,
+        &mut self,
+        _now: Instant,
+        _congestion_event: Option<&BBRv2CongestionEvent>,
+        _params: &Params,
     ) {
         unreachable!("Enter should never be called for startup")
     }
 
-    fn leave(
-        &mut self, _now: Instant,
-        _congestion_event: Option<&BBRv2CongestionEvent>,
-    ) {
+    fn leave(&mut self, _now: Instant, _congestion_event: Option<&BBRv2CongestionEvent>) {
         // Clear bandwidth_lo if it's set during STARTUP.
         self.model.clear_bandwidth_lo();
     }
@@ -158,7 +163,9 @@ impl ModeImpl for Startup {
 
 impl Startup {
     fn into_drain(
-        mut self, now: Instant, congestion_event: Option<&BBRv2CongestionEvent>,
+        mut self,
+        now: Instant,
+        congestion_event: Option<&BBRv2CongestionEvent>,
         params: &Params,
     ) -> Mode {
         self.leave(now, congestion_event);
@@ -168,19 +175,19 @@ impl Startup {
     }
 
     fn check_excessive_losses(
-        &mut self, congestion_event: &mut BBRv2CongestionEvent, params: &Params,
+        &mut self,
+        congestion_event: &mut BBRv2CongestionEvent,
+        params: &Params,
     ) {
         // At the end of a round trip. Check if loss is too high in this round.
-        if self.model.is_inflight_too_high(
-            congestion_event,
-            params.startup_full_loss_count,
-            params,
-        ) {
+        if self
+            .model
+            .is_inflight_too_high(congestion_event, params.startup_full_loss_count, params)
+        {
             let mut new_inflight_hi = self.model.bdp0();
 
             if params.startup_loss_exit_use_max_delivered_for_inflight_hi {
-                new_inflight_hi = new_inflight_hi
-                    .max(self.model.max_bytes_delivered_in_round());
+                new_inflight_hi = new_inflight_hi.max(self.model.max_bytes_delivered_in_round());
             }
 
             self.model.set_inflight_hi(new_inflight_hi);

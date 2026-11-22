@@ -451,7 +451,6 @@ use server::{ServerCommand, ServerEventSink, ServerMsg, ServerSetup};
 struct ServerHandle {
     tx: Mutex<Option<Sender<ServerCommand>>>,
     waker: Arc<mio::Waker>,
-    shared: Arc<DriverShared>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -601,7 +600,6 @@ fn server_listen(mut cx: FunctionContext) -> JsResult<JsBox<ServerHandle>> {
     Ok(cx.boxed(ServerHandle {
         tx: Mutex::new(Some(tx)),
         waker,
-        shared,
         thread: Mutex::new(Some(thread)),
     }))
 }
@@ -684,12 +682,6 @@ fn server_send_datagram(mut cx: FunctionContext) -> JsResult<JsUndefined> {
         request_id,
     });
     Ok(cx.undefined())
-}
-
-fn server_max_datagram_size(mut cx: FunctionContext) -> JsResult<JsNumber> {
-    let handle = cx.argument::<JsBox<ServerHandle>>(0)?;
-    let n = handle.shared.max_datagram_size.load(Ordering::Relaxed);
-    Ok(cx.number(n as f64))
 }
 
 fn server_close_session(mut cx: FunctionContext) -> JsResult<JsUndefined> {
@@ -886,6 +878,10 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
             set_str(cx, &obj, "type", "datagram")?;
             set_buf(cx, &obj, "data", data)?;
         }
+        Ev::DatagramSize(size) => {
+            set_str(cx, &obj, "type", "datagramSize")?;
+            set_num(cx, &obj, "size", *size as f64)?;
+        }
         Ev::IncomingStream { id, bidi } => {
             set_str(cx, &obj, "type", "stream")?;
             set_num(cx, &obj, "streamId", *id as f64)?;
@@ -915,9 +911,13 @@ fn ev_to_js<'a>(cx: &mut TaskContext<'a>, ev: &Ev) -> JsResult<'a, JsObject> {
             set_num(cx, &obj, "requestId", *request_id as f64)?;
             set_num(cx, &obj, "streamId", *id as f64)?;
         }
-        Ev::WriteAck { request_id } => {
+        Ev::WriteAck {
+            request_id,
+            accepted,
+        } => {
             set_str(cx, &obj, "type", "writeAck")?;
             set_num(cx, &obj, "requestId", *request_id as f64)?;
+            set_bool(cx, &obj, "accepted", *accepted)?;
         }
         Ev::DatagramAck { request_id, sent } => {
             set_str(cx, &obj, "type", "datagramAck")?;
@@ -1013,7 +1013,6 @@ fn main(mut cx: ModuleContext) -> NeonResult<()> {
     cx.export_function("serverStopSending", server_stop_sending)?;
     cx.export_function("serverSetPaused", server_set_paused)?;
     cx.export_function("serverSendDatagram", server_send_datagram)?;
-    cx.export_function("serverMaxDatagramSize", server_max_datagram_size)?;
     cx.export_function("serverCloseSession", server_close_session)?;
     cx.export_function("serverDrain", server_drain)?;
     cx.export_function("serverGetStats", server_get_stats)?;

@@ -50,31 +50,28 @@ pub extern "C" fn quiche_h3_config_new() -> *mut h3::Config {
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_config_set_max_field_section_size(
-    config: &mut h3::Config, v: u64,
-) {
+pub extern "C" fn quiche_h3_config_set_max_field_section_size(config: &mut h3::Config, v: u64) {
     config.set_max_field_section_size(v);
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_config_set_qpack_max_table_capacity(
-    config: &mut h3::Config, v: u64,
-) {
+pub extern "C" fn quiche_h3_config_set_qpack_max_table_capacity(config: &mut h3::Config, v: u64) {
     config.set_qpack_max_table_capacity(v);
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_config_set_qpack_blocked_streams(
-    config: &mut h3::Config, v: u64,
-) {
+pub extern "C" fn quiche_h3_config_set_qpack_blocked_streams(config: &mut h3::Config, v: u64) {
     config.set_qpack_blocked_streams(v);
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_config_enable_extended_connect(
-    config: &mut h3::Config, enabled: bool,
-) {
+pub extern "C" fn quiche_h3_config_enable_extended_connect(config: &mut h3::Config, enabled: bool) {
     config.enable_extended_connect(enabled);
+}
+
+#[no_mangle]
+pub extern "C" fn quiche_h3_config_set_max_priority_update_size(config: &mut h3::Config, v: u64) {
+    config.set_max_priority_update_size(v);
 }
 
 #[no_mangle]
@@ -86,7 +83,8 @@ pub extern "C" fn quiche_h3_config_free(config: *mut h3::Config) {
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_conn_new_with_transport(
-    quic_conn: &mut Connection, config: &mut h3::Config,
+    quic_conn: &mut Connection,
+    config: &mut h3::Config,
 ) -> *mut h3::Connection {
     match h3::Connection::with_transport(quic_conn, config) {
         Ok(c) => Box::into_raw(Box::new(c)),
@@ -112,7 +110,7 @@ pub extern "C" fn quiche_h3_for_each_setting(
             }
 
             0
-        },
+        }
 
         None => -1,
     }
@@ -120,7 +118,8 @@ pub extern "C" fn quiche_h3_for_each_setting(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_conn_poll(
-    conn: &mut h3::Connection, quic_conn: &mut Connection,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
     ev: *mut *const h3::Event,
 ) -> i64 {
     match conn.poll(quic_conn) {
@@ -130,7 +129,7 @@ pub extern "C" fn quiche_h3_conn_poll(
             }
 
             id as i64
-        },
+        }
 
         Err(e) => e.to_c() as i64,
     }
@@ -168,7 +167,7 @@ pub extern "C" fn quiche_h3_event_for_each_header(
     argp: *mut c_void,
 ) -> c_int {
     match ev {
-        h3::Event::Headers { list, .. } =>
+        h3::Event::Headers { list, .. } => {
             for h in list {
                 let rc = cb(
                     h.name().as_ptr(),
@@ -181,7 +180,8 @@ pub extern "C" fn quiche_h3_event_for_each_header(
                 if rc != 0 {
                     return rc;
                 }
-            },
+            }
+        }
 
         _ => unreachable!(),
     }
@@ -190,9 +190,7 @@ pub extern "C" fn quiche_h3_event_for_each_header(
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_event_headers_has_more_frames(
-    ev: &h3::Event,
-) -> bool {
+pub extern "C" fn quiche_h3_event_headers_has_more_frames(ev: &h3::Event) -> bool {
     match ev {
         h3::Event::Headers { more_frames, .. } => *more_frames,
 
@@ -201,9 +199,7 @@ pub extern "C" fn quiche_h3_event_headers_has_more_frames(
 }
 
 #[no_mangle]
-pub extern "C" fn quiche_h3_extended_connect_enabled_by_peer(
-    conn: &h3::Connection,
-) -> bool {
+pub extern "C" fn quiche_h3_extended_connect_enabled_by_peer(conn: &h3::Connection) -> bool {
     conn.extended_connect_enabled_by_peer()
 }
 
@@ -225,8 +221,11 @@ pub struct Header {
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_request(
-    conn: &mut h3::Connection, quic_conn: &mut Connection,
-    headers: *const Header, headers_len: size_t, fin: bool,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    headers: *const Header,
+    headers_len: size_t,
+    fin: bool,
 ) -> i64 {
     let req_headers = headers_from_ptr(headers, headers_len);
 
@@ -239,8 +238,12 @@ pub extern "C" fn quiche_h3_send_request(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_response(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
-    headers: *const Header, headers_len: size_t, fin: bool,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
+    headers: *const Header,
+    headers_len: size_t,
+    fin: bool,
 ) -> c_int {
     let resp_headers = headers_from_ptr(headers, headers_len);
 
@@ -253,18 +256,17 @@ pub extern "C" fn quiche_h3_send_response(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_response_with_priority(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
-    headers: *const Header, headers_len: size_t, priority: &Priority, fin: bool,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
+    headers: *const Header,
+    headers_len: size_t,
+    priority: &Priority,
+    fin: bool,
 ) -> c_int {
     let resp_headers = headers_from_ptr(headers, headers_len);
 
-    match conn.send_response_with_priority(
-        quic_conn,
-        stream_id,
-        &resp_headers,
-        priority,
-        fin,
-    ) {
+    match conn.send_response_with_priority(quic_conn, stream_id, &resp_headers, priority, fin) {
         Ok(_) => 0,
 
         Err(e) => e.to_c() as c_int,
@@ -273,19 +275,17 @@ pub extern "C" fn quiche_h3_send_response_with_priority(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_additional_headers(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
-    headers: *const Header, headers_len: size_t, is_trailer_section: bool,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
+    headers: *const Header,
+    headers_len: size_t,
+    is_trailer_section: bool,
     fin: bool,
 ) -> c_int {
     let headers = headers_from_ptr(headers, headers_len);
 
-    match conn.send_additional_headers(
-        quic_conn,
-        stream_id,
-        &headers,
-        is_trailer_section,
-        fin,
-    ) {
+    match conn.send_additional_headers(quic_conn, stream_id, &headers, is_trailer_section, fin) {
         Ok(_) => 0,
 
         Err(e) => e.to_c() as c_int,
@@ -294,8 +294,12 @@ pub extern "C" fn quiche_h3_send_additional_headers(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_body(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
-    body: *const u8, body_len: size_t, fin: bool,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
+    body: *const u8,
+    body_len: size_t,
+    fin: bool,
 ) -> ssize_t {
     if body_len > <ssize_t>::MAX as usize {
         panic!("The provided buffer is too large");
@@ -312,8 +316,11 @@ pub extern "C" fn quiche_h3_send_body(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_recv_body(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
-    out: *mut u8, out_len: size_t,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
+    out: *mut u8,
+    out_len: size_t,
 ) -> ssize_t {
     if out_len > <ssize_t>::MAX as usize {
         panic!("The provided buffer is too large");
@@ -330,7 +337,9 @@ pub extern "C" fn quiche_h3_recv_body(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_goaway(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, id: u64,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    id: u64,
 ) -> c_int {
     match conn.send_goaway(quic_conn, id) {
         Ok(()) => 0,
@@ -342,7 +351,9 @@ pub extern "C" fn quiche_h3_send_goaway(
 #[no_mangle]
 #[cfg(feature = "sfv")]
 pub extern "C" fn quiche_h3_parse_extensible_priority(
-    priority: *const u8, priority_len: size_t, parsed: &mut Priority,
+    priority: *const u8,
+    priority_len: size_t,
+    parsed: &mut Priority,
 ) -> c_int {
     let priority = unsafe { slice::from_raw_parts(priority, priority_len) };
 
@@ -351,7 +362,7 @@ pub extern "C" fn quiche_h3_parse_extensible_priority(
             parsed.urgency = v.urgency;
             parsed.incremental = v.incremental;
             0
-        },
+        }
 
         Err(e) => e.to_c() as c_int,
     }
@@ -359,7 +370,9 @@ pub extern "C" fn quiche_h3_parse_extensible_priority(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_send_priority_update_for_request(
-    conn: &mut h3::Connection, quic_conn: &mut Connection, stream_id: u64,
+    conn: &mut h3::Connection,
+    quic_conn: &mut Connection,
+    stream_id: u64,
     priority: &Priority,
 ) -> c_int {
     match conn.send_priority_update_for_request(quic_conn, stream_id, priority) {
@@ -371,7 +384,8 @@ pub extern "C" fn quiche_h3_send_priority_update_for_request(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_take_last_priority_update(
-    conn: &mut h3::Connection, prioritized_element_id: u64,
+    conn: &mut h3::Connection,
+    prioritized_element_id: u64,
     cb: extern "C" fn(
         priority_field_value: *const u8,
         priority_field_value_len: size_t,
@@ -388,7 +402,7 @@ pub extern "C" fn quiche_h3_take_last_priority_update(
             }
 
             0
-        },
+        }
 
         Err(e) => e.to_c() as c_int,
     }
@@ -396,7 +410,8 @@ pub extern "C" fn quiche_h3_take_last_priority_update(
 
 #[no_mangle]
 pub extern "C" fn quiche_h3_dgram_enabled_by_peer(
-    conn: &h3::Connection, quic_conn: &Connection,
+    conn: &h3::Connection,
+    quic_conn: &Connection,
 ) -> bool {
     conn.dgram_enabled_by_peer(quic_conn)
 }
@@ -408,9 +423,7 @@ pub extern "C" fn quiche_h3_conn_free(conn: *mut h3::Connection) {
     }
 }
 
-fn headers_from_ptr<'a>(
-    ptr: *const Header, len: size_t,
-) -> Vec<h3::HeaderRef<'a>> {
+fn headers_from_ptr<'a>(ptr: *const Header, len: size_t) -> Vec<h3::HeaderRef<'a>> {
     let headers = unsafe { slice::from_raw_parts(ptr, len) };
 
     let mut out = Vec::new();

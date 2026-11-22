@@ -35,7 +35,7 @@ function run(cmd, args) {
 }
 
 function main() {
-  const cargoArgs = ['build', '-p', CRATE];
+  const cargoArgs = ['build', '--locked', '-p', CRATE];
   if (!debug) cargoArgs.push('--release');
   // Allow an explicit target (used by cross-compiling CI jobs).
   const target = process.env.CARGO_BUILD_TARGET;
@@ -59,8 +59,15 @@ function main() {
   const plat = process.env.PREBUILD_PLATFORM || process.platform;
   const outDir = path.join(root, 'prebuilds', `${plat}-${arch}`);
   fs.mkdirSync(outDir, { recursive: true });
-  const out = path.join(outDir, 'rwebtransport.node');
-  fs.copyFileSync(artifact, out);
+  const name = process.argv.includes('--fallback') ? 'rwebtransport-local.node' : 'rwebtransport.node';
+  const out = path.join(outDir, name);
+  const temporary = `${out}.${process.pid}.tmp`;
+  try {
+    fs.copyFileSync(artifact, temporary);
+    fs.renameSync(temporary, out);
+  } finally {
+    fs.rmSync(temporary, { force: true });
+  }
   console.error(`copied ${artifact} -> ${out}`);
 }
 

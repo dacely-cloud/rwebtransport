@@ -88,9 +88,7 @@ where
         if match &self.estimates[0] {
             None => true,
             Some(best) if new_sample > best.sample => true,
-            _ =>
-                new_time - self.estimates[2].as_ref().unwrap().time >
-                    self.window_length,
+            _ => new_time - self.estimates[2].as_ref().unwrap().time > self.window_length,
         } {
             return self.reset(new_sample, new_time);
         }
@@ -118,10 +116,8 @@ where
                 sample: new_sample,
                 time: new_time,
             });
-            // Need to iterate one more time. Check if the new best estimate is
-            // outside the window as well, since it may also have been recorded a
-            // long time ago. Don't need to iterate once more since we cover that
-            // case at the beginning of the method.
+            // The new best estimate may also be stale. Check it once more. The
+            // check at the start of the method handles further stale samples.
             if new_time - self.estimates[0].unwrap().time > self.window_length {
                 self.estimates[0] = self.estimates[1];
                 self.estimates[1] = self.estimates[2];
@@ -129,12 +125,11 @@ where
             return;
         }
 
-        if self.estimates[1].unwrap().sample == self.estimates[0].unwrap().sample &&
-            new_time - self.estimates[1].unwrap().time > self.window_length / 4
+        if self.estimates[1].unwrap().sample == self.estimates[0].unwrap().sample
+            && new_time - self.estimates[1].unwrap().time > self.window_length / 4
         {
-            // A quarter of the window has passed without a better sample, so the
-            // second-best estimate is taken from the second quarter of the
-            // window.
+            // No better sample arrived for a quarter of the window, so take the
+            // second-best estimate from the second quarter.
             self.estimates[1] = Some(Sample {
                 sample: new_sample,
                 time: new_time,
@@ -143,8 +138,8 @@ where
             return;
         }
 
-        if self.estimates[2].unwrap().sample == self.estimates[1].unwrap().sample &&
-            new_time - self.estimates[2].unwrap().time > self.window_length / 2
+        if self.estimates[2].unwrap().sample == self.estimates[1].unwrap().sample
+            && new_time - self.estimates[2].unwrap().time > self.window_length / 2
         {
             // We've passed a half of the window without a better estimate, so
             // take a third-best estimate from the second half of the

@@ -242,7 +242,7 @@ export class WebTransportServer {
         const responseHeaderNames: string[] = [];
         const responseHeaderValues: string[] = [];
         for (const [name, value] of Object.entries(options.responseHeaders ?? {})) {
-            responseHeaderNames.push(name);
+            responseHeaderNames.push(name.toLowerCase());
             responseHeaderValues.push(value);
         }
 

@@ -107,9 +107,8 @@ export class WebTransportDatagramDuplexStream {
      *
      * 1. Creates {@link readable} and captures its controller from `start`.
      * 2. Installs a datagram sink that enqueues each received datagram only
-     *    while the controller's `desiredSize` is positive (treating an unknown
-     *    `desiredSize` of `null` as `1`, i.e. room available); datagrams that
-     *    arrive when the queue is full are dropped.
+     *    while the controller's `desiredSize` is positive. Datagrams that
+     *    arrive after cancellation or when the queue is full are dropped.
      * 3. Subscribes to the session's `closed` promise so the inbound stream is
      *    closed on both clean close and error, preventing a pending `read()`
      *    from hanging forever. A double-close is swallowed.
@@ -120,10 +119,14 @@ export class WebTransportDatagramDuplexStream {
         this.session = session;
 
         let rController!: ReadableStreamDefaultController<Uint8Array>;
+        let receiving = true;
         this.readable = new ReadableStream<Uint8Array>(
             {
                 start(c) {
                     rController = c;
+                },
+                cancel() {
+                    receiving = false;
                 },
             },
             new CountQueuingStrategy({ highWaterMark: this.incomingHwm }),
@@ -131,7 +134,7 @@ export class WebTransportDatagramDuplexStream {
 
         session.setDatagramSink((data) => {
             // Unreliable: drop when the inbound queue is already full.
-            if ((rController.desiredSize ?? 1) > 0) {
+            if (receiving && (rController.desiredSize ?? 0) > 0) {
                 rController.enqueue(data);
             } else {
                 session.recordDroppedIncomingDatagram();

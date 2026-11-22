@@ -42,6 +42,7 @@ use crate::recovery::MINIMUM_WINDOW_PACKETS;
 
 pub(crate) static RENO: CongestionControlOps = CongestionControlOps {
     on_init,
+    on_mtu_update: |_| {},
     on_packet_sent,
     on_packets_acked,
     congestion_event,
@@ -55,23 +56,26 @@ pub(crate) static RENO: CongestionControlOps = CongestionControlOps {
 pub fn on_init(_r: &mut Congestion) {}
 
 pub fn on_packet_sent(
-    _r: &mut Congestion, _sent_bytes: usize, _bytes_in_flight: usize,
+    _r: &mut Congestion,
+    _sent_bytes: usize,
+    _bytes_in_flight: usize,
     _now: Instant,
 ) {
 }
 
 fn on_packets_acked(
-    r: &mut Congestion, _bytes_in_flight: usize, packets: &mut Vec<Acked>,
-    now: Instant, rtt_stats: &RttStats,
+    r: &mut Congestion,
+    _bytes_in_flight: usize,
+    packets: &mut Vec<Acked>,
+    now: Instant,
+    rtt_stats: &RttStats,
 ) {
     for pkt in packets.drain(..) {
         on_packet_acked(r, &pkt, now, rtt_stats);
     }
 }
 
-fn on_packet_acked(
-    r: &mut Congestion, packet: &Acked, now: Instant, rtt_stats: &RttStats,
-) {
+fn on_packet_acked(r: &mut Congestion, packet: &Acked, now: Instant, rtt_stats: &RttStats) {
     if r.in_congestion_recovery(packet.time_sent) {
         return;
     }
@@ -107,8 +111,11 @@ fn on_packet_acked(
 }
 
 fn congestion_event(
-    r: &mut Congestion, _bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    r: &mut Congestion,
+    _bytes_in_flight: usize,
+    _lost_bytes: usize,
+    largest_lost_pkt: &Sent,
+    now: Instant,
 ) {
     // Start a new congestion event if packet was sent after the
     // start of the previous congestion recovery period.
@@ -117,16 +124,14 @@ fn congestion_event(
     if !r.in_congestion_recovery(time_sent) {
         r.congestion_recovery_start_time = Some(now);
 
-        r.congestion_window =
-            (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize;
+        r.congestion_window = (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize;
 
         r.congestion_window = cmp::max(
             r.congestion_window,
             r.max_datagram_size * MINIMUM_WINDOW_PACKETS,
         );
 
-        r.bytes_acked_ca =
-            (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize;
+        r.bytes_acked_ca = (r.congestion_window as f64 * LOSS_REDUCTION_FACTOR) as usize;
 
         r.ssthresh.update(r.congestion_window, r.hystart.in_css());
 

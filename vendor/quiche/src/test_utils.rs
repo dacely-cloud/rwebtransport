@@ -30,6 +30,28 @@ use smallvec::smallvec;
 
 use crate::recovery::Sent;
 
+/// Curve preference list that excludes post-quantum groups.
+///
+/// Several tests were written against a pre-PQ world where the ClientHello
+/// fit in a single Initial packet; those tests opt out of PQ to keep that
+/// invariant. See [`config_no_pq`] and
+/// [`Config::set_curves_list`](crate::Config::set_curves_list).
+const NO_PQ_CURVES: &str = "X25519:P-256:P-384";
+
+/// Returns a `Config` equivalent to `Config::new(version)` but with
+/// post-quantum TLS curves disabled.
+///
+/// Use this as a drop-in replacement for `Config::new(version)` in tests
+/// whose expected packet counts/sizes were calibrated against a
+/// single-Initial ClientHello. A post-quantum keyshare pushes the
+/// ClientHello across two Initial packets, which perturbs those
+/// expectations.
+pub fn config_no_pq(version: u32) -> Result<Config> {
+    let mut config = Config::new(version)?;
+    config.set_curves_list(NO_PQ_CURVES)?;
+    Ok(config)
+}
+
 pub struct Pipe<F = DefaultBufFactory>
 where
     F: BufFactory,
@@ -57,19 +79,23 @@ impl Pipe {
         Ok(config)
     }
 
+    /// Like [`default_config`](Self::default_config) but with post-quantum
+    /// TLS curves disabled. See [`config_no_pq`] for the rationale.
+    pub fn default_config_no_pq(cc_algorithm_name: &str) -> Result<Config> {
+        let mut config = Self::default_config(cc_algorithm_name)?;
+        config.set_curves_list(NO_PQ_CURVES)?;
+        Ok(config)
+    }
+
     #[cfg(feature = "boringssl-boring-crate")]
     pub fn default_tls_ctx_builder() -> boring::ssl::SslContextBuilder {
         let mut ctx_builder =
-            boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls())
-                .unwrap();
+            boring::ssl::SslContextBuilder::new(boring::ssl::SslMethod::tls()).unwrap();
         ctx_builder
             .set_certificate_chain_file("examples/cert.crt")
             .unwrap();
         ctx_builder
-            .set_private_key_file(
-                "examples/cert.key",
-                boring::ssl::SslFiletype::PEM,
-            )
+            .set_private_key_file("examples/cert.key", boring::ssl::SslFiletype::PEM)
             .unwrap();
 
         ctx_builder
@@ -93,7 +119,9 @@ impl Pipe {
     }
 
     pub fn with_config_and_scid_lengths(
-        config: &mut Config, client_scid_len: usize, server_scid_len: usize,
+        config: &mut Config,
+        client_scid_len: usize,
+        server_scid_len: usize,
     ) -> Result<Pipe> {
         Pipe::<DefaultBufFactory>::with_config_and_scid_lengths_and_buf(
             config,
@@ -111,7 +139,8 @@ impl Pipe {
     }
 
     pub fn with_client_and_server_config(
-        client_config: &mut Config, server_config: &mut Config,
+        client_config: &mut Config,
+        server_config: &mut Config,
     ) -> Result<Pipe> {
         Pipe::<DefaultBufFactory>::with_client_and_server_config_and_buf(
             client_config,
@@ -145,18 +174,14 @@ impl<F: BufFactory> Pipe<F> {
                 server_addr,
                 config,
             )?,
-            server: accept_with_buf_factory(
-                &server_scid,
-                None,
-                server_addr,
-                client_addr,
-                config,
-            )?,
+            server: accept_with_buf_factory(&server_scid, None, server_addr, client_addr, config)?,
         })
     }
 
     pub fn with_config_and_scid_lengths_and_buf(
-        config: &mut Config, client_scid_len: usize, server_scid_len: usize,
+        config: &mut Config,
+        client_scid_len: usize,
+        server_scid_len: usize,
     ) -> Result<Pipe<F>> {
         let mut client_scid = vec![0; client_scid_len];
         rand::rand_bytes(&mut client_scid[..]);
@@ -176,19 +201,11 @@ impl<F: BufFactory> Pipe<F> {
                 server_addr,
                 config,
             )?,
-            server: accept_with_buf_factory(
-                &server_scid,
-                None,
-                server_addr,
-                client_addr,
-                config,
-            )?,
+            server: accept_with_buf_factory(&server_scid, None, server_addr, client_addr, config)?,
         })
     }
 
-    pub fn with_client_config_and_buf(
-        client_config: &mut Config,
-    ) -> Result<Pipe<F>> {
+    pub fn with_client_config_and_buf(client_config: &mut Config) -> Result<Pipe<F>> {
         let mut client_scid = [0; 16];
         rand::rand_bytes(&mut client_scid[..]);
         let client_scid = ConnectionId::from_ref(&client_scid);
@@ -228,9 +245,7 @@ impl<F: BufFactory> Pipe<F> {
         })
     }
 
-    pub fn with_server_config_and_buf(
-        server_config: &mut Config,
-    ) -> Result<Pipe<F>> {
+    pub fn with_server_config_and_buf(server_config: &mut Config) -> Result<Pipe<F>> {
         let mut client_scid = [0; 16];
         rand::rand_bytes(&mut client_scid[..]);
         let client_scid = ConnectionId::from_ref(&client_scid);
@@ -269,7 +284,8 @@ impl<F: BufFactory> Pipe<F> {
     }
 
     pub fn with_client_and_server_config_and_buf(
-        client_config: &mut Config, server_config: &mut Config,
+        client_config: &mut Config,
+        server_config: &mut Config,
     ) -> Result<Pipe<F>> {
         let mut client_scid = [0; 16];
         rand::rand_bytes(&mut client_scid[..]);
@@ -357,7 +373,10 @@ impl<F: BufFactory> Pipe<F> {
     }
 
     pub fn send_pkt_to_server(
-        &mut self, pkt_type: Type, frames: &[frame::Frame], buf: &mut [u8],
+        &mut self,
+        pkt_type: Type,
+        frames: &[frame::Frame],
+        buf: &mut [u8],
     ) -> Result<usize> {
         let written = encode_pkt(&mut self.client, pkt_type, frames, buf)?;
         recv_send(&mut self.server, buf, written)
@@ -396,7 +415,9 @@ impl<F: BufFactory> Pipe<F> {
 }
 
 pub fn recv_send<F: BufFactory>(
-    conn: &mut Connection<F>, buf: &mut [u8], len: usize,
+    conn: &mut Connection<F>,
+    buf: &mut [u8],
+    len: usize,
 ) -> Result<usize> {
     let active_path = conn.paths.get_active()?;
     let info = RecvInfo {
@@ -420,7 +441,8 @@ pub fn recv_send<F: BufFactory>(
 }
 
 pub fn process_flight<F: BufFactory>(
-    conn: &mut Connection<F>, flight: Vec<(Vec<u8>, SendInfo)>,
+    conn: &mut Connection<F>,
+    flight: Vec<(Vec<u8>, SendInfo)>,
 ) -> Result<()> {
     for (mut pkt, si) in flight {
         let info = RecvInfo {
@@ -435,7 +457,9 @@ pub fn process_flight<F: BufFactory>(
 }
 
 pub fn emit_flight_with_max_buffer<F: BufFactory>(
-    conn: &mut Connection<F>, out_size: usize, from: Option<SocketAddr>,
+    conn: &mut Connection<F>,
+    out_size: usize,
+    from: Option<SocketAddr>,
     to: Option<SocketAddr>,
 ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
     let mut flight = Vec::new();
@@ -447,7 +471,7 @@ pub fn emit_flight_with_max_buffer<F: BufFactory>(
             Ok((written, info)) => {
                 out.truncate(written);
                 info
-            },
+            }
 
             Err(Error::Done) => break,
 
@@ -465,19 +489,21 @@ pub fn emit_flight_with_max_buffer<F: BufFactory>(
 }
 
 pub fn emit_flight_on_path<F: BufFactory>(
-    conn: &mut Connection<F>, from: Option<SocketAddr>, to: Option<SocketAddr>,
+    conn: &mut Connection<F>,
+    from: Option<SocketAddr>,
+    to: Option<SocketAddr>,
 ) -> Result<Vec<(Vec<u8>, SendInfo)>> {
     emit_flight_with_max_buffer(conn, 65535, from, to)
 }
 
-pub fn emit_flight<F: BufFactory>(
-    conn: &mut Connection<F>,
-) -> Result<Vec<(Vec<u8>, SendInfo)>> {
+pub fn emit_flight<F: BufFactory>(conn: &mut Connection<F>) -> Result<Vec<(Vec<u8>, SendInfo)>> {
     emit_flight_on_path(conn, None, None)
 }
 
 pub fn encode_pkt<F: BufFactory>(
-    conn: &mut Connection<F>, pkt_type: Type, frames: &[frame::Frame],
+    conn: &mut Connection<F>,
+    pkt_type: Type,
+    frames: &[frame::Frame],
     buf: &mut [u8],
 ) -> Result<usize> {
     let mut b = octets::OctetsMut::with_slice(buf);
@@ -502,12 +528,8 @@ pub fn encode_pkt<F: BufFactory>(
     let hdr = Header {
         ty: pkt_type,
         version: conn.version,
-        dcid: ConnectionId::from_ref(
-            conn.ids.get_dcid(*active_dcid_seq)?.cid.as_ref(),
-        ),
-        scid: ConnectionId::from_ref(
-            conn.ids.get_scid(*active_scid_seq)?.cid.as_ref(),
-        ),
+        dcid: ConnectionId::from_ref(conn.ids.get_dcid(*active_dcid_seq)?.cid.as_ref()),
+        scid: ConnectionId::from_ref(conn.ids.get_scid(*active_scid_seq)?.cid.as_ref()),
         pkt_num: pn,
         pkt_num_len: pn_len,
         token: conn.token.clone(),
@@ -539,15 +561,7 @@ pub fn encode_pkt<F: BufFactory>(
         None => return Err(Error::InvalidState),
     };
 
-    let written = packet::encrypt_pkt(
-        &mut b,
-        pn,
-        pn_len,
-        payload_len,
-        payload_offset,
-        None,
-        aead,
-    )?;
+    let written = packet::encrypt_pkt(&mut b, pn, pn_len, payload_len, payload_offset, None, aead)?;
 
     conn.next_pkt_num += 1;
 
@@ -555,7 +569,8 @@ pub fn encode_pkt<F: BufFactory>(
 }
 
 pub fn decode_pkt<F: BufFactory>(
-    conn: &mut Connection<F>, buf: &mut [u8],
+    conn: &mut Connection<F>,
+    buf: &mut [u8],
 ) -> Result<Vec<frame::Frame>> {
     let mut b = octets::OctetsMut::with_slice(buf);
 
@@ -575,9 +590,7 @@ pub fn decode_pkt<F: BufFactory>(
         hdr.pkt_num_len,
     );
 
-    let mut payload =
-        packet::decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, aead)
-            .unwrap();
+    let mut payload = packet::decrypt_pkt(&mut b, pn, hdr.pkt_num_len, payload_len, aead).unwrap();
 
     let mut frames = Vec::new();
 
@@ -589,9 +602,7 @@ pub fn decode_pkt<F: BufFactory>(
     Ok(frames)
 }
 
-pub fn create_cid_and_reset_token(
-    cid_len: usize,
-) -> (ConnectionId<'static>, u128) {
+pub fn create_cid_and_reset_token(cid_len: usize) -> (ConnectionId<'static>, u128) {
     let mut cid = vec![0; cid_len];
     rand::rand_bytes(&mut cid[..]);
     let cid = ConnectionId::from(cid);
@@ -626,7 +637,9 @@ pub fn helper_packet_sent(pkt_num: u64, now: Instant, size: usize) -> Sent {
 
 // Helper function for testing either stream receive or discard.
 pub fn stream_recv_discard<F: BufFactory>(
-    conn: &mut Connection<F>, discard: bool, stream_id: u64,
+    conn: &mut Connection<F>,
+    discard: bool,
+    stream_id: u64,
 ) -> Result<(usize, bool)> {
     let mut buf = [0; 65535];
     if discard {
@@ -645,7 +658,8 @@ pub fn stream_recv_discard<F: BufFactory>(
 /// unacknowledged packets from the sender are detected as lost.
 #[cfg(test)]
 pub fn trigger_ack_based_loss<F: BufFactory>(
-    sender: &mut Connection<F>, receiver: &mut Connection<F>,
+    sender: &mut Connection<F>,
+    receiver: &mut Connection<F>,
 ) {
     let mut buf = [0; 65535];
 

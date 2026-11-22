@@ -3,10 +3,12 @@
 //! the quiche connection, feeds packets to [`crate::session::WtSession`], and
 //! ferries commands in and events out.
 
+use std::collections::{HashSet, VecDeque};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use mio::net::UdpSocket;
 use mio::{Events, Poll, Token};
@@ -28,7 +30,15 @@ pub const WAKE_TOKEN: Token = Token(1);
 /// back below this cap: back-pressure is set on the driver thread but cleared on the JS thread, so
 /// without that wake the driver would keep withholding data (including a terminal frame) until an
 /// unrelated event happened to run another loop iteration.
-pub const MAX_INFLIGHT_BATCHES: i64 = 128;
+pub const MAX_INFLIGHT_BATCHES: i64 = 16;
+
+/// Yield to commands and timers even if the UDP socket stays readable.
+pub const MAX_RECV_PER_WAKE: usize = 1024;
+/// Allow Initial packets larger than our advertised 1350-byte payload without
+/// handing oversized datagrams to QUIC and its receive queues.
+pub const MAX_RECV_UDP_PAYLOAD: usize = 2048;
+const ADDRESS_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_RESOLVED_ADDRESSES: usize = 16;
 
 /// State shared between the driver thread and the JS-facing handle so that
 /// synchronous property reads (e.g. `datagrams.maxDatagramSize`) don't require a
@@ -164,18 +174,6 @@ fn emit_fatal(sink: &dyn EventSink, shared: &Arc<DriverShared>, message: String)
     ]);
 }
 
-fn random_scid() -> [u8; 16] {
-    let mut b = [0u8; 16];
-    if getrandom::getrandom(&mut b).is_err() {
-        let seed: u128 = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        b.copy_from_slice(&seed.to_le_bytes());
-    }
-    b
-}
-
 /// Resolve DNS, bind the UDP socket, build the QUIC config, perform the handshake
 /// handshake, then run the event loop. Any setup failure is surfaced to JS.
 fn setup_and_run(
@@ -185,43 +183,22 @@ fn setup_and_run(
     sink: &dyn EventSink,
     shared: &Arc<DriverShared>,
 ) {
-    // DNS resolution, potentially blocking, so it runs here (driver thread),
-    // never on the JS event loop.
-    let peer = match (setup.host.as_str(), setup.port)
+    let mut seen = HashSet::new();
+    let peers: Vec<_> = (setup.host.as_str(), setup.port)
         .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-    {
-        Some(p) => p,
-        None => {
-            emit_fatal(
-                sink,
-                shared,
-                format!("failed to resolve {}:{}", setup.host, setup.port),
-            );
-            return;
-        }
-    };
-
-    let bind: SocketAddr = if peer.is_ipv4() {
-        "0.0.0.0:0".parse().unwrap()
-    } else {
-        "[::]:0".parse().unwrap()
-    };
-    let socket = match UdpSocket::bind(bind) {
-        Ok(s) => s,
-        Err(e) => {
-            emit_fatal(sink, shared, format!("failed to bind UDP socket: {e}"));
-            return;
-        }
-    };
-    let local_addr = match socket.local_addr() {
-        Ok(a) => a,
-        Err(e) => {
-            emit_fatal(sink, shared, format!("failed to read local addr: {e}"));
-            return;
-        }
-    };
+        .into_iter()
+        .flatten()
+        .filter(|address| seen.insert(*address))
+        .take(MAX_RESOLVED_ADDRESSES)
+        .collect();
+    if peers.is_empty() {
+        emit_fatal(
+            sink,
+            shared,
+            format!("failed to resolve {}:{}", setup.host, setup.port),
+        );
+        return;
+    }
 
     let mut config = match build_config(&setup.config) {
         Ok(c) => c,
@@ -231,25 +208,174 @@ fn setup_and_run(
         }
     };
 
-    let scid = random_scid();
-    let scid = quiche::ConnectionId::from_ref(&scid);
-    let conn = match quiche::connect(setup.sni.as_deref(), &scid, local_addr, peer, &mut config) {
-        Ok(c) => c,
-        Err(e) => {
-            emit_fatal(sink, shared, format!("quiche connect: {e:?}"));
-            return;
+    let mut poll = poll;
+    let mut pending = VecDeque::new();
+    let mut bind_error = String::new();
+    for (index, peer) in peers.iter().copied().enumerate() {
+        let (mut socket, local_addr, mut conn) =
+            match dial_peer(peer, setup.sni.as_deref(), &mut config) {
+                Ok(connection) => connection,
+                Err(e) => {
+                    bind_error = e;
+                    continue;
+                }
+            };
+        if index + 1 < peers.len() {
+            match probe_address(
+                &mut poll,
+                &mut socket,
+                local_addr,
+                &mut conn,
+                &rx,
+                &mut pending,
+            ) {
+                Ok(Probe::Established) => {}
+                Ok(Probe::NextAddress) => continue,
+                Ok(Probe::Closed) => {
+                    shared.closed.store(true, Ordering::Relaxed);
+                    sink.emit(vec![Ev::Closed {
+                        code: 0,
+                        reason: Vec::new(),
+                        remote: false,
+                    }]);
+                    return;
+                }
+                Err(e) => {
+                    bind_error = format!("probing {peer}: {e}");
+                    continue;
+                }
+            }
         }
-    };
 
-    let session = WtSession::new_client(
-        setup.authority,
-        setup.path,
-        setup.origin,
-        setup.extra_headers,
-        setup.protocols,
+        let session = WtSession::new_client(
+            setup.authority,
+            setup.path,
+            setup.origin,
+            setup.extra_headers,
+            setup.protocols,
+        );
+        run_inner(
+            poll, socket, local_addr, conn, session, rx, pending, sink, shared,
+        );
+        return;
+    }
+
+    emit_fatal(
+        sink,
+        shared,
+        format!(
+            "could not connect to any address for {}: {bind_error}",
+            setup.host
+        ),
     );
+}
 
-    run_inner(poll, socket, local_addr, conn, session, rx, sink, shared);
+fn dial_peer(
+    peer: SocketAddr,
+    sni: Option<&str>,
+    config: &mut quiche::Config,
+) -> Result<(UdpSocket, SocketAddr, quiche::Connection), String> {
+    let bind = if peer.is_ipv4() {
+        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let socket = UdpSocket::bind(bind).map_err(|e| format!("binding for {peer}: {e}"))?;
+    let local = socket
+        .local_addr()
+        .map_err(|e| format!("local address: {e}"))?;
+    let mut scid = [0; 16];
+    getrandom::fill(&mut scid).map_err(|e| format!("generating QUIC connection ID: {e}"))?;
+    let scid = quiche::ConnectionId::from_ref(&scid);
+    let conn = quiche::connect(sni, &scid, local, peer, config)
+        .map_err(|e| format!("QUIC connect to {peer}: {e:?}"))?;
+    Ok((socket, local, conn))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Probe {
+    Established,
+    NextAddress,
+    Closed,
+}
+
+fn probe_address(
+    poll: &mut Poll,
+    socket: &mut UdpSocket,
+    local: SocketAddr,
+    conn: &mut quiche::Connection,
+    rx: &Receiver<Command>,
+    pending: &mut VecDeque<Command>,
+) -> std::io::Result<Probe> {
+    poll.registry()
+        .register(socket, SOCKET_TOKEN, mio::Interest::READABLE)?;
+    let result = probe_registered(poll, socket, local, conn, rx, pending);
+    poll.registry().deregister(socket)?;
+    result
+}
+
+fn probe_registered(
+    poll: &mut Poll,
+    socket: &UdpSocket,
+    local: SocketAddr,
+    conn: &mut quiche::Connection,
+    rx: &Receiver<Command>,
+    pending: &mut VecDeque<Command>,
+) -> std::io::Result<Probe> {
+    let deadline = Instant::now() + ADDRESS_ATTEMPT_TIMEOUT;
+    let mut events = Events::with_capacity(8);
+    let mut packet = vec![0; 65_535];
+    let mut out = [0; 1350];
+    loop {
+        while let Ok(cmd) = rx.try_recv() {
+            if matches!(cmd, Command::Close { .. } | Command::Shutdown) {
+                return Ok(Probe::Closed);
+            }
+            pending.push_back(cmd);
+        }
+        if conn.is_established() && conn.local_error().is_none() && !conn.is_draining() {
+            return Ok(Probe::Established);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero()
+            || conn.is_closed()
+            || conn.local_error().is_some()
+            || conn.is_draining()
+        {
+            return Ok(Probe::NextAddress);
+        }
+        conn.on_timeout();
+        flush_send(conn, socket, &mut out, false);
+        let mut drained = false;
+        let mut received = false;
+        for _ in 0..MAX_RECV_PER_WAKE {
+            match socket.recv_from(&mut packet) {
+                Ok((len, from)) if len != 0 && len <= MAX_RECV_UDP_PAYLOAD => {
+                    let _ = conn.recv(&mut packet[..len], quiche::RecvInfo { from, to: local });
+                    received = true;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    drained = true;
+                    break;
+                }
+                Err(e) if is_udp_port_unreachable(&e) => return Ok(Probe::NextAddress),
+                Err(e) => return Err(e),
+            }
+        }
+        if received || !drained {
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let timeout = conn
+            .timeout()
+            .map_or(remaining, |timeout| timeout.min(remaining));
+        if let Err(e) = poll.poll(&mut events, Some(timeout)) {
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                return Err(e);
+            }
+        }
+    }
 }
 
 /// The actual event loop. Runs until the connection closes or a fatal error
@@ -263,6 +389,7 @@ fn run_inner(
     mut conn: quiche::Connection,
     mut session: WtSession,
     rx: Receiver<Command>,
+    mut pending: VecDeque<Command>,
     sink: &dyn EventSink,
     shared: &Arc<DriverShared>,
 ) {
@@ -290,8 +417,15 @@ fn run_inner(
     // Prime the handshake (send the client Initial).
     flush_send(&mut conn, &socket, &mut send_buf, debug);
 
+    let mut udp_pending = conn.is_established() || !pending.is_empty();
+    let mut read_pending = false;
     loop {
-        let timeout = conn.timeout();
+        let can_read = shared.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT_BATCHES;
+        let timeout = if udp_pending || (read_pending && can_read) {
+            Some(std::time::Duration::ZERO)
+        } else {
+            conn.timeout()
+        };
         if let Err(e) = poll.poll(&mut events, timeout) {
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
@@ -303,17 +437,18 @@ fn run_inner(
         let mut evs: Vec<Ev> = Vec::new();
         let mut shutdown = false;
 
-        // 1. Read all datagrams the socket has.
-        let mut got_packet = false;
-        loop {
+        // mio may use edge-triggered readiness. If we stop before WouldBlock,
+        // poll again without waiting for a new readiness edge.
+        let mut udp_budget = MAX_RECV_PER_WAKE;
+        while udp_budget > 0 {
+            udp_budget -= 1;
             match socket.recv_from(&mut recv_buf) {
                 Ok((len, from)) => {
                     // UDP permits empty datagrams. They carry no QUIC packet
                     // and must not become fatal errors before authentication.
-                    if len == 0 {
+                    if len == 0 || len > MAX_RECV_UDP_PAYLOAD {
                         continue;
                     }
-                    got_packet = true;
                     if debug {
                         eprintln!("[rwt-driver] recv {len} bytes from {from}");
                     }
@@ -328,7 +463,8 @@ fn run_inner(
                             if debug {
                                 eprintln!("[rwt-driver] recv err {e:?}");
                             }
-                            evs.push(Ev::Error(format!("quic recv: {e:?}")));
+                            // quiche records fatal transport errors on the
+                            // connection. Invalid UDP input is otherwise dropped.
                         }
                     }
                 }
@@ -345,14 +481,13 @@ fn run_inner(
                 }
             }
         }
+        udp_pending = udp_budget == 0;
 
-        // 2. Fire the timeout if nothing else woke us.
-        if !got_packet && events.is_empty() {
-            conn.on_timeout();
-        }
+        // quiche checks whether a timer is due.
+        conn.on_timeout();
 
         // 3. Drain commands.
-        while let Ok(cmd) = rx.try_recv() {
+        while let Some(cmd) = pending.pop_front().or_else(|| rx.try_recv().ok()) {
             match cmd {
                 Command::OpenStream { request_id, bidi } => {
                     session.open_stream(bidi, request_id, &mut evs)
@@ -381,9 +516,9 @@ fn run_inner(
                     label,
                     context,
                     length,
-                } => evs.push(crate::session::build_keying_material(
-                    &mut conn, request_id, &label, &context, length,
-                )),
+                } => evs.push(
+                    session.build_keying_material(&mut conn, request_id, &label, &context, length),
+                ),
                 Command::Shutdown => {
                     shutdown = true;
                     break;
@@ -412,24 +547,18 @@ fn run_inner(
                     conn.application_proto()
                 );
             }
-            session.on_established();
+            session.on_established(conn.reliable_stream_reset_negotiated());
         }
 
         // Backpressure: if the JS thread is behind on processing events, stop
         // pulling high-volume data out of quiche this iteration. Unread stream
         // bytes stay flow-controlled in quiche and excess datagrams are dropped
         // by quiche's bounded recv queue, so the event queue cannot grow without
-        // bound (hostile-flood OOM protection). Control-plane processing (the
-        // CONNECT response, SETTINGS, session close) always runs.
-        let backpressured = shared.inflight.load(Ordering::Relaxed) >= MAX_INFLIGHT_BATCHES;
-
-        if !backpressured {
-            session.on_datagrams(&mut conn, &mut evs);
-        }
-
-        let readable: Vec<u64> = conn.readable().collect();
-        for id in readable {
-            session.on_readable(&mut conn, id, backpressured, &mut evs);
+        // bound. QUIC packet processing and closure continue under pressure.
+        if shared.inflight.load(Ordering::Relaxed) < MAX_INFLIGHT_BATCHES {
+            let mut budget = crate::session::ReceiveBudget::new();
+            session.read_pending(&mut conn, &mut budget, &mut evs);
+            read_pending = budget.exhausted();
         }
 
         session.flush(&mut conn, &mut evs);
@@ -474,7 +603,7 @@ fn run_inner(
 
 /// Winsock may report an ICMP Port Unreachable for an earlier UDP send. Let QUIC
 /// determine connection liveness after loss rather than retiring the session from recv_from.
-fn is_udp_port_unreachable(error: &std::io::Error) -> bool {
+pub(crate) fn is_udp_port_unreachable(error: &std::io::Error) -> bool {
     const WSAECONNRESET: i32 = 10054;
     cfg!(windows) && error.raw_os_error() == Some(WSAECONNRESET)
 }

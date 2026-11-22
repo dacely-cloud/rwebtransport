@@ -69,13 +69,8 @@ function assertSupportedRuntime(): void {
  *          The file is not guaranteed to exist; callers check separately.
  * @internal
  */
-function prebuiltPath(): string {
-    return join(
-        PACKAGE_ROOT,
-        'prebuilds',
-        `${process.platform}-${process.arch}`,
-        'rwebtransport.node',
-    );
+function prebuiltPath(name = 'rwebtransport.node'): string {
+    return join(PACKAGE_ROOT, 'prebuilds', `${process.platform}-${process.arch}`, name);
 }
 
 /**
@@ -95,7 +90,7 @@ let cached: NativeAddon | undefined;
  *   2. Assert the runtime is Node 24 or 26 (see {@link assertSupportedRuntime}).
  *   3. If a prebuilt binary exists for this platform and architecture, `require`
  *      it, cache it, and return it.
- *   4. Otherwise fall back to compiling from source: run `scripts/build.js` with
+ *   4. If the prebuild is missing or cannot be loaded, compile from source: run `scripts/build.js` with
  *      the current Node executable (working directory set to the package root
  *      and stdio inherited, so the compile output is streamed to the caller's
  *      console), then `require` and cache the freshly produced binary. A notice
@@ -121,27 +116,58 @@ export function loadNative(): NativeAddon {
     assertSupportedRuntime();
 
     const prebuilt = prebuiltPath();
+    let prebuildError: unknown;
+    let output = prebuilt;
     if (existsSync(prebuilt)) {
-        cached = require(prebuilt) as NativeAddon;
-        return cached;
+        try {
+            cached = require(prebuilt) as NativeAddon;
+            return cached;
+        } catch (error) {
+            if (
+                !(error instanceof Error) ||
+                (error as NodeJS.ErrnoException).code !== 'ERR_DLOPEN_FAILED'
+            ) {
+                throw error;
+            }
+            prebuildError = error;
+            output = prebuiltPath('rwebtransport-local.node');
+        }
+    }
+    if (output !== prebuilt && existsSync(output)) {
+        try {
+            cached = require(output) as NativeAddon;
+            return cached;
+        } catch (error) {
+            if (
+                !(error instanceof Error) ||
+                (error as NodeJS.ErrnoException).code !== 'ERR_DLOPEN_FAILED'
+            ) {
+                throw error;
+            }
+        }
     }
 
     // Fallback: compile from source.
     const builder = join(PACKAGE_ROOT, 'scripts', 'build.js');
     if (!existsSync(builder)) {
         throw new Error(
-            `rwebtransport: no prebuilt binary at ${prebuilt} and no build script to compile one. ` +
+            `rwebtransport: no usable native binary at ${prebuilt} and no build script to compile one. ` +
                 `Reinstall the package or build it manually (npm run build:rust).`,
+            { cause: prebuildError },
         );
     }
     process.stderr.write(
-        'rwebtransport: no prebuilt binary for this platform; compiling the native addon (this happens once)...\n',
+        'rwebtransport: no usable native binary for this platform; compiling the native addon...\n',
     );
-    execFileSync(process.execPath, [builder], { cwd: PACKAGE_ROOT, stdio: 'inherit' });
-
-    if (!existsSync(prebuilt)) {
-        throw new Error(`rwebtransport: build completed but ${prebuilt} was not produced.`);
+    const args = output === prebuilt ? [builder] : [builder, '--fallback'];
+    try {
+        execFileSync(process.execPath, args, { cwd: PACKAGE_ROOT, stdio: 'inherit' });
+    } catch (error) {
+        const detail = prebuildError instanceof Error ? ` (${prebuildError.message})` : '';
+        throw new Error(`rwebtransport: unable to build a native addon for this system${detail}`, {
+            cause: error,
+        });
     }
-    cached = require(prebuilt) as NativeAddon;
+    cached = require(output) as NativeAddon;
     return cached;
 }

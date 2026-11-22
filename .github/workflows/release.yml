@@ -26,32 +26,37 @@ jobs:
           - os: windows-2025
             target: win32-x64
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version: 'stable'
 
       - if: runner.os == 'Windows'
-        uses: ilammy/setup-nasm@v1
-
-      - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+        uses: ilammy/setup-nasm@v1.5.2
 
       - if: runner.os == 'macOS'
         run: brew install cmake ninja
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 26
 
+      - name: Build glibc 2.28 Linux prebuild
+        if: runner.os == 'Linux'
+        run: bash scripts/build-linux-prebuilt.sh
+
       - name: Build native addon
+        if: runner.os != 'Linux'
         run: node scripts/build.js
 
+      - name: Load native addon
+        run: node -e "require('./prebuilds/${{ matrix.target }}/rwebtransport.node')"
+
       - name: Upload prebuilt
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v7.0.2
         with:
           name: prebuild-${{ matrix.target }}
           path: prebuilds/${{ matrix.target }}/rwebtransport.node
@@ -65,16 +70,15 @@ jobs:
       contents: write # attach the prebuilds tarball to the GitHub Release
       id-token: write # OIDC token for npm Trusted Publishing (no NPM_TOKEN needed)
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7.0.1
 
-      - uses: actions/setup-node@v6
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 26
           registry-url: https://registry.npmjs.org
 
       - name: Update npm (Trusted Publishing and --provenance need a recent npm)
-        # Pinned: npm 12's global install drops sigstore, which breaks --provenance.
-        run: npm install -g npm@11.18.0
+        run: npm install -g npm@12.2.3
 
       - name: Install deps
         run: npm ci
@@ -82,7 +86,7 @@ jobs:
           RWEBTRANSPORT_SKIP_POSTINSTALL: '1'
 
       - name: Download all prebuilds
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8.0.2
         with:
           pattern: prebuild-*
           path: artifacts
@@ -105,7 +109,7 @@ jobs:
         run: tar czf rwebtransport-prebuilds.tar.gz prebuilds
 
       - name: Attach prebuilds to GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v3.0.4
         with:
           files: rwebtransport-prebuilds.tar.gz
           fail_on_unmatched_files: true

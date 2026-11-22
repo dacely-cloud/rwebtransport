@@ -13,13 +13,13 @@ repository = "https://github.com/felixantoinebelleau/rwebtransport"
 [workspace.dependencies]
 wtcore = { package = "rwebtransport-wtcore", path = "crates/wtcore" }
 quiche = { path = "vendor/quiche", default-features = false, features = ["boringssl-boring-crate"] }
-boring = "4.22"
-boring-sys = "4.22"
-octets = { version = "0.3.5", features = ["huffman_hpack"] }
+boring = "5.6"
+boring-sys = "5.6"
+octets = { version = "0.3.7", features = ["huffman_hpack"] }
 log = "0.4"
 mio = { version = "1", features = ["net", "os-poll"] }
-getrandom = "0.2"
-socket2 = { version = "0.5", features = ["all"] }
+getrandom = "0.4"
+socket2 = { version = "0.6", features = ["all"] }
 
 # Release profile tuned for a shippable native addon without pathological compile times.
 # NOTE: panic must stay "unwind" (the default) so neon can catch Rust panics at the

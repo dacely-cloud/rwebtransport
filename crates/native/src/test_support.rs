@@ -36,7 +36,7 @@ pub fn pair(
         .unwrap();
     cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
         .unwrap();
-    cert.append_extension(BasicConstraints::new().critical().ca().build().unwrap())
+    cert.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
         .unwrap();
     let mut san = SubjectAlternativeName::new();
     san.dns("wrong.example");
@@ -44,7 +44,7 @@ pub fn pair(
         san.ip("127.0.0.1").ip("::1");
     }
     let san = san.build(&cert.x509v3_context(None, None)).unwrap();
-    cert.append_extension(san).unwrap();
+    cert.append_extension(&san).unwrap();
     cert.sign(&key, MessageDigest::sha256()).unwrap();
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(

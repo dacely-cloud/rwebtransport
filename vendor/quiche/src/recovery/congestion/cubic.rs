@@ -47,6 +47,7 @@ use crate::recovery::MINIMUM_WINDOW_PACKETS;
 
 pub(crate) static CUBIC: CongestionControlOps = CongestionControlOps {
     on_init,
+    on_mtu_update: |_| {},
     on_packet_sent,
     on_packets_acked,
     congestion_event,
@@ -140,23 +141,18 @@ impl State {
     fn w_cubic(&self, t: Duration, max_datagram_size: usize) -> f64 {
         let w_max = self.w_max / max_datagram_size as f64;
 
-        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) *
-            max_datagram_size as f64
+        (C * (t.as_secs_f64() - self.k).powi(3) + w_max) * max_datagram_size as f64
     }
 
     // W_est = W_est + alpha_aimd * (segments_acked / cwnd)  (Eq. 4)
-    fn w_est_inc(
-        &self, acked: usize, cwnd: usize, max_datagram_size: usize,
-    ) -> f64 {
+    fn w_est_inc(&self, acked: usize, cwnd: usize, max_datagram_size: usize) -> f64 {
         self.alpha_aimd * (acked as f64 / cwnd as f64) * max_datagram_size as f64
     }
 }
 
 fn on_init(_r: &mut Congestion) {}
 
-fn on_packet_sent(
-    r: &mut Congestion, sent_bytes: usize, bytes_in_flight: usize, now: Instant,
-) {
+fn on_packet_sent(r: &mut Congestion, sent_bytes: usize, bytes_in_flight: usize, now: Instant) {
     reno::on_packet_sent(r, sent_bytes, bytes_in_flight, now);
 
     // Don't adjust epoch or track send time for non-data packets
@@ -187,8 +183,7 @@ fn on_packet_sent(
             if let Some(idle_start) = idle_start {
                 if idle_start < now {
                     let delta = now - idle_start;
-                    r.congestion_recovery_start_time =
-                        Some(recovery_start_time + delta);
+                    r.congestion_recovery_start_time = Some(recovery_start_time + delta);
                 }
             }
         }
@@ -198,8 +193,11 @@ fn on_packet_sent(
 }
 
 fn on_packets_acked(
-    r: &mut Congestion, bytes_in_flight: usize, packets: &mut Vec<Acked>,
-    now: Instant, rtt_stats: &RttStats,
+    r: &mut Congestion,
+    bytes_in_flight: usize,
+    packets: &mut Vec<Acked>,
+    now: Instant,
+    rtt_stats: &RttStats,
 ) {
     r.cubic_state.last_ack_time = Some(now);
 
@@ -209,7 +207,10 @@ fn on_packets_acked(
 }
 
 fn on_packet_acked(
-    r: &mut Congestion, bytes_in_flight: usize, packet: &Acked, now: Instant,
+    r: &mut Congestion,
+    bytes_in_flight: usize,
+    packet: &Acked,
+    now: Instant,
     rtt_stats: &RttStats,
 ) {
     let in_congestion_recovery = r.in_congestion_recovery(packet.time_sent);
@@ -232,15 +233,14 @@ fn on_packet_acked(
     // Detecting spurious congestion events.
     // <https://tools.ietf.org/id/draft-ietf-tcpm-rfc8312bis-00.html#section-4.9>
     //
-    // When the recovery episode ends with recovering
-    // a few packets (less than cwnd / mss * ROLLBACK_THRESHOLD_PERCENT(%)), it's
-    // considered as spurious and restore to the previous state.
+    // If recovery ends after fewer than
+    // `cwnd / mss * ROLLBACK_THRESHOLD_PERCENT` packets, treat the congestion
+    // event as spurious and restore the previous state.
     if r.congestion_recovery_start_time.is_some() {
         let new_lost = r.lost_count - r.cubic_state.prior.lost_count;
 
-        let rollback_threshold = (r.congestion_window / r.max_datagram_size) *
-            ROLLBACK_THRESHOLD_PERCENT /
-            100;
+        let rollback_threshold =
+            (r.congestion_window / r.max_datagram_size) * ROLLBACK_THRESHOLD_PERCENT / 100;
 
         let rollback_threshold = rollback_threshold.max(MIN_ROLLBACK_THRESHOLD);
 
@@ -259,8 +259,7 @@ fn on_packet_acked(
 
         if r.bytes_acked_sl >= r.max_datagram_size {
             if r.hystart.in_css() {
-                r.congestion_window +=
-                    r.hystart.css_cwnd_inc(r.max_datagram_size);
+                r.congestion_window += r.hystart.css_cwnd_inc(r.max_datagram_size);
             } else {
                 r.congestion_window += r.max_datagram_size;
             }
@@ -302,7 +301,7 @@ fn on_packet_acked(
 
                     r.cubic_state.w_est = r.congestion_window as f64;
                     r.cubic_state.alpha_aimd = ALPHA_AIMD;
-                },
+                }
             }
         }
 
@@ -318,11 +317,9 @@ fn on_packet_acked(
         let target = f64::min(target, r.congestion_window as f64 * 1.5);
 
         // Update w_est.
-        let w_est_inc = r.cubic_state.w_est_inc(
-            packet.size,
-            r.congestion_window,
-            r.max_datagram_size,
-        );
+        let w_est_inc =
+            r.cubic_state
+                .w_est_inc(packet.size, r.congestion_window, r.max_datagram_size);
         r.cubic_state.w_est += w_est_inc;
 
         if r.cubic_state.w_est >= r.cubic_state.w_max {
@@ -336,8 +333,7 @@ fn on_packet_acked(
             cubic_cwnd = cmp::max(cubic_cwnd, r.cubic_state.w_est as usize);
         } else {
             // Concave region or convex region use same increment.
-            let cubic_inc =
-                r.max_datagram_size * (target as usize - cubic_cwnd) / cubic_cwnd;
+            let cubic_inc = r.max_datagram_size * (target as usize - cubic_cwnd) / cubic_cwnd;
 
             cubic_cwnd += cubic_inc;
         }
@@ -353,8 +349,11 @@ fn on_packet_acked(
 }
 
 fn congestion_event(
-    r: &mut Congestion, bytes_in_flight: usize, _lost_bytes: usize,
-    largest_lost_pkt: &Sent, now: Instant,
+    r: &mut Congestion,
+    bytes_in_flight: usize,
+    _lost_bytes: usize,
+    largest_lost_pkt: &Sent,
+    now: Instant,
 ) {
     let time_sent = largest_lost_pkt.time_sent;
     let in_congestion_recovery = r.in_congestion_recovery(time_sent);
@@ -366,15 +365,13 @@ fn congestion_event(
 
         // Fast convergence
         if (r.congestion_window as f64) < r.cubic_state.w_max {
-            r.cubic_state.w_max =
-                r.congestion_window as f64 * (1.0 + BETA_CUBIC) / 2.0;
+            r.cubic_state.w_max = r.congestion_window as f64 * (1.0 + BETA_CUBIC) / 2.0;
         } else {
             r.cubic_state.w_max = r.congestion_window as f64;
         }
 
         let ssthresh = (r.congestion_window as f64 * BETA_CUBIC) as usize;
-        let ssthresh =
-            cmp::max(ssthresh, r.max_datagram_size * MINIMUM_WINDOW_PACKETS);
+        let ssthresh = cmp::max(ssthresh, r.max_datagram_size * MINIMUM_WINDOW_PACKETS);
         r.ssthresh.update(ssthresh, r.hystart.in_css());
         r.congestion_window = ssthresh;
 
@@ -385,8 +382,7 @@ fn congestion_event(
                 .cubic_k(r.congestion_window, r.max_datagram_size)
         };
 
-        r.cubic_state.cwnd_inc =
-            (r.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as usize;
+        r.cubic_state.cwnd_inc = (r.cubic_state.cwnd_inc as f64 * BETA_CUBIC) as usize;
 
         r.cubic_state.w_est = r.congestion_window as f64;
         r.cubic_state.alpha_aimd = ALPHA_AIMD;
@@ -652,8 +648,7 @@ mod tests {
         assert!(sender.hystart.css_start_time().is_none());
         assert_eq!(
             sender.congestion_window(),
-            cwnd_prev +
-                size / hystart::CSS_GROWTH_DIVISOR * hystart::N_RTT_SAMPLE
+            cwnd_prev + size / hystart::CSS_GROWTH_DIVISOR * hystart::N_RTT_SAMPLE
         );
     }
 
@@ -886,8 +881,7 @@ mod tests {
         sender.lose_n_packets(1, size, None);
         let post_loss_cwnd = sender.congestion_window;
         assert_eq!(post_loss_cwnd, (initial_cwnd as f64 * BETA_CUBIC) as usize);
-        let initial_recovery_start_time =
-            sender.congestion_recovery_start_time.unwrap();
+        let initial_recovery_start_time = sender.congestion_recovery_start_time.unwrap();
         assert_eq!(initial_recovery_start_time, sender.time);
 
         // ACK remaining in-flight packets to exit recovery.
@@ -919,8 +913,7 @@ mod tests {
         );
         // Recovery start hasn't changed.
         assert_eq!(
-            sender.congestion_recovery_start_time.unwrap() -
-                initial_recovery_start_time,
+            sender.congestion_recovery_start_time.unwrap() - initial_recovery_start_time,
             Duration::ZERO,
             "epoch should not have shifted without idle gap",
         );
@@ -944,8 +937,7 @@ mod tests {
         sender.advance_time(rtt);
         sender.lose_n_packets(1, size, None);
 
-        let initial_recovery_start =
-            sender.congestion_recovery_start_time.unwrap();
+        let initial_recovery_start = sender.congestion_recovery_start_time.unwrap();
         assert_eq!(
             initial_recovery_start,
             test_start + rtt,
@@ -979,8 +971,7 @@ mod tests {
         // idle shift logic ran).
         let recovery_start = sender.congestion_recovery_start_time.unwrap();
         assert!(
-            recovery_start >
-                sender.cubic_state.last_sent_time.unwrap() - idle_duration,
+            recovery_start > sender.cubic_state.last_sent_time.unwrap() - idle_duration,
             "epoch should have been shifted forward by idle period",
         );
         assert_eq!(

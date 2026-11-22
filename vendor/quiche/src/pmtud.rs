@@ -84,9 +84,9 @@ impl Pmtud {
     /// Checks there are no probes in flight, that a PMTU has not been
     /// found, and that the minimum supported MTU has not been reached.
     pub fn should_probe(&self) -> bool {
-        !self.in_flight &&
-            self.pmtu.is_none() &&
-            self.smallest_failed_probe_size != Some(MIN_PLPMTU)
+        !self.in_flight
+            && self.pmtu.is_none()
+            && self.smallest_failed_probe_size != Some(MIN_PLPMTU)
     }
 
     /// Sets the PMTUD probe size.
@@ -138,22 +138,22 @@ impl Pmtud {
                     debug!("Found PMTU: {successful_probe_size}");
                     self.set_pmtu(successful_probe_size);
                 } else {
-                    self.probe_size =
-                        (successful_probe_size + failed_probe_size) / 2
+                    self.probe_size = (successful_probe_size + failed_probe_size) / 2
                 }
-            },
+            }
 
-            // With only failed probes, binary search between the smallest failed
-            // probe and the minimum supported MTU
-            (Some(failed_probe_size), None) =>
-                self.probe_size = (MIN_PLPMTU + failed_probe_size) / 2,
+            // With only failed probes, binary search between the smallest
+            // failed probe and the minimum supported MTU
+            (Some(failed_probe_size), None) => {
+                self.probe_size = (MIN_PLPMTU + failed_probe_size) / 2
+            }
 
             // As the algorithm is optimistic in that the initial probe size
             // is the maximum supported MTU, then having only a successful probe
             // means the maximum supported MTU is <= PMTU
             (None, Some(successful_probe_size)) => {
                 self.set_pmtu(successful_probe_size);
-            },
+            }
 
             // Use the initial probe size if no record of success/failures
             (None, None) => self.probe_size = self.maximum_supported_mtu,
@@ -535,19 +535,21 @@ mod tests {
             let probe_size = pmtud.get_probe_size();
 
             if probe_size <= target_mtu {
-                // First probe fails (random loss)
+                // The first probe fails due to random loss.
                 pmtud.failed_probe(probe_size);
                 assert_eq!(pmtud.probe_failure_count, 1);
 
-                // Second probe succeeds
+                // The second probe succeeds.
                 pmtud.successful_probe(probe_size);
-                assert_eq!(pmtud.probe_failure_count, 0); // Reset on success
+                // A successful probe resets the failure count.
+                assert_eq!(pmtud.probe_failure_count, 0);
             } else {
-                // Size exceeds MTU - all probes fail
+                // All probes fail because their size exceeds the MTU.
                 let old_probe_size = probe_size;
                 fail_probe_max_times(&mut pmtud, probe_size);
 
-                // After max failures, probe_failure_count resets and size changes
+                // After the maximum failures, `probe_failure_count` resets and
+                // the probe size changes.
                 assert_eq!(pmtud.probe_failure_count, 0);
                 if pmtud.get_pmtu().is_none() {
                     assert!(pmtud.get_probe_size() < old_probe_size);

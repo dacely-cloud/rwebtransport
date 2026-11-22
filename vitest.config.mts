@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { configDefaults, defineConfig } from 'vitest/config';
-import browserConfig from './vitest.browser.config.js';
+import browserConfig from './vitest.browser.config.mjs';
 
 export default defineConfig({
     test: {

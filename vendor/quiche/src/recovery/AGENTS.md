@@ -39,6 +39,7 @@ gcongestion/        Next-gen CC (BBR2)
     probe_bw.rs     ProbeBW mode (bandwidth probing cycles)
     probe_rtt.rs    ProbeRTT mode (min RTT measurement)
     network_model.rs  Bandwidth/RTT model, BbrParams application
+    rtt_jump_detector/  RTT jump detection (global-min + HMM)
   bbr.rs            BBR (v1, not actively used)
 ```
 
@@ -73,8 +74,10 @@ gcongestion/        Next-gen CC (BBR2)
 ## NOTES
 
 - Constants cite RFC 9002: `INITIAL_TIME_THRESHOLD = 9.0/8.0`, `GRANULARITY = 1ms`.
-- `CongestionControlAlgorithm` values: Reno=0, CUBIC=1, Bbr2Gcongestion=4. Gap is intentional (removed variants).
-- `Recovery::new_with_config` tries `GRecovery::new` first; falls back to `LegacyRecovery` if algo is Reno/CUBIC.
+- `CongestionControlAlgorithm` values: Reno=0, CUBIC=1, Bbr2Gcongestion=4,
+  CongestionWindowUnchecked=5 when enabled. Gaps are intentional (removed variants).
+- `Recovery::new_with_config` tries `GRecovery::new` first; falls back to
+  `LegacyRecovery` for Reno, CUBIC, and CongestionWindowUnchecked.
 - `bbr2/` is a deeply nested state machine -- changes require understanding all six substates.
 - `enable_relaxed_loss_threshold` experiment adjusts time thresholds dynamically on spurious loss.
 - `gcongestion/bbr.rs` is BBRv1 -- mostly vestigial alongside BBR2.

@@ -89,6 +89,7 @@ describe('Audit regressions', () => {
         core.dispatch({
             type: NativeEventType.WriteAck,
             requestId: transport.write.mock.calls[0]![2],
+            accepted: true,
         });
         await other;
     });

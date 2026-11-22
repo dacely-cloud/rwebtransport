@@ -27,6 +27,7 @@
 use std::ffi;
 use std::mem::ManuallyDrop;
 use std::ptr;
+use std::ptr::NonNull;
 use std::slice;
 
 use std::io::Write;
@@ -128,14 +129,14 @@ pub static QUICHE_EX_DATA_INDEX: LazyLock<c_int> = LazyLock::new(|| unsafe {
     SSL_get_ex_new_index(0, ptr::null(), ptr::null(), ptr::null(), ptr::null())
 });
 
-pub struct Context(*mut SSL_CTX);
+pub struct Context(NonNull<SSL_CTX>);
 
 impl Context {
     // Note: some vendor-specific methods are implemented in the boringssl
     // submodule.
     pub fn new() -> Result<Context> {
         unsafe {
-            let ctx_raw = SSL_CTX_new(TLS_method());
+            let ctx_raw = NonNull::new(SSL_CTX_new(TLS_method())).ok_or(Error::TlsFail)?;
 
             let mut ctx = Context(ctx_raw);
 
@@ -148,20 +149,22 @@ impl Context {
     }
 
     #[cfg(feature = "boringssl-boring-crate")]
-    pub fn from_boring(
-        ssl_ctx_builder: boring::ssl::SslContextBuilder,
-    ) -> Context {
+    pub fn from_boring(ssl_ctx_builder: boring::ssl::SslContextBuilder) -> Result<Context> {
         use foreign_types_shared::ForeignType;
 
-        let mut ctx = Context(ssl_ctx_builder.build().into_ptr() as _);
+        let ctx_raw =
+            NonNull::new(ssl_ctx_builder.build().into_ptr() as _).ok_or(Error::TlsFail)?;
+
+        let mut ctx = Context(ctx_raw);
         ctx.set_session_callback();
 
-        ctx
+        Ok(ctx)
     }
 
     pub fn new_handshake(&mut self) -> Result<Handshake> {
         unsafe {
-            let ssl = SSL_new(self.as_mut_ptr());
+            let ssl = NonNull::new(SSL_new(self.as_mut_ptr())).ok_or(Error::TlsFail)?;
+
             Ok(Handshake::new(ssl))
         }
     }
@@ -169,39 +172,25 @@ impl Context {
     pub fn load_verify_locations_from_file(&mut self, file: &str) -> Result<()> {
         let file = ffi::CString::new(file).map_err(|_| Error::TlsFail)?;
         map_result(unsafe {
-            SSL_CTX_load_verify_locations(
-                self.as_mut_ptr(),
-                file.as_ptr(),
-                ptr::null(),
-            )
+            SSL_CTX_load_verify_locations(self.as_mut_ptr(), file.as_ptr(), ptr::null())
         })
     }
 
-    pub fn load_verify_locations_from_directory(
-        &mut self, path: &str,
-    ) -> Result<()> {
+    pub fn load_verify_locations_from_directory(&mut self, path: &str) -> Result<()> {
         let path = ffi::CString::new(path).map_err(|_| Error::TlsFail)?;
         map_result(unsafe {
-            SSL_CTX_load_verify_locations(
-                self.as_mut_ptr(),
-                ptr::null(),
-                path.as_ptr(),
-            )
+            SSL_CTX_load_verify_locations(self.as_mut_ptr(), ptr::null(), path.as_ptr())
         })
     }
 
     pub fn use_certificate_chain_file(&mut self, file: &str) -> Result<()> {
         let cstr = ffi::CString::new(file).map_err(|_| Error::TlsFail)?;
-        map_result(unsafe {
-            SSL_CTX_use_certificate_chain_file(self.as_mut_ptr(), cstr.as_ptr())
-        })
+        map_result(unsafe { SSL_CTX_use_certificate_chain_file(self.as_mut_ptr(), cstr.as_ptr()) })
     }
 
     pub fn use_privkey_file(&mut self, file: &str) -> Result<()> {
         let cstr = ffi::CString::new(file).map_err(|_| Error::TlsFail)?;
-        map_result(unsafe {
-            SSL_CTX_use_PrivateKey_file(self.as_mut_ptr(), cstr.as_ptr(), 1)
-        })
+        map_result(unsafe { SSL_CTX_use_PrivateKey_file(self.as_mut_ptr(), cstr.as_ptr(), 1) })
     }
 
     #[cfg(not(windows))]
@@ -213,11 +202,10 @@ impl Context {
     fn load_ca_certs(&mut self) -> Result<()> {
         unsafe {
             let cstr = ffi::CString::new("Root").map_err(|_| Error::TlsFail)?;
-            let sys_store =
-                windows_sys::Win32::Security::Cryptography::CertOpenSystemStoreA(
-                    0,
-                    cstr.as_ptr() as windows_sys::core::PCSTR,
-                );
+            let sys_store = windows_sys::Win32::Security::Cryptography::CertOpenSystemStoreA(
+                0,
+                cstr.as_ptr() as windows_sys::core::PCSTR,
+            );
             if sys_store.is_null() {
                 return Err(Error::TlsFail);
             }
@@ -235,11 +223,7 @@ impl Context {
             while !ctx_p.is_null() {
                 let in_p = (*ctx_p).pbCertEncoded as *const u8;
 
-                let cert = d2i_X509(
-                    ptr::null_mut(),
-                    &in_p,
-                    (*ctx_p).cbCertEncoded as i32,
-                );
+                let cert = d2i_X509(ptr::null_mut(), &in_p, (*ctx_p).cbCertEncoded as i32);
                 if !cert.is_null() {
                     X509_STORE_add_cert(ctx_store, cert);
                 }
@@ -253,9 +237,7 @@ impl Context {
 
             // tidy up
             windows_sys::Win32::Security::Cryptography::CertFreeCertificateContext(ctx_p);
-            windows_sys::Win32::Security::Cryptography::CertCloseStore(
-                sys_store, 0,
-            );
+            windows_sys::Win32::Security::Cryptography::CertCloseStore(sys_store, 0);
         }
 
         Ok(())
@@ -279,8 +261,8 @@ impl Context {
         // false -> 0x00 SSL_VERIFY_NONE
         let mode = i32::from(verify);
 
-        // Note: Base on two used modes(see above), it seems ok for both, bssl and
-        // ossl. If mode needs to be ored then it may need to be adjusted.
+        // The two modes above work for both BoringSSL and OpenSSL. This may
+        // need adjustment if modes must be combined.
         unsafe {
             SSL_CTX_set_verify(self.as_mut_ptr(), mode, None);
         }
@@ -302,43 +284,39 @@ impl Context {
 
         // Configure ALPN for servers.
         unsafe {
-            SSL_CTX_set_alpn_select_cb(
-                self.as_mut_ptr(),
-                Some(select_alpn),
-                ptr::null_mut(),
-            );
+            SSL_CTX_set_alpn_select_cb(self.as_mut_ptr(), Some(select_alpn), ptr::null_mut());
         }
 
         // Configure ALPN for clients.
         map_result_zero_is_success(unsafe {
-            SSL_CTX_set_alpn_protos(
-                self.as_mut_ptr(),
-                protos.as_ptr(),
-                protos.len(),
-            )
+            SSL_CTX_set_alpn_protos(self.as_mut_ptr(), protos.as_ptr(), protos.len())
         })
     }
 
     pub fn set_ticket_key(&mut self, key: &[u8]) -> Result<()> {
         map_result(unsafe {
-            SSL_CTX_set_tlsext_ticket_keys(
-                self.as_mut_ptr(),
-                key.as_ptr(),
-                key.len(),
-            )
+            SSL_CTX_set_tlsext_ticket_keys(self.as_mut_ptr(), key.as_ptr(), key.len())
         })
     }
 
+    pub fn set_curves_list(&mut self, curves: &str) -> Result<()> {
+        // Note: BoringSSL exports `SSL_CTX_set1_groups_list` as a real
+        // function; OpenSSL (and openssl-quictls) defines it as a macro
+        // that expands to `SSL_CTX_ctrl`. Each backend provides a
+        // `SSL_CTX_set1_groups_list` shim in the per-vendor module so this
+        // call site can be backend-agnostic.
+        let cstr = ffi::CString::new(curves).map_err(|_| Error::TlsFail)?;
+        map_result(unsafe { SSL_CTX_set1_groups_list(self.as_mut_ptr(), cstr.as_ptr()) })
+    }
+
     fn as_mut_ptr(&mut self) -> *mut SSL_CTX {
-        self.0
+        self.0.as_ptr()
     }
 }
 
-// NOTE: These traits are not automatically implemented for Context due to the
-// raw pointer it wraps. However, the underlying data is not aliased (as Context
-// should be its only owner), and there is no interior mutability, as the
-// pointer is not accessed directly outside of this module, and the Context
-// object API should preserve Rust's borrowing guarantees.
+// These traits are not automatically implemented because NonNull does not
+// convey ownership. Context uniquely owns the underlying data, and its API
+// preserves Rust's borrowing guarantees.
 unsafe impl Send for Context {}
 unsafe impl Sync for Context {}
 
@@ -349,8 +327,7 @@ impl Drop for Context {
 }
 
 pub struct Handshake {
-    /// Raw pointer
-    ptr: *mut SSL,
+    ptr: NonNull<SSL>,
     /// SSL_process_quic_post_handshake should be called when whenever
     /// SSL_provide_quic_data is called to process the provided data.
     provided_data_outstanding: bool,
@@ -360,11 +337,13 @@ impl Handshake {
     // Note: some vendor-specific methods are implemented in the boringssl
     // submodule.
     #[cfg(any(feature = "ffi", feature = "boringssl-boring-crate"))]
-    pub unsafe fn from_ptr(ssl: *mut c_void) -> Handshake {
-        Handshake::new(ssl as *mut SSL)
+    pub unsafe fn from_ptr(ssl: *mut c_void) -> Result<Handshake> {
+        let ptr = NonNull::new(ssl.cast()).ok_or(Error::TlsFail)?;
+
+        Ok(Handshake::new(ptr))
     }
 
-    fn new(ptr: *mut SSL) -> Handshake {
+    fn new(ptr: NonNull<SSL>) -> Handshake {
         Handshake {
             ptr,
             provided_data_outstanding: false,
@@ -394,10 +373,7 @@ impl Handshake {
 
     pub fn use_legacy_codepoint(&mut self, use_legacy: bool) {
         unsafe {
-            SSL_set_quic_use_legacy_codepoint(
-                self.as_mut_ptr(),
-                use_legacy as c_int,
-            );
+            SSL_set_quic_use_legacy_codepoint(self.as_mut_ptr(), use_legacy as c_int);
         }
     }
 
@@ -419,21 +395,15 @@ impl Handshake {
     }
 
     pub fn set_quic_method(&mut self) -> Result<()> {
-        map_result(unsafe {
-            SSL_set_quic_method(self.as_mut_ptr(), &QUICHE_STREAM_METHOD)
-        })
+        map_result(unsafe { SSL_set_quic_method(self.as_mut_ptr(), &QUICHE_STREAM_METHOD) })
     }
 
     pub fn set_min_proto_version(&mut self, version: u16) -> Result<()> {
-        map_result(unsafe {
-            SSL_set_min_proto_version(self.as_mut_ptr(), version)
-        })
+        map_result(unsafe { SSL_set_min_proto_version(self.as_mut_ptr(), version) })
     }
 
     pub fn set_max_proto_version(&mut self, version: u16) -> Result<()> {
-        map_result(unsafe {
-            SSL_set_max_proto_version(self.as_mut_ptr(), version)
-        })
+        map_result(unsafe { SSL_set_max_proto_version(self.as_mut_ptr(), version) })
     }
 
     pub fn set_quiet_shutdown(&mut self, mode: bool) {
@@ -442,31 +412,25 @@ impl Handshake {
 
     pub fn set_host_name(&mut self, name: &str) -> Result<()> {
         let cstr = ffi::CString::new(name).map_err(|_| Error::TlsFail)?;
-        let rc =
-            unsafe { SSL_set_tlsext_host_name(self.as_mut_ptr(), cstr.as_ptr()) };
+        let rc = unsafe { SSL_set_tlsext_host_name(self.as_mut_ptr(), cstr.as_ptr()) };
         self.map_result_ssl(rc)?;
 
         let param = unsafe { SSL_get0_param(self.as_mut_ptr()) };
 
-        map_result(unsafe {
-            X509_VERIFY_PARAM_set1_host(param, cstr.as_ptr(), name.len())
-        })
+        map_result(unsafe { X509_VERIFY_PARAM_set1_host(param, cstr.as_ptr(), name.len()) })
     }
 
     pub fn set_quic_transport_params(
-        &mut self, params: &crate::TransportParams, is_server: bool,
+        &mut self,
+        params: &crate::TransportParams,
+        is_server: bool,
     ) -> Result<()> {
         let mut raw_params = [0; 128];
 
-        let raw_params =
-            crate::TransportParams::encode(params, is_server, &mut raw_params)?;
+        let raw_params = crate::TransportParams::encode(params, is_server, &mut raw_params)?;
 
         let rc = unsafe {
-            SSL_set_quic_transport_params(
-                self.as_mut_ptr(),
-                raw_params.as_ptr(),
-                raw_params.len(),
-            )
+            SSL_set_quic_transport_params(self.as_mut_ptr(), raw_params.as_ptr(), raw_params.len())
         };
         self.map_result_ssl(rc)
     }
@@ -518,18 +482,10 @@ impl Handshake {
         s.to_str().ok()
     }
 
-    pub fn provide_data(
-        &mut self, level: crypto::Level, buf: &[u8],
-    ) -> Result<()> {
+    pub fn provide_data(&mut self, level: crypto::Level, buf: &[u8]) -> Result<()> {
         self.provided_data_outstanding = true;
-        let rc = unsafe {
-            SSL_provide_quic_data(
-                self.as_mut_ptr(),
-                level,
-                buf.as_ptr(),
-                buf.len(),
-            )
-        };
+        let rc =
+            unsafe { SSL_provide_quic_data(self.as_mut_ptr(), level, buf.as_ptr(), buf.len()) };
         self.map_result_ssl(rc)
     }
 
@@ -563,8 +519,7 @@ impl Handshake {
     }
 
     pub fn cipher(&self) -> Option<crypto::Algorithm> {
-        let cipher =
-            map_result_ptr(unsafe { SSL_get_current_cipher(self.as_ptr()) });
+        let cipher = map_result_ptr(unsafe { SSL_get_current_cipher(self.as_ptr()) });
 
         get_cipher_from_ptr(cipher.ok()?).ok()
     }
@@ -590,11 +545,11 @@ impl Handshake {
     }
 
     fn as_ptr(&self) -> *const SSL {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
     fn as_mut_ptr(&mut self) -> *mut SSL {
-        self.ptr
+        self.ptr.as_ptr()
     }
 
     fn map_result_ssl(&mut self, bssl_result: c_int) -> Result<()> {
@@ -609,7 +564,7 @@ impl Handshake {
                         log_ssl_error();
 
                         Err(Error::TlsFail)
-                    },
+                    }
 
                     // SSL_ERROR_WANT_READ
                     2 => Err(Error::Done),
@@ -639,14 +594,14 @@ impl Handshake {
                     15 => {
                         self.reset_early_data_reject();
                         Err(Error::Done)
-                    },
+                    }
 
                     // SSL_ERROR_WANT_CERTIFICATE_VERIFY
                     16 => Err(Error::Done),
 
                     _ => Err(Error::TlsFail),
                 }
-            },
+            }
         }
     }
 
@@ -671,7 +626,10 @@ impl Handshake {
     /// Fills `out` with `out.len()` bytes derived from `label` and the optional
     /// `context`. Fails if the handshake has not completed.
     pub fn export_keying_material(
-        &mut self, out: &mut [u8], label: &[u8], context: Option<&[u8]>,
+        &mut self,
+        out: &mut [u8],
+        label: &[u8],
+        context: Option<&[u8]>,
     ) -> Result<()> {
         let (context, context_len, use_context) = match context {
             Some(c) => (c.as_ptr(), c.len(), 1),
@@ -706,11 +664,9 @@ impl Handshake {
     }
 }
 
-// NOTE: These traits are not automatically implemented for Handshake due to the
-// raw pointer it wraps. However, the underlying data is not aliased (as
-// Handshake should be its only owner), and there is no interior mutability, as
-// the pointer is not accessed directly outside of this module, and the
-// Handshake object API should preserve Rust's borrowing guarantees.
+// These traits are not automatically implemented because NonNull does not
+// convey ownership. Handshake uniquely owns the underlying data, and its API
+// preserves Rust's borrowing guarantees.
 unsafe impl Send for Handshake {}
 unsafe impl Sync for Handshake {}
 
@@ -739,13 +695,12 @@ pub struct ExData<'a> {
 
     pub tx_cap_factor: f64,
 
+    pub max_outstanding_sent_packets: Option<std::num::NonZeroUsize>,
+
     /// PMTUD configuration: (enable, max_probes)
     pub pmtud: Option<(bool, u8)>,
 
     pub is_server: bool,
-
-    /// see [`Connection::use_initial_max_data_as_flow_control_win`]
-    pub use_initial_max_data_as_flow_control_win: bool,
 }
 
 impl<'a> ExData<'a> {
@@ -787,8 +742,11 @@ fn get_cipher_from_ptr(cipher: *const SSL_CIPHER) -> Result<crypto::Algorithm> {
 }
 
 extern "C" fn set_read_secret(
-    ssl: *mut SSL, level: crypto::Level, cipher: *const SSL_CIPHER,
-    secret: *const u8, secret_len: usize,
+    ssl: *mut SSL,
+    level: crypto::Level,
+    cipher: *const SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
 ) -> c_int {
     let ex_data = match ExData::from_ssl_ptr(ssl) {
         Some(v) => v,
@@ -800,12 +758,9 @@ extern "C" fn set_read_secret(
 
     let space = match level {
         crypto::Level::Initial => &mut ex_data.crypto_ctx[packet::Epoch::Initial],
-        crypto::Level::ZeroRTT =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Application],
-        crypto::Level::Handshake =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
-        crypto::Level::OneRTT =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Application],
+        crypto::Level::ZeroRTT => &mut ex_data.crypto_ctx[packet::Epoch::Application],
+        crypto::Level::Handshake => &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
+        crypto::Level::OneRTT => &mut ex_data.crypto_ctx[packet::Epoch::Application],
     };
 
     let aead = match get_cipher_from_ptr(cipher) {
@@ -836,8 +791,11 @@ extern "C" fn set_read_secret(
 }
 
 extern "C" fn set_write_secret(
-    ssl: *mut SSL, level: crypto::Level, cipher: *const SSL_CIPHER,
-    secret: *const u8, secret_len: usize,
+    ssl: *mut SSL,
+    level: crypto::Level,
+    cipher: *const SSL_CIPHER,
+    secret: *const u8,
+    secret_len: usize,
 ) -> c_int {
     let ex_data = match ExData::from_ssl_ptr(ssl) {
         Some(v) => v,
@@ -849,12 +807,9 @@ extern "C" fn set_write_secret(
 
     let space = match level {
         crypto::Level::Initial => &mut ex_data.crypto_ctx[packet::Epoch::Initial],
-        crypto::Level::ZeroRTT =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Application],
-        crypto::Level::Handshake =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
-        crypto::Level::OneRTT =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Application],
+        crypto::Level::ZeroRTT => &mut ex_data.crypto_ctx[packet::Epoch::Application],
+        crypto::Level::Handshake => &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
+        crypto::Level::OneRTT => &mut ex_data.crypto_ctx[packet::Epoch::Application],
     };
 
     let aead = match get_cipher_from_ptr(cipher) {
@@ -880,7 +835,10 @@ extern "C" fn set_write_secret(
 }
 
 extern "C" fn add_handshake_data(
-    ssl: *mut SSL, level: crypto::Level, data: *const u8, len: usize,
+    ssl: *mut SSL,
+    level: crypto::Level,
+    data: *const u8,
+    len: usize,
 ) -> c_int {
     let ex_data = match ExData::from_ssl_ptr(ssl) {
         Some(v) => v,
@@ -900,10 +858,8 @@ extern "C" fn add_handshake_data(
     let space = match level {
         crypto::Level::Initial => &mut ex_data.crypto_ctx[packet::Epoch::Initial],
         crypto::Level::ZeroRTT => unreachable!(),
-        crypto::Level::Handshake =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
-        crypto::Level::OneRTT =>
-            &mut ex_data.crypto_ctx[packet::Epoch::Application],
+        crypto::Level::Handshake => &mut ex_data.crypto_ctx[packet::Epoch::Handshake],
+        crypto::Level::OneRTT => &mut ex_data.crypto_ctx[packet::Epoch::Application],
     };
 
     if space.crypto_stream.send.write(buf, false).is_err() {
@@ -920,9 +876,7 @@ extern "C" fn flush_flight(_ssl: *mut SSL) -> c_int {
     1
 }
 
-extern "C" fn send_alert(
-    ssl: *mut SSL, level: crypto::Level, alert: u8,
-) -> c_int {
+extern "C" fn send_alert(ssl: *mut SSL, level: crypto::Level, alert: u8) -> c_int {
     let ex_data = match ExData::from_ssl_ptr(ssl) {
         Some(v) => v,
 
@@ -966,8 +920,12 @@ extern "C" fn keylog(ssl: *const SSL, line: *const c_char) {
 }
 
 extern "C" fn select_alpn(
-    ssl: *mut SSL, out: *mut *const u8, out_len: *mut u8, inp: *mut u8,
-    in_len: c_uint, _arg: *mut c_void,
+    ssl: *mut SSL,
+    out: *mut *const u8,
+    out_len: *mut u8,
+    inp: *mut u8,
+    in_len: c_uint,
+    _arg: *mut c_void,
 ) -> c_int {
     // SSL_TLSEXT_ERR_OK 0
     // SSL_TLSEXT_ERR_ALERT_WARNING 1
@@ -987,9 +945,8 @@ extern "C" fn select_alpn(
         return TLS_ERROR;
     }
 
-    let mut protos = octets::Octets::with_slice(unsafe {
-        slice::from_raw_parts(inp, in_len as usize)
-    });
+    let mut protos =
+        octets::Octets::with_slice(unsafe { slice::from_raw_parts(inp, in_len as usize) });
 
     while let Ok(proto) = protos.get_bytes_with_u8_length() {
         let found = ex_data.application_protos.iter().any(|expected| {
@@ -999,9 +956,7 @@ extern "C" fn select_alpn(
                 std::str::from_utf8(expected.as_slice())
             );
 
-            if expected.len() == proto.len() &&
-                expected.as_slice() == proto.as_ref()
-            {
+            if expected.len() == proto.len() && expected.as_slice() == proto.as_ref() {
                 unsafe {
                     *out = expected.as_slice().as_ptr();
                     *out_len = expected.len() as u8;
@@ -1022,7 +977,13 @@ extern "C" fn select_alpn(
 }
 
 extern "C" fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
-    let ex_data = match ExData::from_ssl_ptr(ssl) {
+    let ssl = match NonNull::new(ssl) {
+        Some(v) => v,
+
+        None => return 0,
+    };
+
+    let ex_data = match ExData::from_ssl_ptr(ssl.as_ptr()) {
         Some(v) => v,
 
         None => return 0,
@@ -1039,8 +1000,7 @@ extern "C" fn new_session(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int {
         Err(_) => return 0,
     };
 
-    let mut buffer =
-        Vec::with_capacity(8 + peer_params.len() + 8 + session_bytes.len());
+    let mut buffer = Vec::with_capacity(8 + peer_params.len() + 8 + session_bytes.len());
 
     let session_bytes_len = session_bytes.len() as u64;
 
@@ -1117,16 +1077,14 @@ extern "C" {
     fn SSL_CTX_new(method: *const SSL_METHOD) -> *mut SSL_CTX;
     fn SSL_CTX_free(ctx: *mut SSL_CTX);
 
-    fn SSL_CTX_use_certificate_chain_file(
-        ctx: *mut SSL_CTX, file: *const c_char,
-    ) -> c_int;
+    fn SSL_CTX_use_certificate_chain_file(ctx: *mut SSL_CTX, file: *const c_char) -> c_int;
 
-    fn SSL_CTX_use_PrivateKey_file(
-        ctx: *mut SSL_CTX, file: *const c_char, ty: c_int,
-    ) -> c_int;
+    fn SSL_CTX_use_PrivateKey_file(ctx: *mut SSL_CTX, file: *const c_char, ty: c_int) -> c_int;
 
     fn SSL_CTX_load_verify_locations(
-        ctx: *mut SSL_CTX, file: *const c_char, path: *const c_char,
+        ctx: *mut SSL_CTX,
+        file: *const c_char,
+        path: *const c_char,
     ) -> c_int;
 
     #[cfg(not(windows))]
@@ -1136,13 +1094,9 @@ extern "C" {
     fn SSL_CTX_get_cert_store(ctx: *mut SSL_CTX) -> *mut X509_STORE;
 
     fn SSL_CTX_set_verify(
-        ctx: *mut SSL_CTX, mode: c_int,
-        cb: Option<
-            unsafe extern "C" fn(
-                ok: c_int,
-                store_ctx: *mut X509_STORE_CTX,
-            ) -> c_int,
-        >,
+        ctx: *mut SSL_CTX,
+        mode: c_int,
+        cb: Option<unsafe extern "C" fn(ok: c_int, store_ctx: *mut X509_STORE_CTX) -> c_int>,
     );
 
     fn SSL_CTX_set_keylog_callback(
@@ -1150,9 +1104,7 @@ extern "C" {
         cb: Option<unsafe extern "C" fn(ssl: *const SSL, line: *const c_char)>,
     );
 
-    fn SSL_CTX_set_alpn_protos(
-        ctx: *mut SSL_CTX, protos: *const u8, protos_len: usize,
-    ) -> c_int;
+    fn SSL_CTX_set_alpn_protos(ctx: *mut SSL_CTX, protos: *const u8, protos_len: usize) -> c_int;
 
     fn SSL_CTX_set_alpn_select_cb(
         ctx: *mut SSL_CTX,
@@ -1171,12 +1123,7 @@ extern "C" {
 
     fn SSL_CTX_sess_set_new_cb(
         ctx: *mut SSL_CTX,
-        cb: Option<
-            unsafe extern "C" fn(
-                ssl: *mut SSL,
-                session: *mut SSL_SESSION,
-            ) -> c_int,
-        >,
+        cb: Option<unsafe extern "C" fn(ssl: *mut SSL, session: *mut SSL_SESSION) -> c_int>,
     );
 
     fn SSL_new(ctx: *mut SSL_CTX) -> *mut SSL;
@@ -1199,13 +1146,9 @@ extern "C" {
 
     fn SSL_set_quiet_shutdown(ssl: *mut SSL, mode: c_int);
 
-    fn SSL_set_quic_transport_params(
-        ssl: *mut SSL, params: *const u8, params_len: usize,
-    ) -> c_int;
+    fn SSL_set_quic_transport_params(ssl: *mut SSL, params: *const u8, params_len: usize) -> c_int;
 
-    fn SSL_set_quic_method(
-        ssl: *mut SSL, quic_method: *const SSL_QUIC_METHOD,
-    ) -> c_int;
+    fn SSL_set_quic_method(ssl: *mut SSL, quic_method: *const SSL_QUIC_METHOD) -> c_int;
 
     fn SSL_set_quic_use_legacy_codepoint(ssl: *mut SSL, use_legacy: c_int);
 
@@ -1213,17 +1156,20 @@ extern "C" {
     fn SSL_set_options(ssl: *mut SSL, opts: u32) -> u32;
 
     fn SSL_get_peer_quic_transport_params(
-        ssl: *const SSL, out_params: *mut *const u8, out_params_len: *mut usize,
+        ssl: *const SSL,
+        out_params: *mut *const u8,
+        out_params_len: *mut usize,
     );
 
-    fn SSL_get0_alpn_selected(
-        ssl: *const SSL, out: *mut *const u8, out_len: *mut u32,
-    );
+    fn SSL_get0_alpn_selected(ssl: *const SSL, out: *mut *const u8, out_len: *mut u32);
 
     fn SSL_get_servername(ssl: *const SSL, ty: c_int) -> *const c_char;
 
     fn SSL_provide_quic_data(
-        ssl: *mut SSL, level: crypto::Level, data: *const u8, len: usize,
+        ssl: *mut SSL,
+        level: crypto::Level,
+        data: *const u8,
+        len: usize,
     ) -> c_int;
 
     fn SSL_process_quic_post_handshake(ssl: *mut SSL) -> c_int;
@@ -1239,8 +1185,13 @@ extern "C" {
     fn SSL_clear(ssl: *mut SSL) -> c_int;
 
     fn SSL_export_keying_material(
-        ssl: *mut SSL, out: *mut u8, out_len: usize, label: *const c_char,
-        label_len: usize, context: *const u8, context_len: usize,
+        ssl: *mut SSL,
+        out: *mut u8,
+        out_len: usize,
+        label: *const c_char,
+        label_len: usize,
+        context: *const u8,
+        context_len: usize,
         use_context: c_int,
     ) -> c_int;
 
@@ -1255,7 +1206,9 @@ extern "C" {
 
     // X509_VERIFY_PARAM
     fn X509_VERIFY_PARAM_set1_host(
-        param: *mut X509_VERIFY_PARAM, name: *const c_char, namelen: usize,
+        param: *mut X509_VERIFY_PARAM,
+        name: *const c_char,
+        namelen: usize,
     ) -> c_int;
 
     // X509_STORE

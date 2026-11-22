@@ -82,6 +82,7 @@ impl PathState {
 
 /// A path-specific event.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathEvent {
     /// A new network path (local address, peer address) has been seen on a
     /// received packet. Note that this event is only triggered for servers, as
@@ -105,11 +106,7 @@ pub enum PathEvent {
     /// The stack observes that the Source Connection ID with the given sequence
     /// number, initially used by the peer over the first pair of `SocketAddr`s,
     /// is now reused over the second pair of `SocketAddr`s.
-    ReusedSourceConnectionId(
-        u64,
-        (SocketAddr, SocketAddr),
-        (SocketAddr, SocketAddr),
-    ),
+    ReusedSourceConnectionId(u64, (SocketAddr, SocketAddr), (SocketAddr, SocketAddr)),
 
     /// The connection observed that the peer migrated over the network path
     /// denoted by the pair of `SocketAddr`, i.e., non-probing packets have been
@@ -117,6 +114,37 @@ pub enum PathEvent {
     ///
     /// Note that this event is only raised if the path has been validated.
     PeerMigrated(SocketAddr, SocketAddr),
+
+    /// The validated PMTU available for normal application traffic changed on
+    /// the network path between `local` and `peer`.
+    ///
+    /// This event is generated only while PMTUD is enabled. It reports the
+    /// largest successfully probed size, falling back to QUIC's minimum packet
+    /// size while no larger size is validated. Unvalidated probe sizes and the
+    /// initial minimum set when the path is created are not reported.
+    PmtuUpdated {
+        /// The path's local address.
+        local: SocketAddr,
+
+        /// The path's peer address.
+        peer: SocketAddr,
+
+        /// The current validated PMTU limit for normal application traffic.
+        pmtu: usize,
+    },
+}
+
+pub(crate) fn pmtu_event(
+    local: SocketAddr,
+    peer: SocketAddr,
+    old: usize,
+    new: usize,
+) -> Option<PathEvent> {
+    (old != new).then_some(PathEvent::PmtuUpdated {
+        local,
+        peer,
+        pmtu: new,
+    })
 }
 
 /// A network path on which QUIC packets can be sent.
@@ -229,9 +257,11 @@ impl Path {
     /// Create a new Path instance with the provided addresses, the remaining of
     /// the fields being set to their default value.
     pub fn new(
-        local_addr: SocketAddr, peer_addr: SocketAddr,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
         recovery_config: &recovery::RecoveryConfig,
-        path_challenge_recv_max_queue_len: usize, is_initial: bool,
+        path_challenge_recv_max_queue_len: usize,
+        is_initial: bool,
         config: Option<&Config>,
     ) -> Self {
         let (state, active_scid_seq, active_dcid_seq) = if is_initial {
@@ -243,8 +273,9 @@ impl Path {
         let pmtud = config.and_then(|c| {
             if c.pmtud {
                 let maximum_supported_mtu: usize = std::cmp::min(
-                    // if the max_udp_payload_size doesn't fit into a usize, then
-                    // max_send_udp_payload_size must be smaller so use that
+                    // if the max_udp_payload_size doesn't fit into a usize,
+                    // then max_send_udp_payload_size must be smaller so use
+                    // that
                     c.local_transport_params
                         .max_udp_payload_size
                         .try_into()
@@ -270,9 +301,7 @@ impl Path {
             max_challenge_size: 0,
             probing_lost: 0,
             last_probe_lost_time: None,
-            received_challenges: VecDeque::with_capacity(
-                path_challenge_recv_max_queue_len,
-            ),
+            received_challenges: VecDeque::with_capacity(path_challenge_recv_max_queue_len),
             received_challenges_max_len: path_challenge_recv_max_queue_len,
             sent_count: 0,
             recv_count: 0,
@@ -321,9 +350,7 @@ impl Path {
     /// Returns whether the path can be used to send non-probing packets.
     #[inline]
     pub fn usable(&self) -> bool {
-        self.active() ||
-            (self.state == PathState::Validated &&
-                self.active_dcid_seq.is_some())
+        self.active() || (self.state == PathState::Validated && self.active_dcid_seq.is_some())
     }
 
     /// Returns whether the path is unused.
@@ -378,19 +405,23 @@ impl Path {
     }
 
     pub fn should_send_pmtu_probe(
-        &mut self, hs_confirmed: bool, hs_done: bool, out_len: usize,
-        is_closing: bool, frames_empty: bool,
+        &mut self,
+        hs_confirmed: bool,
+        hs_done: bool,
+        out_len: usize,
+        is_closing: bool,
+        frames_empty: bool,
     ) -> bool {
         let Some(pmtud) = self.pmtud.as_mut() else {
             return false;
         };
 
-        (hs_confirmed && hs_done) &&
-            self.recovery.cwnd_available() > pmtud.get_probe_size() &&
-            out_len >= pmtud.get_probe_size() &&
-            pmtud.should_probe() &&
-            !is_closing &&
-            frames_empty
+        (hs_confirmed && hs_done)
+            && self.recovery.cwnd_available() > pmtud.get_probe_size()
+            && out_len >= pmtud.get_probe_size()
+            && pmtud.should_probe()
+            && !is_closing
+            && frames_empty
     }
 
     pub fn on_challenge_sent(&mut self) {
@@ -399,9 +430,7 @@ impl Path {
     }
 
     /// Handles the sending of PATH_CHALLENGE.
-    pub fn add_challenge_sent(
-        &mut self, data: [u8; 8], pkt_size: usize, sent_time: Instant,
-    ) {
+    pub fn add_challenge_sent(&mut self, data: [u8; 8], pkt_size: usize, sent_time: Instant) {
         self.on_challenge_sent();
         self.in_flight_challenges
             .push_back((data, pkt_size, sent_time));
@@ -439,8 +468,7 @@ impl Path {
         // The 4-tuple is reachable, but we didn't check Path MTU yet.
         self.promote_to(PathState::ValidatingMTU);
 
-        self.max_challenge_size =
-            std::cmp::max(self.max_challenge_size, challenge_size);
+        self.max_challenge_size = std::cmp::max(self.max_challenge_size, challenge_size);
 
         if self.state == PathState::ValidatingMTU {
             if self.max_challenge_size >= crate::MIN_CLIENT_INITIAL_LEN {
@@ -467,14 +495,15 @@ impl Path {
     }
 
     pub fn on_loss_detection_timeout(
-        &mut self, handshake_status: HandshakeStatus, now: Instant,
-        is_server: bool, trace_id: &str,
+        &mut self,
+        handshake_status: HandshakeStatus,
+        now: Instant,
+        is_server: bool,
+        trace_id: &str,
     ) -> OnLossDetectionTimeoutOutcome {
-        let outcome = self.recovery.on_loss_detection_timeout(
-            handshake_status,
-            now,
-            trace_id,
-        );
+        let outcome = self
+            .recovery
+            .on_loss_detection_timeout(handshake_status, now, trace_id);
 
         let mut lost_probe_time = None;
         self.in_flight_challenges.retain(|(_, _, sent_time)| {
@@ -500,17 +529,17 @@ impl Path {
                     } else {
                         Some(last)
                     }
-                },
+                }
                 None => {
                     self.probing_lost += 1;
                     Some(lost_probe_time)
-                },
+                }
             };
             // As a server, if requesting a challenge is not
             // possible due to the amplification attack, declare the
             // validation as failed.
-            if self.probing_lost >= crate::MAX_PROBING_TIMEOUTS ||
-                (is_server && self.max_send_bytes < crate::MIN_PROBING_SIZE)
+            if self.probing_lost >= crate::MAX_PROBING_TIMEOUTS
+                || (is_server && self.max_send_bytes < crate::MIN_PROBING_SIZE)
             {
                 self.on_failed_validation();
             } else {
@@ -528,19 +557,15 @@ impl Path {
     /// packets, and it is still OK to fully reinitialize the recovery module to
     /// pickup changes to congestion control config.
     pub fn can_reinit_recovery(&self) -> bool {
-        // The recovery module can be reinitialized until the connection attempts
-        // to send a packet with inflight data. The congestion
-        // controller doesn't track anything interesting until inflight
-        // data is sent. Handshake ACKs may be sent prior to arrival of
-        // the full ClientHello, but the send of ACK only packets
-        // shouldn't prevent the reinit of the recovery module.
-        self.recovery.bytes_in_flight() == 0 &&
-            self.recovery.bytes_in_flight_duration() == Duration::ZERO
+        // Recovery can be reinitialized until the connection sends in-flight
+        // data. The congestion controller has no relevant state before then.
+        // ACK-only packets sent before the full ClientHello arrives should not
+        // prevent reinitialization.
+        self.recovery.bytes_in_flight() == 0
+            && self.recovery.bytes_in_flight_duration() == Duration::ZERO
     }
 
-    pub fn reinit_recovery(
-        &mut self, recovery_config: &recovery::RecoveryConfig,
-    ) {
+    pub fn reinit_recovery(&mut self, recovery_config: &recovery::RecoveryConfig) {
         self.recovery = recovery::Recovery::new_with_config(recovery_config)
     }
 
@@ -579,6 +604,7 @@ impl Path {
                 .recovery
                 .max_bandwidth()
                 .map(Bandwidth::to_bytes_per_second),
+            rtt_persistent_jump_count: self.recovery.rtt_persistent_jump_count(),
             startup_exit: self.recovery.startup_exit(),
         }
     }
@@ -636,10 +662,9 @@ pub struct PathMap {
 impl PathMap {
     /// Creates a new `PathMap` with the initial provided `path` and a
     /// capacity limit.
-    pub fn new(
-        mut initial_path: Path, max_concurrent_paths: usize, is_server: bool,
-    ) -> Self {
-        let mut paths = Slab::with_capacity(1); // most connections only have one path
+    pub fn new(mut initial_path: Path, max_concurrent_paths: usize, is_server: bool) -> Self {
+        // Most connections only have one path.
+        let mut paths = Slab::with_capacity(1);
         let mut addrs_to_paths = BTreeMap::new();
 
         let local_addr = initial_path.local_addr;
@@ -734,6 +759,15 @@ impl PathMap {
         self.paths.iter_mut()
     }
 
+    /// Returns a mutable iterator over all existing paths and the path event
+    /// queue.
+    #[inline]
+    pub(crate) fn iter_mut_and_events(
+        &mut self,
+    ) -> (slab::IterMut<'_, Path>, &mut VecDeque<PathEvent>) {
+        (self.paths.iter_mut(), &mut self.events)
+    }
+
     /// Returns the number of existing paths.
     #[inline]
     pub fn len(&self) -> usize {
@@ -742,9 +776,7 @@ impl PathMap {
 
     /// Returns the `Path` identifier related to the provided `addrs`.
     #[inline]
-    pub fn path_id_from_addrs(
-        &self, addrs: &(SocketAddr, SocketAddr),
-    ) -> Option<usize> {
+    pub fn path_id_from_addrs(&self, addrs: &(SocketAddr, SocketAddr)) -> Option<usize> {
         self.addrs_to_paths.get(addrs).copied()
     }
 
@@ -818,10 +850,8 @@ impl PathMap {
             .filter(|(_, p)| p.validation_failed() && !p.failure_notified);
 
         for (_, p) in validation_failed {
-            self.events.push_back(PathEvent::FailedValidation(
-                p.local_addr,
-                p.peer_addr,
-            ));
+            self.events
+                .push_back(PathEvent::FailedValidation(p.local_addr, p.peer_addr));
 
             p.failure_notified = true;
         }
@@ -840,8 +870,7 @@ impl PathMap {
     pub fn on_response_received(&mut self, data: [u8; 8]) -> Result<()> {
         let active_pid = self.get_active_path_id()?;
 
-        let challenge_pending =
-            self.iter_mut().find(|(_, p)| p.has_pending_challenge(data));
+        let challenge_pending = self.iter_mut().find(|(_, p)| p.has_pending_challenge(data));
 
         if let Some((pid, p)) = challenge_pending {
             if p.on_response_received(data) {
@@ -857,9 +886,7 @@ impl PathMap {
                 // If this path was the candidate for migration, notifies the
                 // application.
                 if pid == active_pid && was_migrating {
-                    self.notify_event(PathEvent::PeerMigrated(
-                        local_addr, peer_addr,
-                    ));
+                    self.notify_event(PathEvent::PeerMigrated(local_addr, peer_addr));
                 }
             }
         }
@@ -907,10 +934,19 @@ impl PathMap {
 
     /// Configures path MTU discovery on all existing paths.
     pub fn set_discover_pmtu_on_existing_paths(
-        &mut self, discover: bool, max_send_udp_payload_size: usize,
+        &mut self,
+        discover: bool,
+        max_send_udp_payload_size: usize,
         pmtud_max_probes: u8,
     ) {
         for (_, path) in self.paths.iter_mut() {
+            let old_pmtu = path
+                .pmtud
+                .as_ref()
+                .map_or(path.recovery.max_datagram_size(), |pmtud| {
+                    pmtud.get_current_mtu()
+                });
+
             path.pmtud = if discover {
                 Some(pmtud::Pmtud::new(
                     max_send_udp_payload_size,
@@ -919,6 +955,17 @@ impl PathMap {
             } else {
                 None
             };
+
+            if let Some(pmtud) = path.pmtud.as_ref() {
+                if let Some(event) = pmtu_event(
+                    path.local_addr,
+                    path.peer_addr,
+                    old_pmtu,
+                    pmtud.get_current_mtu(),
+                ) {
+                    self.events.push_back(event);
+                }
+            }
         }
     }
 }
@@ -1020,6 +1067,9 @@ pub struct PathStats {
     /// it is currently only implemented for bbr2_gcongestion.
     pub max_bandwidth: Option<u64>,
 
+    /// The total number of confirmed persistent RTT jump episodes.
+    pub rtt_persistent_jump_count: u64,
+
     /// Statistics from when a CCA first exited the startup phase.
     pub startup_exit: Option<StartupExit>,
 }
@@ -1040,7 +1090,14 @@ impl std::fmt::Debug for PathStats {
         write!(
             f,
             "recv={} sent={} lost={} retrans={} rtt={:?} min_rtt={:?} rttvar={:?} cwnd={}",
-            self.recv, self.sent, self.lost, self.retrans, self.rtt, self.min_rtt, self.rttvar, self.cwnd,
+            self.recv,
+            self.sent,
+            self.lost,
+            self.retrans,
+            self.rtt,
+            self.min_rtt,
+            self.rttvar,
+            self.cwnd,
         )?;
 
         write!(
@@ -1051,8 +1108,11 @@ impl std::fmt::Debug for PathStats {
 
         write!(
             f,
-            " stream_retrans_bytes={} pmtu={} delivery_rate={}",
-            self.stream_retrans_bytes, self.pmtu, self.delivery_rate,
+            " stream_retrans_bytes={} pmtu={} delivery_rate={} rtt_persistent_jump_count={}",
+            self.stream_retrans_bytes,
+            self.pmtu,
+            self.delivery_rate,
+            self.rtt_persistent_jump_count,
         )
     }
 }
@@ -1060,12 +1120,83 @@ impl std::fmt::Debug for PathStats {
 #[cfg(test)]
 mod tests {
     use crate::rand;
+    use crate::test_utils;
     use crate::MIN_CLIENT_INITIAL_LEN;
 
     use crate::recovery::RecoveryConfig;
     use crate::Config;
 
     use super::*;
+
+    #[test]
+    fn pmtud_probe_respects_cwnd_during_pto() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.discover_pmtu(true);
+        config.set_max_send_udp_payload_size(1400);
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let mut path = Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            Some(&config),
+        );
+        let now = Instant::now();
+        let cwnd = path.recovery.cwnd();
+
+        path.recovery.on_packet_sent(
+            test_utils::helper_packet_sent(0, now, cwnd),
+            crate::packet::Epoch::Application,
+            HandshakeStatus {
+                has_handshake_keys: false,
+                peer_verified_address: true,
+                completed: true,
+            },
+            now,
+            "",
+        );
+        path.recovery
+            .inc_loss_probes(crate::packet::Epoch::Application);
+
+        assert!(path.pmtud.as_ref().unwrap().should_probe());
+        assert!(!path.should_send_pmtu_probe(true, true, 1400, false, true));
+    }
+
+    #[test]
+    fn reinitializing_pmtud_notifies_fallback_limit() {
+        let local = "127.0.0.1:1234".parse().unwrap();
+        let peer = "127.0.0.1:4321".parse().unwrap();
+        let mut config = Config::new(crate::PROTOCOL_VERSION).unwrap();
+        config.discover_pmtu(true);
+        config.set_max_send_udp_payload_size(1400);
+        let recovery_config = RecoveryConfig::from_config(&config);
+        let mut path = Path::new(
+            local,
+            peer,
+            &recovery_config,
+            config.path_challenge_recv_max_queue_len,
+            true,
+            Some(&config),
+        );
+        path.pmtud.as_mut().unwrap().successful_probe(1400);
+        let mut paths = PathMap::new(path, 1, false);
+
+        paths.set_discover_pmtu_on_existing_paths(false, 1400, 1);
+        assert_eq!(paths.pop_event(), None);
+
+        paths.set_discover_pmtu_on_existing_paths(true, 1400, 1);
+        assert_eq!(
+            paths.pop_event(),
+            Some(PathEvent::PmtuUpdated {
+                local,
+                peer,
+                pmtu: MIN_CLIENT_INITIAL_LEN,
+            })
+        );
+    }
 
     #[test]
     fn path_validation_limited_mtu() {
@@ -1103,8 +1234,7 @@ mod tests {
         assert!(path_mgr.get_mut(pid).unwrap().validation_requested());
         assert!(path_mgr.get_mut(pid).unwrap().probing_required());
 
-        // Fake sending of PathChallenge in a packet of MIN_CLIENT_INITIAL_LEN - 1
-        // bytes.
+        // Send `PathChallenge` one byte below `MIN_CLIENT_INITIAL_LEN`.
         let data = rand::rand_u64().to_be_bytes();
         path_mgr.get_mut(pid).unwrap().add_challenge_sent(
             data,

@@ -255,6 +255,49 @@ describe('WebTransportServer', () => {
         expect(stats.datagrams.droppedIncoming).toBeGreaterThan(0);
     });
 
+    it('reports peer cancellation before the application writes to a stream', async () => {
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+
+        const session = server.incomingSessions.getReader().read();
+        const client = connect(`https://127.0.0.1:${server.port}/cancel`);
+        await client.ready;
+        const receiver = (await session).value!.incomingBidirectionalStreams.getReader();
+
+        const stream = await client.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        const stopped = expect(writer.closed).rejects.toMatchObject({ streamErrorCode: 42 });
+        await (
+            await receiver.read()
+        ).value!.readable.cancel(
+            new WebTransportError('cancelled', { source: 'stream', streamErrorCode: 42 }),
+        );
+        await stopped;
+    });
+
+    it('rejects an in-flight write when the peer stops reading', async () => {
+        const server = new WebTransportServer({ port: 0, host: '127.0.0.1', cert: CERT, key: KEY });
+        servers.push(server);
+        await server.ready;
+
+        const session = server.incomingSessions.getReader().read();
+        const client = connect(`https://127.0.0.1:${server.port}/cancel`);
+        await client.ready;
+        const peer = (await session).value!;
+        expect(peer.datagrams.maxDatagramSize).toBeGreaterThan(0);
+
+        const stream = await client.createBidirectionalStream();
+        const writer = stream.writable.getWriter();
+        const writing = writer.write(new Uint8Array(512 * 1024));
+        const rejected = expect(writing).rejects.toMatchObject({ streamErrorCode: 42 });
+        const { value: incoming } = await peer.incomingBidirectionalStreams.getReader().read();
+        await incoming!.readable.cancel(
+            new WebTransportError('cancelled', { source: 'stream', streamErrorCode: 42 }),
+        );
+        await rejected;
+    });
+
     it('accepts sendOrder / sendGroup on stream creation and exposes them', async () => {
         const url = await echoServer();
         const wt = connect(url);

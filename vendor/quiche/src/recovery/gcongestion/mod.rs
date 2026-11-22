@@ -76,8 +76,12 @@ pub(super) trait CongestionControl: Debug {
     /// before the packet was sent. Note: this function must be called for
     /// every packet sent to the wire.
     fn on_packet_sent(
-        &mut self, sent_time: Instant, bytes_in_flight: usize,
-        packet_number: u64, bytes: usize, is_retransmissible: bool,
+        &mut self,
+        sent_time: Instant,
+        bytes_in_flight: usize,
+        packet_number: u64,
+        bytes: usize,
+        is_retransmissible: bool,
     );
 
     /// Inform that `packet_number` has been neutered.
@@ -91,9 +95,15 @@ pub(super) trait CongestionControl: Debug {
     /// congestion event.
     #[allow(clippy::too_many_arguments)]
     fn on_congestion_event(
-        &mut self, rtt_updated: bool, prior_in_flight: usize,
-        bytes_in_flight: usize, event_time: Instant, acked_packets: &[Acked],
-        lost_packets: &[Lost], least_unacked: u64, rtt_stats: &RttStats,
+        &mut self,
+        rtt_updated: bool,
+        prior_in_flight: usize,
+        bytes_in_flight: usize,
+        event_time: Instant,
+        acked_packets: &[Acked],
+        lost_packets: &[Lost],
+        least_unacked: u64,
+        rtt_stats: &RttStats,
         recovery_stats: &mut RecoveryStats,
     );
 
@@ -113,9 +123,7 @@ pub(super) trait CongestionControl: Debug {
     #[allow(dead_code)]
     fn is_cwnd_limited(&self, bytes_in_flight: usize) -> bool;
 
-    fn pacing_rate(
-        &self, bytes_in_flight: usize, rtt_stats: &RttStats,
-    ) -> Bandwidth;
+    fn pacing_rate(&self, bytes_in_flight: usize, rtt_stats: &RttStats) -> Bandwidth;
 
     fn bandwidth_estimate(&self, rtt_stats: &RttStats) -> Bandwidth;
 
@@ -221,6 +229,10 @@ pub struct BbrParams {
     /// initial cwnd by the first RTT estimate.
     pub initial_pacing_rate_bytes_per_second: Option<u64>,
 
+    /// Lower bound on the congestion window in packets.  If not set,
+    /// the initial congestion window is used as the lower bound.
+    pub min_cwnd_packets: Option<usize>,
+
     /// If true, scale the pacing rate when updating mss when doing pmtud.
     pub scale_pacing_rate_by_mss: Option<bool>,
 
@@ -233,6 +245,47 @@ pub struct BbrParams {
     /// on `get_next_release_time()` can result in artificially low
     /// minRTT measurements which will make BBR misbehave.
     pub time_sent_set_to_now: Option<bool>,
+
+    /// Selects the RTT jump detector implementation.
+    #[cfg(feature = "internal")]
+    pub rtt_jump_detector: Option<BbrRttJumpDetector>,
+}
+
+/// Selects which RTT jump detector BBR uses.
+///
+/// This functionality is experimental and will be removed in the future.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+#[repr(C)]
+#[doc(hidden)]
+pub enum BbrRttJumpDetector {
+    /// Disables RTT jump detection.
+    #[default]
+    Disabled = 0,
+
+    /// Connection-lifetime minimum baseline with a strict multiplicative jump
+    /// test and a sample/duration confirmation gate.
+    GlobalMin = 1,
+
+    /// 3-state Hidden Markov Model (HMM) decoded with a scaled forward filter.
+    Hmm = 2,
+}
+
+#[doc(hidden)]
+impl FromStr for BbrRttJumpDetector {
+    type Err = crate::Error;
+
+    /// Converts a string to `BbrRttJumpDetector`.
+    ///
+    /// If `name` is not valid, `Error::CongestionControl` is returned.
+    fn from_str(name: &str) -> Result<Self, Self::Err> {
+        match name {
+            "none" => Ok(BbrRttJumpDetector::Disabled),
+            "global_min" => Ok(BbrRttJumpDetector::GlobalMin),
+            "hmm" => Ok(BbrRttJumpDetector::Hmm),
+
+            _ => Err(crate::Error::CongestionControl),
+        }
+    }
 }
 
 /// Controls BBR's bandwidth reduction strategy on congestion event.
@@ -243,16 +296,16 @@ pub struct BbrParams {
 #[doc(hidden)]
 pub enum BbrBwLoReductionStrategy {
     /// Uses the default strategy based on `BBRBeta`.
-    Default           = 0,
+    Default = 0,
 
     /// Considers min-rtt to estimate bandwidth reduction.
-    MinRttReduction   = 1,
+    MinRttReduction = 1,
 
     /// Considers inflight data to estimate bandwidth reduction.
     InflightReduction = 2,
 
     /// Considers cwnd to estimate bandwidth reduction.
-    CwndReduction     = 3,
+    CwndReduction = 3,
 }
 
 #[doc(hidden)]

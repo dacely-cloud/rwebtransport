@@ -59,10 +59,7 @@ impl TestSender {
             next_ack: 0,
             bytes_in_flight: 0,
             time: Instant::now(),
-            rtt_stats: RttStats::new(
-                DEFAULT_INITIAL_RTT,
-                Duration::from_micros(0),
-            ),
+            rtt_stats: RttStats::new(DEFAULT_INITIAL_RTT, Duration::from_micros(0)),
             cc: Congestion::from_config(&RecoveryConfig::from_config(&cfg)),
             sent_packets: VecDeque::new(),
         }
@@ -88,14 +85,8 @@ impl TestSender {
             is_pmtud_probe: false,
         };
 
-        self.cc.on_packet_sent(
-            self.bytes_in_flight,
-            bytes,
-            self.time,
-            &mut sent,
-            0,
-            true,
-        );
+        self.cc
+            .on_packet_sent(self.bytes_in_flight, bytes, self.time, &mut sent, 0, true);
 
         self.sent_packets.push_back(sent);
 
@@ -106,12 +97,8 @@ impl TestSender {
     pub(crate) fn inject_ack(&mut self, acked: Acked, now: Instant) {
         let _ = self.sent_packets.pop_front().unwrap();
 
-        self.cc.on_packets_acked(
-            self.bytes_in_flight,
-            &mut vec![acked],
-            &self.rtt_stats,
-            now,
-        );
+        self.cc
+            .on_packets_acked(self.bytes_in_flight, &mut vec![acked], &self.rtt_stats, now);
     }
 
     pub(crate) fn ack_n_packets(&mut self, n: usize, bytes: usize) {
@@ -135,19 +122,13 @@ impl TestSender {
             self.next_ack += 1;
         }
 
-        self.cc.on_packets_acked(
-            self.bytes_in_flight,
-            &mut acked,
-            &self.rtt_stats,
-            self.time,
-        );
+        self.cc
+            .on_packets_acked(self.bytes_in_flight, &mut acked, &self.rtt_stats, self.time);
 
         self.bytes_in_flight -= n * bytes;
     }
 
-    pub(crate) fn lose_n_packets(
-        &mut self, n: usize, bytes: usize, time_sent: Option<Instant>,
-    ) {
+    pub(crate) fn lose_n_packets(&mut self, n: usize, bytes: usize, time_sent: Option<Instant>) {
         let mut unacked = None;
 
         for _ in 0..n {

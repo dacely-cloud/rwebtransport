@@ -55,6 +55,7 @@ export enum NativeEventType {
     Error = 'error',
     /** An inbound datagram payload arrived. */
     Datagram = 'datagram',
+    DatagramSize = 'datagramSize',
     /** The peer opened a stream. */
     Stream = 'stream',
     /** Inbound application bytes arrived on an existing stream. */
@@ -256,6 +257,7 @@ export interface NativeWriteAckEvent {
     type: NativeEventType.WriteAck;
     /** The request id passed to {@link NativeAddon.writeStream}. */
     requestId: number;
+    accepted: boolean;
 }
 
 /**
@@ -333,6 +335,7 @@ export type NativeEvent =
     | NativeClosedEvent
     | NativeErrorEvent
     | NativeDatagramEvent
+    | { type: NativeEventType.DatagramSize; size: number }
     | NativeStreamEvent
     | NativeStreamDataEvent
     | NativeStreamFinEvent
@@ -617,13 +620,6 @@ export interface NativeAddon {
         bytes: Uint8Array,
         requestId: number,
     ): void;
-    /**
-     * Server-side {@link maxDatagramSize}.
-     *
-     * @param handle - The server handle.
-     * @returns The maximum datagram payload size currently permitted, in bytes.
-     */
-    serverMaxDatagramSize(handle: NativeServerHandle): number;
     /**
      * Server-side {@link closeSession}: gracefully close one session.
      *
@@ -924,7 +920,7 @@ export interface SessionTransport {
      */
     sendDatagram(bytes: Uint8Array, requestId: number): void;
     /** @returns The maximum datagram payload size, in bytes. */
-    maxDatagramSize(): number;
+    maxDatagramSize?(): number;
     /**
      * Gracefully close the session.
      *
@@ -1010,6 +1006,7 @@ export class SessionCore {
     private cachedProtocol = '';
     /** The CONNECT response headers, cached from the client ready event. */
     private cachedResponseHeaders: [string, string][] = [];
+    private advertisedDatagramSize?: number;
 
     /**
      * Resolves when the session is established, rejects if it fails before then.
@@ -1124,14 +1121,19 @@ export class SessionCore {
      */
     public resetStream(streamId: number, code: number): void {
         this.transport?.reset(streamId, code >>> 0);
+        this.rejectStreamWrites(
+            streamId,
+            new WebTransportError('stream aborted', {
+                source: 'stream',
+                streamErrorCode: code >>> 0,
+            }),
+        );
+    }
+
+    private rejectStreamWrites(streamId: number, error: WebTransportError): void {
         for (const [requestId, write] of this.writes) {
             if (write.streamId === streamId) {
-                write.deferred.reject(
-                    new WebTransportError('stream aborted', {
-                        source: 'stream',
-                        streamErrorCode: code >>> 0,
-                    }),
-                );
+                write.deferred.reject(error);
                 this.writes.delete(requestId);
             }
         }
@@ -1177,7 +1179,8 @@ export class SessionCore {
      * @returns The maximum datagram payload size in bytes, or 0 if not attached.
      */
     public maxDatagramSize(): number {
-        return this.transport ? this.transport.maxDatagramSize() : 0;
+        if (this.closedState) return 0;
+        return this.advertisedDatagramSize ?? this.transport?.maxDatagramSize?.() ?? 0;
     }
 
     /**
@@ -1373,6 +1376,10 @@ export class SessionCore {
                 this.datagramSink?.(ev.data);
                 break;
             }
+            case NativeEventType.DatagramSize: {
+                this.advertisedDatagramSize = ev.size;
+                break;
+            }
             case NativeEventType.Stream: {
                 if (ev.bidi) this.incoming?.onBidi(ev.streamId);
                 else this.incoming?.onUni(ev.streamId);
@@ -1391,6 +1398,13 @@ export class SessionCore {
                 break;
             }
             case NativeEventType.StreamStopSending: {
+                this.rejectStreamWrites(
+                    ev.streamId,
+                    new WebTransportError('peer sent STOP_SENDING', {
+                        source: 'stream',
+                        streamErrorCode: ev.code,
+                    }),
+                );
                 this.sends.get(ev.streamId)?.onStopSending(ev.code);
                 break;
             }
@@ -1400,8 +1414,13 @@ export class SessionCore {
                 break;
             }
             case NativeEventType.WriteAck: {
-                this.writes.get(ev.requestId)?.deferred.resolve();
+                const write = this.writes.get(ev.requestId);
                 this.writes.delete(ev.requestId);
+                if (ev.accepted) write?.deferred.resolve();
+                else
+                    write?.deferred.reject(
+                        new WebTransportError('stream is closed', { source: 'stream' }),
+                    );
                 break;
             }
             case NativeEventType.DatagramAck: {
@@ -1730,10 +1749,6 @@ export class ServerTransport implements SessionTransport {
      */
     public sendDatagram(bytes: Uint8Array, requestId: number): void {
         this.native.serverSendDatagram(this.handle, this.session, bytes, requestId);
-    }
-    /** @returns The maximum datagram payload size, in bytes. */
-    public maxDatagramSize(): number {
-        return this.native.serverMaxDatagramSize(this.handle);
     }
     /**
      * @param code - The WebTransport close code.

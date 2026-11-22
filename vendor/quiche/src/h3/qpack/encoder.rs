@@ -43,9 +43,7 @@ impl Encoder {
     }
 
     /// Encodes a list of headers into a QPACK header block.
-    pub fn encode<T: NameValue>(
-        &mut self, headers: &[T], out: &mut [u8],
-    ) -> Result<usize> {
+    pub fn encode<T: NameValue>(&mut self, headers: &[T], out: &mut [u8]) -> Result<usize> {
         let mut b = octets::OctetsMut::with_slice(out);
 
         // Required Insert Count.
@@ -61,7 +59,7 @@ impl Encoder {
 
                     // Encode as statically indexed.
                     encode_int(idx, INDEXED | STATIC, 6, &mut b)?;
-                },
+                }
 
                 Some((idx, false)) => {
                     const STATIC: u8 = 0x10;
@@ -69,14 +67,14 @@ impl Encoder {
                     // Encode value as literal with static name reference.
                     encode_int(idx, LITERAL_WITH_NAME_REF | STATIC, 4, &mut b)?;
                     encode_str::<false>(h.value(), 0, 7, &mut b)?;
-                },
+                }
 
                 None => {
                     // Encode as fully literal.
 
                     encode_str::<true>(h.name(), LITERAL, 3, &mut b)?;
                     encode_str::<false>(h.value(), 0, 7, &mut b)?;
-                },
+                }
             };
         }
 
@@ -86,14 +84,12 @@ impl Encoder {
 
 fn lookup_static<T: NameValue>(h: &T) -> Option<(u64, bool)> {
     // Fetch the right encoding table for this header length.
-    let table_for_len =
-        super::static_table::STATIC_ENCODE_TABLE.get(h.name().len())?;
+    let table_for_len = super::static_table::STATIC_ENCODE_TABLE.get(h.name().len())?;
 
     // Similar to [`eq_ignore_ascii_case`], but only lowercases the second
     // operand, as the entries in the table are already lower cased.
-    let cmp_lowercase = |a: &[u8], b: &[u8]| {
-        std::iter::zip(a, b).all(|(a, b)| a.eq(&b.to_ascii_lowercase()))
-    };
+    let cmp_lowercase =
+        |a: &[u8], b: &[u8]| std::iter::zip(a, b).all(|(a, b)| a.eq(&b.to_ascii_lowercase()));
 
     for (name, values) in table_for_len.iter() {
         // Match header name first.
@@ -117,9 +113,7 @@ fn lookup_static<T: NameValue>(h: &T) -> Option<(u64, bool)> {
     None
 }
 
-pub fn encode_int(
-    mut v: u64, first: u8, prefix: usize, b: &mut octets::OctetsMut,
-) -> Result<()> {
+pub fn encode_int(mut v: u64, first: u8, prefix: usize, b: &mut octets::OctetsMut) -> Result<()> {
     let mask = 2u64.pow(prefix as u32) - 1;
 
     // Encode I on N bits.
@@ -148,7 +142,10 @@ pub fn encode_int(
 
 #[inline]
 pub fn encode_str<const LOWER_CASE: bool>(
-    v: &[u8], first: u8, prefix: usize, b: &mut octets::OctetsMut,
+    v: &[u8],
+    first: u8,
+    prefix: usize,
+    b: &mut octets::OctetsMut,
 ) -> Result<()> {
     // Huffman-encoding generally saves space but in some cases it doesn't, for
     // those just encode the literal string.
@@ -156,7 +153,7 @@ pub fn encode_str<const LOWER_CASE: bool>(
         Ok(len) => {
             encode_int(len as u64, first | (1 << prefix), prefix, b)?;
             b.put_huffman_encoded::<LOWER_CASE>(v)?;
-        },
+        }
 
         Err(_) => {
             encode_int(v.len() as u64, first, prefix, b)?;
@@ -165,7 +162,7 @@ pub fn encode_str<const LOWER_CASE: bool>(
             } else {
                 b.put_bytes(v)?;
             }
-        },
+        }
     }
 
     Ok(())

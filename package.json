@@ -1,6 +1,6 @@
 {
     "name": "rwebtransport",
-    "version": "0.2.3",
+    "version": "0.2.5",
     "description": "A fully-compatible WebTransport client and server for Node.js, powered by Cloudflare quiche + BoringSSL via neon.",
     "author": "Dacely Cloud",
     "homepage": "https://github.com/dacely-cloud/rwebtransport#readme",
@@ -41,7 +41,7 @@
         "build:rust": "node scripts/build.js",
         "build:rust:debug": "node scripts/build.js --debug",
         "build:ts": "node scripts/build-ts.js && tsc -p tsconfig.build.json",
-        "build:echo": "cargo build --release -p rwebtransport-echo-server",
+        "build:echo": "cargo build --locked --release -p rwebtransport-echo-server",
         "setup:windows": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
         "setup:unix": "bash scripts/setup-unix.sh",
         "postinstall": "node scripts/postinstall.js",
@@ -58,19 +58,22 @@
         "test:coverage": "npm run pretest && vitest run --coverage"
     },
     "devDependencies": {
-        "@types/node": "^26.6.5",
-        "@vitest/coverage-v8": "^5.0.4",
-        "esbuild": "^0.28.2",
-        "oxlint": "^1.87.0",
-        "oxlint-tsgolint": "^7.0.2004",
-        "prettier": "^3.9.10",
-        "typescript": "^7.0.2",
-        "vitest": "^5.0.4",
+        "@types/node": "^26.6.6",
         "@vitest/browser-webdriverio": "^5.0.0",
-        "webdriverio": "^10.0.2"
+        "@vitest/coverage-v8": "^5.1.1",
+        "esbuild": "^0.28.2",
+        "oxlint": "^1.94.0",
+        "oxlint-tsgolint": "^7.0.2008",
+        "prettier": "^3.10.1",
+        "typescript": "^7.0.2",
+        "vitest": "^5.1.1",
+        "webdriverio": "^10.2.0"
     },
     "overrides": {
-        "esbuild": "$esbuild"
+        "esbuild": "$esbuild",
+        "archiver": {
+            "readdir-glob": "^4.0.0"
+        }
     },
     "keywords": [
         "webtransport",

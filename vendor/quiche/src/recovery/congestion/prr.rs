@@ -65,7 +65,10 @@ impl PRR {
     }
 
     pub fn on_packet_acked(
-        &mut self, delivered_data: usize, pipe: usize, ssthresh: usize,
+        &mut self,
+        delivered_data: usize,
+        pipe: usize,
+        ssthresh: usize,
         max_datagram_size: usize,
     ) {
         self.prr_delivered += delivered_data;

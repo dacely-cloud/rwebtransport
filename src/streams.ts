@@ -26,8 +26,8 @@ function errorCode(reason: unknown): number {
 
 /**
  * The readable half of a WebTransport stream. A `ReadableStream<Uint8Array>`
- * whose queue high-water mark drives native read backpressure: when the JS queue
- * fills, the native side stops draining quiche, flow-controlling the peer.
+ * that requests one native chunk for each pull. Until then, quiche retains
+ * unread data under its receive flow-control limits.
  *
  * @remarks Subclasses the WHATWG `ReadableStream`, so all standard reader APIs
  *   (`getReader`, async iteration, `pipeTo`, `cancel`, and so on) work as usual.
@@ -52,47 +52,49 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
      * @remarks Installs the `ReadableStream` underlying source and registers a
      *   {@link ReceiveSink} on `session` for `streamId`:
      *
-     *   - `pull` unpauses the native stream via `setPaused(streamId, false)`, so
-     *     quiche resumes draining inbound bytes when the consumer wants more.
+     *   - `pull` grants the native stream credit for one inbound chunk.
      *   - `cancel(reason)` sends `STOP_SENDING` to the peer with the code from
      *     {@link errorCode} and then unregisters the receive sink.
-     *   - The sink's `onData` enqueues each chunk and, once the controller's
-     *     `desiredSize` falls to zero or below (a nullish `desiredSize` is treated as
-     *     `1`, so it does not pause), pauses the native stream to flow-control the
-     *     peer.
      *   - The sink's `onFin` closes the controller (swallowing the error if it was
      *     already closed or errored) and unregisters.
      *   - The sink's `onReset(code)` errors the controller with a `'stream'`-sourced
      *     {@link WebTransportError} ('stream reset by peer') carrying the peer's code,
      *     then unregisters.
      *
-     *   A {@link CountQueuingStrategy} with a high-water mark of 32 chunks bounds the
-     *   JS-side queue and thereby the pause threshold.
+     *   A zero high-water mark leaves unread payload in native flow control.
      */
     public constructor(session: SessionCore, streamId: number) {
         let controller!: ReadableStreamDefaultController<Uint8Array>;
+        let resolvePull: (() => void) | undefined;
+        const finishPull = () => {
+            const resolve = resolvePull;
+            resolvePull = undefined;
+            resolve?.();
+        };
         super(
             {
                 start(c) {
                     controller = c;
                 },
                 pull() {
+                    const { promise, resolve } = Promise.withResolvers<void>();
+                    resolvePull = resolve;
                     session.setPaused(streamId, false);
+                    return promise;
                 },
                 cancel(reason) {
                     session.stopSending(streamId, errorCode(reason));
                     session.unregisterReceive(streamId);
+                    finishPull();
                 },
             },
-            new CountQueuingStrategy({ highWaterMark: 32 }),
+            { highWaterMark: 0 },
         );
 
         session.registerReceive(streamId, {
             onData(chunk) {
                 controller.enqueue(chunk);
-                if ((controller.desiredSize ?? 1) <= 0) {
-                    session.setPaused(streamId, true);
-                }
+                finishPull();
             },
             onFin() {
                 try {
@@ -101,6 +103,7 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
                     // already closed/errored
                 }
                 session.unregisterReceive(streamId);
+                finishPull();
             },
             onReset(code) {
                 controller.error(
@@ -110,6 +113,7 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
                     }),
                 );
                 session.unregisterReceive(streamId);
+                finishPull();
             },
             onSessionClose(error) {
                 try {
@@ -118,6 +122,7 @@ export class WebTransportReceiveStream extends ReadableStream<Uint8Array> {
                     // already closed/errored
                 }
                 session.unregisterReceive(streamId);
+                finishPull();
             },
         });
 

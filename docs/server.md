@@ -218,6 +218,8 @@ Each session can queue at most 128 unread incoming streams per direction. Exceed
 
 HTTP/3 and capsule receive parsers have an 8 MiB allocation budget per connection and share a 64 MiB budget across the server. These budgets include retained buffer capacity and frame/capsule copies. A connection that cannot reserve memory is terminated, and its parser allocations are released immediately. Completed parsing also releases empty buffers, so these limits apply to simultaneous allocations rather than cumulative traffic.
 
+Each listener admits up to 256 live QUIC connections, including connections still setting up or draining. Peers have 10 seconds after address validation to complete the QUIC handshake and Extended CONNECT. QUIC stream and handshake receive buffers have a separate 6 MiB budget per connection and 96 MiB per listener. This budget includes the allocations used to track buffered fragments.
+
 ## Closing the server
 
 ```ts

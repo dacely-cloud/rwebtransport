@@ -40,14 +40,14 @@ use intrusive_collections::RBTreeAtomicLink;
 use smallvec::SmallVec;
 
 use crate::buffers::DefaultBufFactory;
+use crate::ranges::RangeSet;
 use crate::BufFactory;
 use crate::Error;
 use crate::Result;
 
-const DEFAULT_URGENCY: u8 = 127;
+pub(crate) use self::send_buf::PeerStopSendingState;
 
-/// The default size of the receiver stream flow control window.
-pub(crate) const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+const DEFAULT_URGENCY: u8 = 127;
 
 /// The maximum size of the receiver stream flow control window.
 pub const MAX_STREAM_WINDOW: u64 = 16 * 1024 * 1024;
@@ -114,18 +114,54 @@ type BuildStreamIdHasher = std::hash::BuildHasherDefault<StreamIdHasher>;
 pub type StreamIdHashMap<V> = HashMap<u64, V, BuildStreamIdHasher>;
 pub type StreamIdHashSet = HashSet<u64, BuildStreamIdHasher>;
 
+/// Tracks collected stream sequences separately for each stream type.
+#[derive(Default)]
+struct CollectedStreams {
+    exhausted: bool,
+    // Defer allocation until the first stream is collected. The range capacity
+    // is unlimited because evicting a tombstone would allow a collected stream
+    // to be recreated.
+    ranges: Option<Box<[RangeSet; 4]>>,
+}
+
+impl CollectedStreams {
+    fn insert(&mut self, stream_id: u64, bounded: bool) {
+        if self.exhausted {
+            return;
+        }
+        // Same-type stream IDs advance by four, so store their sequences to
+        // allow adjacent collected streams to merge into a single range.
+        let ranges = self.ranges.get_or_insert_with(Default::default);
+        ranges[(stream_id & 0x3) as usize].push_item(stream_id >> 2);
+        // Keep accurate history for contiguous streams indefinitely. If the
+        // history becomes too fragmented, close instead of evicting IDs that
+        // must not be accepted again.
+        self.exhausted = bounded && ranges.iter().map(RangeSet::len).sum::<usize>() > 4096;
+    }
+
+    fn contains(&self, stream_id: u64) -> bool {
+        let Some(ranges) = &self.ranges else {
+            return false;
+        };
+
+        ranges[(stream_id & 0x3) as usize].contains(stream_id >> 2)
+    }
+}
+
 /// Keeps track of QUIC streams and enforces stream limits.
 #[derive(Default)]
 pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// Map of streams indexed by stream ID.
     streams: StreamIdHashMap<Stream<F>>,
 
+    pub(crate) receive_memory: Option<Arc<ReceiveMemory>>,
+
     /// Set of streams that were completed and garbage collected.
     ///
     /// Instead of keeping the full stream state forever, we collect completed
     /// streams to save memory, but we still need to keep track of previously
     /// created streams, to prevent peers from re-creating them.
-    collected: StreamIdHashSet,
+    collected: CollectedStreams,
 
     /// Peer's maximum bidirectional stream count limit.
     peer_max_streams_bidi: u64,
@@ -169,11 +205,12 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// having to iterate over the full list of streams.
     pub readable: RBTree<StreamReadablePriorityAdapter>,
 
-    /// Set of stream IDs corresponding to streams that have enough flow control
-    /// capacity to be written to, and is not finished. This is used to generate
-    /// a `StreamIter` of streams without having to iterate over the full list
-    /// of streams.
+    /// Set of streams queued for writable notification. A stopped stream can
+    /// be removed before its error is reported to the application.
     pub writable: RBTree<StreamWritablePriorityAdapter>,
+
+    /// Stopped streams still queued for writable notification.
+    stopped_writable: RBTree<StreamStoppedWritablePriorityAdapter>,
 
     /// Set of stream IDs corresponding to streams that are almost out of flow
     /// control credit and need to send MAX_STREAM_DATA. This is used to
@@ -189,7 +226,7 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// Set of stream IDs corresponding to streams that are reset. The value
     /// of the map elements is a tuple of the error code and final size values
     /// to include in the RESET_STREAM frame.
-    reset: StreamIdHashMap<(u64, u64)>,
+    reset: StreamIdHashMap<(u64, u64, Option<u64>)>,
 
     /// Set of stream IDs corresponding to streams that are shutdown on the
     /// receive side, and need to send a STOP_SENDING frame. The value of the
@@ -199,15 +236,12 @@ pub struct StreamMap<F: BufFactory = DefaultBufFactory> {
     /// The maximum size of a stream window.
     max_stream_window: u64,
 
-    /// When `true`, the initial flow control window will be set to the
-    /// `max_rx_data`, if false, it will be set to `DEFAULT_STREAM_WINDOW`
-    use_initial_max_data_as_flow_control_win: bool,
+    /// Total number of bytes in send buffers across all streams.
+    tx_buffered: usize,
 }
 
 impl<F: BufFactory> StreamMap<F> {
-    pub fn new(
-        max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64,
-    ) -> Self {
+    pub fn new(max_streams_bidi: u64, max_streams_uni: u64, max_stream_window: u64) -> Self {
         StreamMap {
             local_max_streams_bidi: max_streams_bidi,
             local_max_streams_bidi_next: max_streams_bidi,
@@ -236,23 +270,28 @@ impl<F: BufFactory> StreamMap<F> {
     /// Returns the mutable stream with the given ID if it exists, or creates
     /// a new one otherwise.
     ///
-    /// The `local` parameter indicates whether the stream's creation was
-    /// requested by the local application rather than the peer, and is
-    /// used to validate the requested stream ID, and to select the initial
-    /// flow control values from the local and remote transport parameters
-    /// (also passed as arguments).
+    /// The `local` parameter indicates whether the stream is locally
+    /// initiated. It validates the stream ID and selects the initial flow
+    /// control values from the local and remote transport parameters.
     ///
     /// This also takes care of enforcing both local and the peer's stream
     /// count limits. If one of these limits is violated, the `StreamLimit`
     /// error is returned.
     pub(crate) fn get_or_create(
-        &mut self, id: u64, local_params: &crate::TransportParams,
-        peer_params: &crate::TransportParams, local: bool, is_server: bool,
+        &mut self,
+        id: u64,
+        local_params: &crate::TransportParams,
+        peer_params: &crate::TransportParams,
+        local: bool,
+        is_server: bool,
     ) -> Result<&mut Stream<F>> {
         let (stream, is_new_and_writable) = match self.streams.entry(id) {
             hash_map::Entry::Vacant(v) => {
+                if self.collected.exhausted {
+                    return Err(Error::StreamMemoryLimit);
+                }
                 // Stream has already been closed and garbage collected.
-                if self.collected.contains(&id) {
+                if self.collected.contains(id) {
                     return Err(Error::Done);
                 }
 
@@ -277,8 +316,7 @@ impl<F: BufFactory> StreamMap<F> {
                     ),
 
                     // Remotely-initiated unidirectional stream.
-                    (false, false) =>
-                        (local_params.initial_max_stream_data_uni, 0),
+                    (false, false) => (local_params.initial_max_stream_data_uni, 0),
                 };
 
                 // The two least significant bits from a stream id identify the
@@ -289,65 +327,48 @@ impl<F: BufFactory> StreamMap<F> {
                 // Enforce stream count limits.
                 match (is_local(id, is_server), is_bidi(id)) {
                     (true, true) => {
-                        let n = cmp::max(
-                            self.local_opened_streams_bidi,
-                            stream_sequence + 1,
-                        );
+                        let n = cmp::max(self.local_opened_streams_bidi, stream_sequence + 1);
 
                         if n > self.peer_max_streams_bidi {
                             return Err(Error::StreamLimit);
                         }
 
                         self.local_opened_streams_bidi = n;
-                    },
+                    }
 
                     (true, false) => {
-                        let n = cmp::max(
-                            self.local_opened_streams_uni,
-                            stream_sequence + 1,
-                        );
+                        let n = cmp::max(self.local_opened_streams_uni, stream_sequence + 1);
 
                         if n > self.peer_max_streams_uni {
                             return Err(Error::StreamLimit);
                         }
 
                         self.local_opened_streams_uni = n;
-                    },
+                    }
 
                     (false, true) => {
-                        let n = cmp::max(
-                            self.peer_opened_streams_bidi,
-                            stream_sequence + 1,
-                        );
+                        let n = cmp::max(self.peer_opened_streams_bidi, stream_sequence + 1);
 
                         if n > self.local_max_streams_bidi {
                             return Err(Error::StreamLimit);
                         }
 
                         self.peer_opened_streams_bidi = n;
-                    },
+                    }
 
                     (false, false) => {
-                        let n = cmp::max(
-                            self.peer_opened_streams_uni,
-                            stream_sequence + 1,
-                        );
+                        let n = cmp::max(self.peer_opened_streams_uni, stream_sequence + 1);
 
                         if n > self.local_max_streams_uni {
                             return Err(Error::StreamLimit);
                         }
 
                         self.peer_opened_streams_uni = n;
-                    },
+                    }
                 };
 
-                let initial_window =
-                    if self.use_initial_max_data_as_flow_control_win {
-                        max_rx_data
-                    } else {
-                        cmp::min(max_rx_data, DEFAULT_STREAM_WINDOW)
-                    };
-                let s = Stream::new(
+                let initial_window = max_rx_data;
+                let mut s = Stream::new(
                     id,
                     max_rx_data,
                     max_tx_data,
@@ -355,11 +376,12 @@ impl<F: BufFactory> StreamMap<F> {
                     initial_window,
                     self.max_stream_window,
                 );
+                s.recv.set_memory_budget(self.receive_memory.clone());
 
                 let is_writable = s.is_writable();
 
                 (v.insert(s), is_writable)
-            },
+            }
 
             hash_map::Entry::Occupied(v) => (v.into_mut(), false),
         };
@@ -408,11 +430,30 @@ impl<F: BufFactory> StreamMap<F> {
         }
     }
 
+    /// Marks a newly stopped stream as queued for writable notification.
+    pub fn insert_stopped_writable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if !priority_key.stopped_writable.is_linked() {
+            self.stopped_writable.insert(Arc::clone(priority_key));
+        }
+
+        self.insert_writable(priority_key);
+    }
+
     /// Removes the stream ID from the writable streams set.
     ///
     /// This should also be called anytime an existing stream stops being
     /// writable.
     pub fn remove_writable(&mut self, priority_key: &Arc<StreamPriorityKey>) {
+        if priority_key.stopped_writable.is_linked() {
+            let ptr = Arc::as_ptr(priority_key);
+            // SAFETY: `priority_key` originates from this `StreamMap`, and its
+            // `stopped_writable` link is only inserted into this map's
+            // corresponding tree. The link is linked, and the `Arc` keeps the
+            // allocation alive, so `ptr` identifies an element of this tree.
+            let mut c = unsafe { self.stopped_writable.cursor_mut_from_ptr(ptr) };
+            c.remove();
+        }
+
         if !priority_key.writable.is_linked() {
             return;
         }
@@ -453,17 +494,20 @@ impl<F: BufFactory> StreamMap<F> {
     }
 
     /// Updates the priorities of a stream.
-    pub fn update_priority(
-        &mut self, old: &Arc<StreamPriorityKey>, new: &Arc<StreamPriorityKey>,
-    ) {
+    pub fn update_priority(&mut self, old: &Arc<StreamPriorityKey>, new: &Arc<StreamPriorityKey>) {
         if old.readable.is_linked() {
             self.remove_readable(old);
             self.readable.insert(Arc::clone(new));
         }
 
         if old.writable.is_linked() {
+            let stopped = old.stopped_writable.is_linked();
             self.remove_writable(old);
-            self.writable.insert(Arc::clone(new));
+            if stopped {
+                self.insert_stopped_writable(new);
+            } else {
+                self.insert_writable(new);
+            }
         }
 
         if old.flushable.is_linked() {
@@ -497,14 +541,17 @@ impl<F: BufFactory> StreamMap<F> {
         self.blocked.remove(&stream_id);
     }
 
-    /// Adds the stream ID to the reset streams set with the
-    /// given error code and final size values.
-    ///
-    /// If the stream was already in the list, this does nothing.
-    pub fn insert_reset(
-        &mut self, stream_id: u64, error_code: u64, final_size: u64,
-    ) {
-        self.reset.insert(stream_id, (error_code, final_size));
+    /// Queues RESET_STREAM unless the send side is already complete or the
+    /// stream has been collected.
+    pub fn insert_reset(&mut self, stream_id: u64, error_code: u64, final_size: u64) {
+        if let Some(stream) = self.streams.get(&stream_id) {
+            if !stream.send.is_complete() && !stream.send.reset_acknowledged() {
+                self.reset.insert(
+                    stream_id,
+                    (error_code, final_size, stream.send.reliable_reset_size),
+                );
+            }
+        }
     }
 
     /// Removes the stream ID from the reset streams set.
@@ -589,10 +636,25 @@ impl<F: BufFactory> StreamMap<F> {
         self.peer_max_streams_uni - self.local_opened_streams_uni
     }
 
+    /// Collects or disarms a stream after reporting STOP_SENDING to the caller.
+    pub fn on_stop_sending_reported(&mut self, stream_id: u64) {
+        let Some(stream) = self.streams.get_mut(&stream_id) else {
+            return;
+        };
+
+        if stream.state() == StreamState::Collectable {
+            let local = stream.local;
+            self.collect(stream_id, local);
+        } else {
+            let priority_key = Arc::clone(&stream.priority_key);
+            self.remove_writable(&priority_key);
+        }
+    }
+
     /// Drops completed stream.
     ///
-    /// This should only be called when Stream::is_complete() returns true for
-    /// the given stream.
+    /// This should only be called when Stream::state() returns Collectable
+    /// for the given stream.
     pub fn collect(&mut self, stream_id: u64, local: bool) {
         if !local {
             // If the stream was created by the peer, give back a max streams
@@ -601,8 +663,7 @@ impl<F: BufFactory> StreamMap<F> {
                 self.local_max_streams_bidi_next =
                     self.local_max_streams_bidi_next.saturating_add(1);
             } else {
-                self.local_max_streams_uni_next =
-                    self.local_max_streams_uni_next.saturating_add(1);
+                self.local_max_streams_uni_next = self.local_max_streams_uni_next.saturating_add(1);
             }
         }
 
@@ -614,7 +675,25 @@ impl<F: BufFactory> StreamMap<F> {
 
         self.remove_flushable(&s.priority_key);
 
-        self.collected.insert(stream_id);
+        self.collected
+            .insert(stream_id, self.receive_memory.is_some());
+    }
+
+    pub(crate) fn collected_history_exhausted(&self) -> bool {
+        self.collected.exhausted
+    }
+
+    /// Collects a completed stream when no application notification remains.
+    pub(crate) fn try_collect(&mut self, stream_id: u64) {
+        let Some(stream) = self.get(stream_id) else {
+            return;
+        };
+
+        let local = stream.local;
+
+        if stream.state() == StreamState::Collectable {
+            self.collect(stream_id, local);
+        }
     }
 
     /// Creates an iterator over streams that have outstanding data to read.
@@ -633,6 +712,39 @@ impl<F: BufFactory> StreamMap<F> {
         }
     }
 
+    /// Creates an iterator over stopped streams in the writable queue.
+    pub fn stopped_writable(&self) -> StreamIter {
+        if self.stopped_writable.is_empty() {
+            return StreamIter::default();
+        }
+
+        StreamIter {
+            streams: self.stopped_writable.iter().map(|key| key.id).collect(),
+            index: 0,
+        }
+    }
+
+    /// Returns and unlinks the next stopped stream awaiting notification.
+    pub fn pop_stopped_writable(&mut self) -> Option<u64> {
+        let priority_key = self.stopped_writable.front().clone_pointer()?;
+        self.remove_writable(&priority_key);
+        Some(priority_key.id)
+    }
+
+    /// Returns true if the given local stream has been opened.
+    ///
+    /// Opening a local stream implicitly opens all lower-numbered local streams
+    /// of the same type, even if they do not have `Stream` objects yet.
+    pub fn local_stream_opened(&self, stream_id: u64) -> bool {
+        let opened = if is_bidi(stream_id) {
+            self.local_opened_streams_bidi
+        } else {
+            self.local_opened_streams_uni
+        };
+
+        stream_id >> 2 < opened
+    }
+
     /// Creates an iterator over streams that need to send MAX_STREAM_DATA.
     pub fn almost_full(&self) -> StreamIter {
         StreamIter::from(&self.almost_full)
@@ -644,7 +756,7 @@ impl<F: BufFactory> StreamMap<F> {
     }
 
     /// Creates an iterator over streams that need to send RESET_STREAM.
-    pub fn reset(&self) -> hash_map::Iter<'_, u64, (u64, u64)> {
+    pub fn reset(&self) -> hash_map::Iter<'_, u64, (u64, u64, Option<u64>)> {
         self.reset.iter()
     }
 
@@ -655,7 +767,7 @@ impl<F: BufFactory> StreamMap<F> {
 
     /// Returns true if the stream has been collected.
     pub fn is_collected(&self, stream_id: u64) -> bool {
-        self.collected.contains(&stream_id)
+        self.collected.contains(stream_id)
     }
 
     /// Returns true if there are any streams that have data to write.
@@ -698,8 +810,8 @@ impl<F: BufFactory> StreamMap<F> {
         let available = self
             .local_max_streams_bidi
             .saturating_sub(self.peer_opened_streams_bidi);
-        self.local_max_streams_bidi_next != self.local_max_streams_bidi &&
-            available <= self.initial_max_streams_bidi / 2
+        self.local_max_streams_bidi_next != self.local_max_streams_bidi
+            && available <= self.initial_max_streams_bidi / 2
     }
 
     /// Returns true if the max unidirectional streams count needs to be updated
@@ -711,8 +823,8 @@ impl<F: BufFactory> StreamMap<F> {
         let available = self
             .local_max_streams_uni
             .saturating_sub(self.peer_opened_streams_uni);
-        self.local_max_streams_uni_next != self.local_max_streams_uni &&
-            available <= self.initial_max_streams_uni / 2
+        self.local_max_streams_uni_next != self.local_max_streams_uni
+            && available <= self.initial_max_streams_uni / 2
     }
 
     /// Returns the number of active streams in the map.
@@ -721,13 +833,78 @@ impl<F: BufFactory> StreamMap<F> {
         self.streams.len()
     }
 
-    /// When `true`, the initial flow control window will be set to the
-    /// `max_rx_data`, if false, it will be set to `DEFAULT_STREAM_WINDOW`
-    pub(crate) fn set_use_initial_max_data_as_flow_control_win(
-        &mut self, v: bool,
-    ) {
-        self.use_initial_max_data_as_flow_control_win = v;
+    /// Returns the total number of bytes buffered across all streams.
+    pub(crate) fn tx_buffered(&self) -> usize {
+        self.tx_buffered
     }
+
+    /// Computes the actual number of bytes in send buffers by summing across
+    /// all streams. This is used for debugging to verify that tx_buffered
+    /// is accurate.
+    fn tx_buffered_actual(&self) -> usize {
+        self.streams
+            .values()
+            .map(|s| s.send.buffered_bytes() as usize)
+            .sum()
+    }
+
+    /// Checks if the stored tx_buffered matches the actual value.
+    /// Returns true if they match, false otherwise.
+    pub(crate) fn tx_buffered_is_consistent(&self) -> bool {
+        self.tx_buffered == self.tx_buffered_actual()
+    }
+
+    /// Updates the tx_buffered value by adding the delta.
+    pub(crate) fn add_tx_buffered(&mut self, delta: usize) {
+        self.tx_buffered += delta;
+
+        #[cfg(debug_assertions)]
+        self.debug_check_tx_buffered_consistency();
+    }
+
+    /// Updates the tx_buffered value by subtracting the delta.
+    pub(crate) fn sub_tx_buffered(&mut self, delta: usize) {
+        debug_assert!(self.tx_buffered >= delta);
+        self.tx_buffered = self.tx_buffered.saturating_sub(delta);
+
+        #[cfg(debug_assertions)]
+        self.debug_check_tx_buffered_consistency();
+    }
+
+    /// Verifies that the stored tx_buffered value matches the actual bytes in
+    /// send buffers across all streams. Enabled in debug builds to catch
+    /// inconsistencies early.
+    #[cfg(debug_assertions)]
+    pub(crate) fn debug_check_tx_buffered_consistency(&self) {
+        if !self.tx_buffered_is_consistent() {
+            let buffered_per_stream = self
+                .streams
+                .iter()
+                .map(|(id, s)| (*id, s.send.buffered_bytes()))
+                .collect::<Vec<_>>();
+
+            let actual = self.tx_buffered_actual();
+            let stored = self.tx_buffered;
+            panic!(
+                "tx_buffered mismatch: stored={}, actual={}, diff={}, buffered_per_stream={:?}",
+                stored,
+                actual,
+                stored as i64 - actual as i64,
+                buffered_per_stream
+            );
+        }
+    }
+}
+
+/// Completion derived from transport buffers and pending app notifications.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StreamState {
+    /// At least one relevant direction is not complete.
+    Incomplete,
+    /// Directions are complete, but receive data or a STOP error remains.
+    CompleteWithPendingDelivery,
+    /// No transport work or application notification remains.
+    Collectable,
 }
 
 /// A QUIC stream.
@@ -758,8 +935,12 @@ pub struct Stream<F: BufFactory = DefaultBufFactory> {
 impl<F: BufFactory> Stream<F> {
     /// Creates a new stream with the given flow control limits.
     pub fn new(
-        id: u64, max_rx_data: u64, max_tx_data: u64, local: bool,
-        initial_window: u64, max_window: u64,
+        id: u64,
+        max_rx_data: u64,
+        max_tx_data: u64,
+        local: bool,
+        initial_window: u64,
+        max_window: u64,
     ) -> Self {
         let priority_key = Arc::new(StreamPriorityKey {
             id,
@@ -786,10 +967,9 @@ impl<F: BufFactory> Stream<F> {
     /// Returns true if the stream has enough flow control capacity to be
     /// written to, and is not finished.
     pub fn is_writable(&self) -> bool {
-        !self.send.is_shutdown() &&
-            !self.send.is_fin() &&
-            (self.send.off_back() + self.send_lowat as u64) <
-                self.send.max_off()
+        !self.send.is_shutdown()
+            && !self.send.is_fin()
+            && (self.send.off_back() + self.send_lowat as u64) < self.send.max_off()
     }
 
     /// Returns true if the stream has data to send and is allowed to send at
@@ -797,12 +977,10 @@ impl<F: BufFactory> Stream<F> {
     pub fn is_flushable(&self) -> bool {
         let off_front = self.send.off_front();
 
-        !self.send.is_empty() &&
-            off_front < self.send.off_back() &&
-            off_front < self.send.max_off()
+        !self.send.is_empty() && off_front < self.send.off_back() && off_front < self.send.max_off()
     }
 
-    /// Returns true if the stream is complete.
+    /// Derives completion without duplicating buffer or acknowledgement state.
     ///
     /// For bidirectional streams this happens when both the receive and send
     /// sides are complete. That is when all incoming data has been read by the
@@ -811,8 +989,8 @@ impl<F: BufFactory> Stream<F> {
     /// For unidirectional streams this happens when either the receive or send
     /// side is complete, depending on whether the stream was created locally
     /// or not.
-    pub fn is_complete(&self) -> bool {
-        match (self.bidi, self.local) {
+    pub(crate) fn state(&self) -> StreamState {
+        let complete = match (self.bidi, self.local) {
             // For bidirectional streams we need to check both receive and send
             // sides for completion.
             (true, _) => self.recv.is_fin() && self.send.is_complete(),
@@ -824,6 +1002,19 @@ impl<F: BufFactory> Stream<F> {
             // For unidirectional streams generated by the peer, we only need
             // to check the receive side for completion.
             (false, false) => self.recv.is_fin(),
+        };
+
+        let pending_stop_sending = match self.send.peer_stop_sending_state() {
+            PeerStopSendingState::NotReported(_) => !self.send.is_shutdown(),
+            PeerStopSendingState::NotReceived | PeerStopSendingState::Reported(_) => false,
+        };
+
+        if !complete {
+            StreamState::Incomplete
+        } else if self.is_readable() || pending_stop_sending {
+            StreamState::CompleteWithPendingDelivery
+        } else {
+            StreamState::Collectable
         }
     }
 }
@@ -846,6 +1037,7 @@ pub struct StreamPriorityKey {
 
     pub readable: RBTreeAtomicLink,
     pub writable: RBTreeAtomicLink,
+    pub stopped_writable: RBTreeAtomicLink,
     pub flushable: RBTreeAtomicLink,
 }
 
@@ -857,6 +1049,7 @@ impl Default for StreamPriorityKey {
             id: Default::default(),
             readable: Default::default(),
             writable: Default::default(),
+            stopped_writable: Default::default(),
             flushable: Default::default(),
         }
     }
@@ -909,7 +1102,7 @@ impl Ord for StreamPriorityKey {
     }
 }
 
-intrusive_adapter!(pub StreamWritablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { writable: RBTreeAtomicLink });
+intrusive_adapter!(pub StreamWritablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { writable => RBTreeAtomicLink });
 
 impl KeyAdapter<'_> for StreamWritablePriorityAdapter {
     type Key = StreamPriorityKey;
@@ -919,7 +1112,17 @@ impl KeyAdapter<'_> for StreamWritablePriorityAdapter {
     }
 }
 
-intrusive_adapter!(pub StreamReadablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { readable: RBTreeAtomicLink });
+intrusive_adapter!(pub StreamStoppedWritablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { stopped_writable => RBTreeAtomicLink });
+
+impl KeyAdapter<'_> for StreamStoppedWritablePriorityAdapter {
+    type Key = StreamPriorityKey;
+
+    fn get_key(&self, s: &StreamPriorityKey) -> Self::Key {
+        s.clone()
+    }
+}
+
+intrusive_adapter!(pub StreamReadablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { readable => RBTreeAtomicLink });
 
 impl KeyAdapter<'_> for StreamReadablePriorityAdapter {
     type Key = StreamPriorityKey;
@@ -929,7 +1132,7 @@ impl KeyAdapter<'_> for StreamReadablePriorityAdapter {
     }
 }
 
-intrusive_adapter!(pub StreamFlushablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { flushable: RBTreeAtomicLink });
+intrusive_adapter!(pub StreamFlushablePriorityAdapter = Arc<StreamPriorityKey>: StreamPriorityKey { flushable => RBTreeAtomicLink });
 
 impl KeyAdapter<'_> for StreamFlushablePriorityAdapter {
     type Key = StreamPriorityKey;
@@ -976,9 +1179,272 @@ impl ExactSizeIterator for StreamIter {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use crate::range_buf::RangeBuf;
+    use crate::test_utils::Pipe;
 
     use super::*;
+
+    /// The default size of the receiver stream flow control window.
+    const DEFAULT_STREAM_WINDOW: u64 = 32 * 1024;
+
+    #[rstest]
+    fn collected_streams_per_type(#[values(0, 1, 2, 3)] stream_type: u64) {
+        let mut collected = CollectedStreams::default();
+        assert!(collected.ranges.is_none());
+
+        for id in 0..4 {
+            assert!(!collected.contains(id));
+        }
+        assert!(collected.ranges.is_none());
+
+        collected.insert(stream_type, false);
+        assert!(collected.ranges.is_some());
+
+        for id in 0..4 {
+            assert_eq!(collected.contains(id), id == stream_type);
+        }
+
+        collected.insert(8 | stream_type, false);
+        assert!(!collected.contains(4 | stream_type));
+        assert_eq!(
+            collected.ranges.as_ref().unwrap()[stream_type as usize].len(),
+            2
+        );
+
+        collected.insert(4 | stream_type, false);
+        collected.insert(4 | stream_type, false);
+        assert_eq!(
+            collected.ranges.as_ref().unwrap()[stream_type as usize],
+            0..3
+        );
+
+        for id in 0..12 {
+            assert_eq!(collected.contains(id), id & 0x3 == stream_type);
+        }
+    }
+
+    #[test]
+    fn collected_streams_preserve_fragmented_and_large_ids() {
+        let mut collected = CollectedStreams::default();
+
+        for sequence in (0..2048).step_by(2) {
+            for stream_type in 0..4 {
+                collected.insert((sequence << 2) | stream_type, false);
+            }
+        }
+
+        for sequence in 0..2048 {
+            for stream_type in 0..4 {
+                assert_eq!(
+                    collected.contains((sequence << 2) | stream_type),
+                    sequence % 2 == 0
+                );
+            }
+        }
+
+        for stream_type in 0..4 {
+            assert_eq!(
+                collected.ranges.as_ref().unwrap()[stream_type as usize].len(),
+                1024
+            );
+
+            let stream_id = ((1u64 << 62) - 4) | stream_type;
+            assert!(!collected.contains(stream_id));
+            collected.insert(stream_id, false);
+            assert!(collected.contains(stream_id));
+            assert!(!collected.contains(stream_id - 4));
+            assert!(!collected.contains((1u64 << 40) | stream_type));
+        }
+    }
+
+    /// Completes a client-initiated stream and processes returned stream
+    /// credit.
+    fn collect_pipe_stream(pipe: &mut Pipe, stream_id: u64) {
+        let mut buf = [0; 1];
+
+        assert_eq!(pipe.client.stream_send(stream_id, b"a", true), Ok(1));
+        assert_eq!(pipe.advance(), Ok(()));
+        assert_eq!(pipe.server.stream_recv(stream_id, &mut buf), Ok((1, true)));
+
+        if is_bidi(stream_id) {
+            assert_eq!(pipe.server.stream_send(stream_id, b"a", true), Ok(1));
+            assert_eq!(pipe.advance(), Ok(()));
+            assert_eq!(pipe.client.stream_recv(stream_id, &mut buf), Ok((1, true)));
+        }
+
+        assert_eq!(pipe.advance(), Ok(()));
+    }
+
+    #[rstest]
+    fn collected_streams_out_of_order(
+        #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values(0, 2)] stream_type: u64,
+    ) {
+        let mut pipe = Pipe::new(cc_algorithm_name).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        for sequence in [2, 0, 1] {
+            let stream_id = (sequence << 2) | stream_type;
+            collect_pipe_stream(&mut pipe, stream_id);
+
+            for conn in [&mut pipe.client, &mut pipe.server] {
+                assert!(conn.streams.get(stream_id).is_none());
+                assert!(conn.streams.is_collected(stream_id));
+                assert!(conn.stream_closed(stream_id));
+                assert_eq!(
+                    conn.streams
+                        .get_or_create(
+                            stream_id,
+                            &conn.local_transport_params,
+                            &conn.peer_transport_params,
+                            !conn.is_server,
+                            conn.is_server,
+                        )
+                        .err(),
+                    Some(Error::Done)
+                );
+            }
+        }
+
+        assert_eq!(
+            pipe.server.streams.collected.ranges.as_ref().unwrap()[stream_type as usize],
+            0..3
+        );
+
+        // Late STREAM frames must not materialize a collected stream again.
+        let frames = [crate::frame::Frame::Stream {
+            stream_id: 8 | stream_type,
+            data: RangeBuf::from(b"a", 0, true),
+        }];
+        assert!(pipe
+            .send_pkt_to_server(crate::Type::Short, &frames, &mut [0; 1280])
+            .is_ok());
+        assert_eq!(pipe.server.streams.len(), 0);
+    }
+
+    #[rstest]
+    fn collected_streams_sparse_peer_credit(
+        #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values(0, 2)] stream_type: u64,
+        #[values(1, 8)] initial_limit: u64,
+    ) {
+        let mut config = Pipe::default_config(cc_algorithm_name).unwrap();
+        config.set_initial_max_streams_bidi(initial_limit);
+        config.set_initial_max_streams_uni(initial_limit);
+
+        let mut pipe = Pipe::with_config(&mut config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        for index in 0..initial_limit {
+            let stream_id = (index << 3) | stream_type;
+            collect_pipe_stream(&mut pipe, stream_id);
+
+            assert_eq!(
+                pipe.server.streams.collected.ranges.as_ref().unwrap()[stream_type as usize].len(),
+                index as usize + 1
+            );
+            assert!(pipe.server.stream_closed(stream_id));
+            assert!(pipe.client.stream_closed(stream_id));
+            assert_eq!(pipe.server.streams.len(), 0);
+        }
+
+        let peer_limit = if is_bidi(stream_type) {
+            pipe.client.streams.peer_max_streams_bidi()
+        } else {
+            pipe.client.streams.peer_max_streams_uni()
+        };
+        assert_eq!(peer_limit, 2 * initial_limit);
+
+        // The odd sequences consume credit but have never had Stream objects.
+        for sequence in (1..2 * initial_limit - 1).step_by(2) {
+            let stream_id = (sequence << 2) | stream_type;
+
+            for conn in [&pipe.client, &pipe.server] {
+                assert!(conn.streams.get(stream_id).is_none());
+                assert!(!conn.streams.is_collected(stream_id));
+                assert!(!conn.stream_closed(stream_id));
+            }
+        }
+
+        // Filling the implicit gaps is still permitted and merges all ranges.
+        for sequence in (1..2 * initial_limit - 1).step_by(2) {
+            collect_pipe_stream(&mut pipe, (sequence << 2) | stream_type);
+        }
+
+        assert_eq!(
+            pipe.server.streams.collected.ranges.as_ref().unwrap()[stream_type as usize],
+            0..2 * initial_limit - 1
+        );
+    }
+
+    #[rstest]
+    fn collected_streams_fragmented_local(
+        #[values("cubic", "bbr2_gcongestion")] cc_algorithm_name: &str,
+        #[values(0, 2)] stream_type: u64,
+    ) {
+        let mut client_config = Pipe::default_config(cc_algorithm_name).unwrap();
+        client_config.set_initial_max_streams_bidi(1);
+        client_config.set_initial_max_streams_uni(1);
+
+        let mut server_config = Pipe::default_config(cc_algorithm_name).unwrap();
+        server_config.set_initial_max_streams_bidi(32);
+        server_config.set_initial_max_streams_uni(32);
+
+        let mut pipe =
+            Pipe::with_client_and_server_config(&mut client_config, &mut server_config).unwrap();
+        assert_eq!(pipe.handshake(), Ok(()));
+
+        // Local fragmentation follows the peer's allowance and application
+        // behavior, not the client's initial incoming stream limit of one.
+        for index in 0..32 {
+            collect_pipe_stream(&mut pipe, (index << 3) | stream_type);
+            assert_eq!(
+                pipe.client.streams.collected.ranges.as_ref().unwrap()[stream_type as usize].len(),
+                index as usize + 1
+            );
+            assert_eq!(pipe.client.streams.len(), 0);
+        }
+    }
+
+    #[rstest]
+    fn stream_limit_does_not_collect(
+        #[values(0, 1, 2, 3)] stream_type: u64,
+        #[values(true, false)] local: bool,
+    ) {
+        let params = crate::TransportParams::default();
+        let mut streams = <StreamMap>::new(1, 1, DEFAULT_STREAM_WINDOW);
+        streams.update_peer_max_streams_bidi(1);
+        streams.update_peer_max_streams_uni(1);
+
+        let stream_id = 4 | stream_type;
+        let is_server = (stream_type & 1 != 0) == local;
+        assert_eq!(
+            streams
+                .get_or_create(stream_id, &params, &params, local, is_server)
+                .err(),
+            Some(Error::StreamLimit)
+        );
+        assert!(!streams.is_collected(stream_id));
+        assert_eq!(streams.len(), 0);
+        assert!(streams.collected.ranges.is_none());
+
+        if local {
+            streams.update_peer_max_streams_bidi(2);
+            streams.update_peer_max_streams_uni(2);
+        } else {
+            streams.local_max_streams_bidi_next = 2;
+            streams.local_max_streams_uni_next = 2;
+            streams.update_max_streams_bidi();
+            streams.update_max_streams_uni();
+        }
+
+        assert!(streams
+            .get_or_create(stream_id, &params, &params, local, is_server)
+            .is_ok());
+        assert!(streams.collected.ranges.is_none());
+    }
 
     #[test]
     fn recv_flow_control() {
@@ -1375,8 +1841,7 @@ mod tests {
 
     #[test]
     fn stream_complete() {
-        let mut stream =
-            <Stream>::new(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
+        let mut stream = <Stream>::new(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -1388,6 +1853,8 @@ mod tests {
 
         assert!(!stream.send.is_complete());
         assert!(stream.send.is_fin());
+
+        assert_eq!(stream.send.emit(&mut [0; 10]), Ok((10, true)));
 
         let buf = RangeBuf::from(b"hello", 0, true);
         assert!(stream.recv.write(buf).is_ok());
@@ -1404,15 +1871,44 @@ mod tests {
         assert!(!stream.send.is_complete());
 
         stream.send.ack(0, 1);
+        assert!(!stream.send.is_complete());
+
+        stream.send.ack_fin();
         assert!(stream.send.is_complete());
 
-        assert!(!stream.is_complete());
+        assert_eq!(stream.state(), StreamState::Incomplete);
 
         let mut buf = [0; 3];
         assert_eq!(stream.recv.emit(&mut buf), Ok((3, true)));
         assert!(stream.recv.is_fin());
 
-        assert!(stream.is_complete());
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        // A completed stream must retain each undelivered terminal event.
+        stream.send.stop(42).unwrap();
+        assert_eq!(stream.state(), StreamState::CompleteWithPendingDelivery);
+        assert_eq!(
+            stream.send.cap_and_report_stop_sending(),
+            Err(Error::StreamStopped(42))
+        );
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        let mut stream = <Stream>::new(0, 30, 30, true, 30, DEFAULT_STREAM_WINDOW);
+        stream.send.shutdown().unwrap();
+        stream.send.ack_reset_stream();
+        stream.recv.reset(43, 5).unwrap();
+        assert_eq!(stream.state(), StreamState::CompleteWithPendingDelivery);
+        assert_eq!(stream.recv.emit(&mut buf), Err(Error::StreamReset(43)));
+        assert_eq!(stream.state(), StreamState::Collectable);
+
+        // Local shutdown permits collection without reporting a later peer
+        // STOP.
+        stream.send.stop(42).unwrap();
+        assert_eq!(stream.state(), StreamState::Collectable);
+        assert_eq!(
+            stream.send.peer_stop_sending_state(),
+            PeerStopSendingState::NotReported(42)
+        );
     }
 
     #[test]
@@ -1441,8 +1937,7 @@ mod tests {
     }
 
     fn stream_send_ready(stream: &Stream) -> bool {
-        !stream.send.is_empty() &&
-            stream.send.off_front() < stream.send.off_back()
+        !stream.send.is_empty() && stream.send.off_front() < stream.send.off_back()
     }
 
     #[test]
@@ -1568,14 +2063,8 @@ mod tests {
     fn send_emit_retransmit() {
         let mut buf = [0; 5];
 
-        let mut stream = <Stream>::new(
-            0,
-            0,
-            20,
-            true,
-            DEFAULT_STREAM_WINDOW,
-            DEFAULT_STREAM_WINDOW,
-        );
+        let mut stream =
+            <Stream>::new(0, 0, 20, true, DEFAULT_STREAM_WINDOW, DEFAULT_STREAM_WINDOW);
 
         assert_eq!(stream.send.write(b"hello", false), Ok(5));
         assert_eq!(stream.send.write(b"world", false), Ok(5));
@@ -1681,6 +2170,24 @@ mod tests {
         assert_eq!(stream.send.emit(&mut buf[..5]), Ok((2, false)));
         assert_eq!(stream.send.off_front(), 20);
         assert_eq!(&buf[..2], b"ro");
+    }
+
+    #[test]
+    fn send_buf_empty_fin_next() {
+        let mut stream = <Stream>::new(0, 0, 20, true, 0, DEFAULT_STREAM_WINDOW);
+
+        assert!(!stream.send.empty_fin_next());
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+
+        let mut buf = [0; 5];
+        assert_eq!(stream.send.emit(&mut buf), Ok((5, false)));
+        assert!(!stream.send.empty_fin_next());
+
+        assert_eq!(stream.send.write(b"", true), Ok(0));
+        assert!(stream.send.empty_fin_next());
+
+        let mut empty = [];
+        assert_eq!(stream.send.emit(&mut empty), Ok((0, true)));
     }
 
     #[test]
@@ -1948,8 +2455,8 @@ mod tests {
 
         let mut streams = <StreamMap>::new(100, 100, 100);
 
-        // Streams where the urgency descends (becomes more important). No stream
-        // shares an urgency.
+        // Streams where the urgency descends (becomes more important). No
+        // stream shares an urgency.
         let input = vec![
             (0, 100),
             (4, 90),
@@ -1980,10 +2487,8 @@ mod tests {
                 ..Default::default()
             });
 
-            let old_priority_key = std::mem::replace(
-                &mut stream.priority_key,
-                new_priority_key.clone(),
-            );
+            let old_priority_key =
+                std::mem::replace(&mut stream.priority_key, new_priority_key.clone());
 
             streams.update_priority(&old_priority_key, &new_priority_key);
         }
@@ -2008,10 +2513,8 @@ mod tests {
                 ..Default::default()
             });
 
-            let old_priority_key = std::mem::replace(
-                &mut stream.priority_key,
-                new_priority_key.clone(),
-            );
+            let old_priority_key =
+                std::mem::replace(&mut stream.priority_key, new_priority_key.clone());
 
             streams.update_priority(&old_priority_key, &new_priority_key);
         }
@@ -2082,10 +2585,8 @@ mod tests {
                 ..Default::default()
             });
 
-            let old_priority_key = std::mem::replace(
-                &mut stream.priority_key,
-                new_priority_key.clone(),
-            );
+            let old_priority_key =
+                std::mem::replace(&mut stream.priority_key, new_priority_key.clone());
 
             streams.update_priority(&old_priority_key, &new_priority_key);
         }
@@ -2169,8 +2670,7 @@ mod tests {
 
     #[test]
     fn priority_tree_dupes() {
-        let mut prioritized_writable: RBTree<StreamWritablePriorityAdapter> =
-            Default::default();
+        let mut prioritized_writable: RBTree<StreamWritablePriorityAdapter> = Default::default();
 
         for id in [0, 4, 8, 12] {
             let s = Arc::new(StreamPriorityKey {
@@ -2183,12 +2683,11 @@ mod tests {
             prioritized_writable.insert(s);
         }
 
-        let walk_1: Vec<u64> =
-            prioritized_writable.iter().map(|s| s.id).collect();
+        let walk_1: Vec<u64> = prioritized_writable.iter().map(|s| s.id).collect();
         assert_eq!(walk_1, vec![0, 4, 8, 12]);
 
-        // Default keys could cause duplicate entries, this is normally protected
-        // against via StreamMap.
+        // Default keys could cause duplicate entries. `StreamMap` normally
+        // prevents this.
         for id in [0, 4, 8, 12] {
             let s = Arc::new(StreamPriorityKey {
                 urgency: 0,
@@ -2200,11 +2699,243 @@ mod tests {
             prioritized_writable.insert(s);
         }
 
-        let walk_2: Vec<u64> =
-            prioritized_writable.iter().map(|s| s.id).collect();
+        let walk_2: Vec<u64> = prioritized_writable.iter().map(|s| s.id).collect();
         assert_eq!(walk_2, vec![0, 0, 4, 4, 8, 8, 12, 12]);
+    }
+
+    #[test]
+    fn retransmit_returns_zero_when_already_acked() {
+        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
+
+        // Write and emit some data.
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // Mark data for retransmission.
+        let retransmitted = stream.send.retransmit(0, 5);
+        assert_eq!(retransmitted, 5);
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // Ack the data.
+        stream.send.ack_and_drop(0, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // Try to retransmit again - should return 0 since data is acked.
+        let retransmitted = stream.send.retransmit(0, 5);
+        assert_eq!(retransmitted, 0);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn retransmit_returns_partial_when_some_acked() {
+        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
+
+        // Write and emit 10 bytes.
+        assert_eq!(stream.send.write(b"helloworld", false), Ok(10));
+        assert_eq!(stream.send.buffered_bytes(), 10);
+
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // Mark all data for retransmission.
+        let retransmitted = stream.send.retransmit(0, 10);
+        assert_eq!(retransmitted, 10);
+        assert_eq!(stream.send.buffered_bytes(), 10);
+
+        // Ack first 5 bytes and drop them.
+        let dropped = stream.send.ack_and_drop(0, 5);
+        assert_eq!(dropped, 5);
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // Try to retransmit all 10 bytes - should return 5 since first 5 are
+        // acked.
+        let retransmitted = stream.send.retransmit(0, 10);
+        assert_eq!(retransmitted, 0); // Already marked, so no change
+        assert_eq!(stream.send.buffered_bytes(), 5);
+    }
+
+    #[test]
+    fn ack_and_drop_decrements_len_and_returns_dropped() {
+        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
+
+        // Write some data.
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // Emit it.
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // Mark for retransmission.
+        let retransmitted = stream.send.retransmit(0, 5);
+        assert_eq!(retransmitted, 5);
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // Ack and drop - should decrement len and return dropped amount.
+        let dropped = stream.send.ack_and_drop(0, 5);
+        assert_eq!(dropped, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn ack_and_drop_partial_buffer() {
+        let mut stream = <Stream>::new(0, 30, 30, true, 0, 30);
+
+        // Write and emit two chunks.
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.write(b"world", false), Ok(5));
+        assert_eq!(stream.send.buffered_bytes(), 10);
+
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 10);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // Mark both chunks for retransmission.
+        let retransmitted = stream.send.retransmit(0, 10);
+        assert_eq!(retransmitted, 10);
+        assert_eq!(stream.send.buffered_bytes(), 10);
+
+        // Ack and drop only first chunk.
+        let dropped = stream.send.ack_and_drop(0, 5);
+        assert_eq!(dropped, 5);
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // Ack and drop second chunk.
+        let dropped = stream.send.ack_and_drop(5, 5);
+        assert_eq!(dropped, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn ack_and_drop_returns_zero_when_nothing_dropped() {
+        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
+
+        // Write and emit data.
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 5);
+
+        // Ack data that's already been fully emitted and not retransmitted.
+        // Nothing should be dropped since there's no buffered data.
+        let dropped = stream.send.ack_and_drop(0, 5);
+        assert_eq!(dropped, 0);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_consistency_through_full_lifecycle() {
+        // This test verifies that StreamMap.tx_buffered stays in sync with
+        // actual buffered data through a full lifecycle: write → emit →
+        // retransmit → ack.
+        let mut streams = <StreamMap>::new(5, 5, 15);
+
+        // Create a stream using low-level StreamMap interface.
+        let local_params = crate::TransportParams {
+            initial_max_data: 30,
+            initial_max_stream_data_bidi_local: 15,
+            initial_max_stream_data_bidi_remote: 15,
+            initial_max_stream_data_uni: 10,
+            initial_max_streams_bidi: 5,
+            initial_max_streams_uni: 5,
+            ..Default::default()
+        };
+        let peer_params = local_params.clone();
+
+        // Update peer stream limits to allow locally-initiated streams.
+        streams.update_peer_max_streams_bidi(5);
+        streams.update_peer_max_streams_uni(5);
+
+        let stream_id = 0u64;
+
+        // Writing raises `stream.send.buffered_bytes()` and `tx_buffered`.
+        {
+            let stream = streams
+                .get_or_create(stream_id, &local_params, &peer_params, true, false)
+                .unwrap();
+            assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        }
+        streams.add_tx_buffered(5);
+        assert_eq!(streams.get(stream_id).unwrap().send.buffered_bytes(), 5);
+        assert_eq!(streams.tx_buffered(), 5);
+        assert!(streams.tx_buffered_is_consistent());
+
+        // Emitting lowers `stream.send.buffered_bytes()` and `tx_buffered`.
+        let mut buf = [0; 10];
+        let written = {
+            let stream = streams.get_mut(stream_id).unwrap();
+            let (written, _) = stream.send.emit(&mut buf).unwrap();
+            written
+        };
+        assert_eq!(written, 5);
+        streams.sub_tx_buffered(5);
+        assert_eq!(streams.get(stream_id).unwrap().send.buffered_bytes(), 0);
+        assert_eq!(streams.tx_buffered(), 0);
+        assert!(streams.tx_buffered_is_consistent());
+
+        // Retransmitting raises both values by the amount retransmitted.
+        let retransmitted = {
+            let stream = streams.get_mut(stream_id).unwrap();
+            stream.send.retransmit(0, 5)
+        };
+        assert_eq!(retransmitted, 5);
+        streams.add_tx_buffered(retransmitted);
+        assert_eq!(streams.get(stream_id).unwrap().send.buffered_bytes(), 5);
+        assert_eq!(streams.tx_buffered(), 5);
+        assert!(streams.tx_buffered_is_consistent());
+
+        // Ack and drop: both stream.send.buffered_bytes() and tx_buffered
+        // decrease by actual amount dropped.
+        let dropped = {
+            let stream = streams.get_mut(stream_id).unwrap();
+            stream.send.ack_and_drop(0, 5)
+        };
+        assert_eq!(dropped, 5);
+        streams.sub_tx_buffered(dropped);
+        assert_eq!(streams.get(stream_id).unwrap().send.buffered_bytes(), 0);
+        assert_eq!(streams.tx_buffered(), 0);
+        assert!(streams.tx_buffered_is_consistent());
+    }
+
+    #[test]
+    fn send_buf_len_reflects_buffered_data() {
+        let mut stream = <Stream>::new(0, 15, 15, true, 0, 15);
+
+        // Initially empty.
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // After write.
+        assert_eq!(stream.send.write(b"hello", false), Ok(5));
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // After emit.
+        let mut buf = [0; 10];
+        let (written, _) = stream.send.emit(&mut buf).unwrap();
+        assert_eq!(written, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
+
+        // After retransmit.
+        let retransmitted = stream.send.retransmit(0, 5);
+        assert_eq!(retransmitted, 5);
+        assert_eq!(stream.send.buffered_bytes(), 5);
+
+        // After ack_and_drop.
+        let dropped = stream.send.ack_and_drop(0, 5);
+        assert_eq!(dropped, 5);
+        assert_eq!(stream.send.buffered_bytes(), 0);
     }
 }
 
 mod recv_buf;
+pub(crate) use recv_buf::ReceiveMemory;
 mod send_buf;

@@ -42,9 +42,7 @@ pub(super) struct SSL_QUIC_METHOD {
 
     flush_flight: Option<extern "C" fn(ssl: *mut SSL) -> c_int>,
 
-    send_alert: Option<
-        extern "C" fn(ssl: *mut SSL, level: crypto::Level, alert: u8) -> c_int,
-    >,
+    send_alert: Option<extern "C" fn(ssl: *mut SSL, level: crypto::Level, alert: u8) -> c_int>,
 }
 
 #[cfg(test)]
@@ -95,10 +93,7 @@ pub(super) static QUICHE_STREAM_METHOD: SSL_QUIC_METHOD = SSL_QUIC_METHOD {
 impl Context {
     pub fn set_early_data_enabled(&mut self, _enabled: bool) {
         unsafe {
-            SSL_CTX_set_early_data_enabled(
-                self.as_mut_ptr(),
-                i32::from(_enabled),
-            );
+            SSL_CTX_set_early_data_enabled(self.as_mut_ptr(), i32::from(_enabled));
         }
     }
 }
@@ -106,11 +101,7 @@ impl Context {
 impl Handshake {
     pub fn set_quic_early_data_context(&mut self, context: &[u8]) -> Result<()> {
         map_result(unsafe {
-            SSL_set_quic_early_data_context(
-                self.as_mut_ptr(),
-                context.as_ptr(),
-                context.len(),
-            )
+            SSL_set_quic_early_data_context(self.as_mut_ptr(), context.as_ptr(), context.len())
         })
     }
 
@@ -122,8 +113,7 @@ impl Handshake {
                 return Err(Error::TlsFail);
             }
 
-            let session =
-                SSL_SESSION_from_bytes(session.as_ptr(), session.len(), ctx);
+            let session = SSL_SESSION_from_bytes(session.as_ptr(), session.len(), ctx);
 
             if session.is_null() {
                 return Err(Error::TlsFail);
@@ -178,8 +168,7 @@ impl Handshake {
 
     pub fn peer_cert_chain(&self) -> Option<Vec<&[u8]>> {
         let cert_chain = unsafe {
-            let chain =
-                map_result_ptr(SSL_get0_peer_certificates(self.as_ptr())).ok()?;
+            let chain = map_result_ptr(SSL_get0_peer_certificates(self.as_ptr())).ok()?;
 
             let num = sk_num(chain);
             if num == 0 {
@@ -188,9 +177,7 @@ impl Handshake {
 
             let mut cert_chain = vec![];
             for i in 0..num {
-                let buffer =
-                    map_result_ptr(sk_value(chain, i) as *const CRYPTO_BUFFER)
-                        .ok()?;
+                let buffer = map_result_ptr(sk_value(chain, i) as *const CRYPTO_BUFFER).ok()?;
 
                 let out_len = CRYPTO_BUFFER_len(buffer);
                 if out_len == 0 {
@@ -211,15 +198,12 @@ impl Handshake {
 
     pub fn peer_cert(&self) -> Option<&[u8]> {
         let peer_cert = unsafe {
-            let chain =
-                map_result_ptr(SSL_get0_peer_certificates(self.as_ptr())).ok()?;
+            let chain = map_result_ptr(SSL_get0_peer_certificates(self.as_ptr())).ok()?;
             if sk_num(chain) == 0 {
                 return None;
             }
 
-            let buffer =
-                map_result_ptr(sk_value(chain, 0) as *const CRYPTO_BUFFER)
-                    .ok()?;
+            let buffer = map_result_ptr(sk_value(chain, 0) as *const CRYPTO_BUFFER).ok()?;
 
             let out_len = CRYPTO_BUFFER_len(buffer);
             if out_len == 0 {
@@ -237,37 +221,45 @@ impl Handshake {
     #[cfg(test)]
     pub fn set_failing_private_key_method(&mut self) {
         extern "C" fn failing_sign(
-            _ssl: *mut SSL, _out: *mut u8, _out_len: *mut usize, _max_out: usize,
-            _signature_algorithm: u16, _in: *const u8, _in_len: usize,
+            _ssl: *mut SSL,
+            _out: *mut u8,
+            _out_len: *mut usize,
+            _max_out: usize,
+            _signature_algorithm: u16,
+            _in: *const u8,
+            _in_len: usize,
         ) -> ssl_private_key_result_t {
             ssl_private_key_result_t::ssl_private_key_failure
         }
 
         extern "C" fn failing_decrypt(
-            _ssl: *mut SSL, _out: *mut u8, _out_len: *mut usize, _max_out: usize,
-            _in: *const u8, _in_len: usize,
+            _ssl: *mut SSL,
+            _out: *mut u8,
+            _out_len: *mut usize,
+            _max_out: usize,
+            _in: *const u8,
+            _in_len: usize,
         ) -> ssl_private_key_result_t {
             ssl_private_key_result_t::ssl_private_key_failure
         }
 
         extern "C" fn failing_complete(
-            _ssl: *mut SSL, _out: *mut u8, _out_len: *mut usize, _max_out: usize,
+            _ssl: *mut SSL,
+            _out: *mut u8,
+            _out_len: *mut usize,
+            _max_out: usize,
         ) -> ssl_private_key_result_t {
             ssl_private_key_result_t::ssl_private_key_failure
         }
 
-        static QUICHE_PRIVATE_KEY_METHOD: SSL_PRIVATE_KEY_METHOD =
-            SSL_PRIVATE_KEY_METHOD {
-                decrypt: Some(failing_decrypt),
-                sign: Some(failing_sign),
-                complete: Some(failing_complete),
-            };
+        static QUICHE_PRIVATE_KEY_METHOD: SSL_PRIVATE_KEY_METHOD = SSL_PRIVATE_KEY_METHOD {
+            decrypt: Some(failing_decrypt),
+            sign: Some(failing_sign),
+            complete: Some(failing_complete),
+        };
 
         unsafe {
-            SSL_set_private_key_method(
-                self.as_mut_ptr(),
-                &QUICHE_PRIVATE_KEY_METHOD,
-            );
+            SSL_set_private_key_method(self.as_mut_ptr(), &QUICHE_PRIVATE_KEY_METHOD);
         }
     }
 
@@ -276,8 +268,7 @@ impl Handshake {
     }
 
     pub fn early_data_reason(&self) -> u32 {
-        let reuse_reason_status =
-            unsafe { SSL_get_early_data_reason(self.as_ptr()) };
+        let reuse_reason_status = unsafe { SSL_get_early_data_reason(self.as_ptr()) };
         reuse_reason_status.0
     }
 }
@@ -306,46 +297,48 @@ pub struct ssl_early_data_reason_t(pub ::std::os::raw::c_uint);
 extern "C" {
     // SSL_METHOD specific for boringssl.
     pub(super) fn SSL_CTX_set_tlsext_ticket_keys(
-        ctx: *mut SSL_CTX, key: *const u8, key_len: usize,
+        ctx: *mut SSL_CTX,
+        key: *const u8,
+        key_len: usize,
     ) -> c_int;
     fn SSL_CTX_set_early_data_enabled(ctx: *mut SSL_CTX, enabled: i32);
 
-    pub(super) fn SSL_CTX_set_session_cache_mode(
-        ctx: *mut SSL_CTX, mode: c_int,
-    ) -> c_int;
+    // BoringSSL exports `SSL_CTX_set1_groups_list` as a real symbol; on
+    // OpenSSL it is a header macro. See `openssl_quictls.rs` for the
+    // OpenSSL shim.
+    pub(super) fn SSL_CTX_set1_groups_list(ctx: *mut SSL_CTX, groups: *const c_char) -> c_int;
+
+    pub(super) fn SSL_CTX_set_session_cache_mode(ctx: *mut SSL_CTX, mode: c_int) -> c_int;
     pub(super) fn SSL_get_ex_new_index(
-        argl: c_long, argp: *const c_void, unused: *const c_void,
-        dup_unused: *const c_void, free_func: *const c_void,
+        argl: c_long,
+        argp: *const c_void,
+        unused: *const c_void,
+        dup_unused: *const c_void,
+        free_func: *const c_void,
     ) -> c_int;
 
     fn SSL_get_curve_id(ssl: *const SSL) -> u16;
     fn SSL_get_curve_name(curve: u16) -> *const c_char;
 
     fn SSL_get_peer_signature_algorithm(ssl: *const SSL) -> u16;
-    fn SSL_get_signature_algorithm_name(
-        sigalg: u16, include_curve: i32,
-    ) -> *const c_char;
+    fn SSL_get_signature_algorithm_name(sigalg: u16, include_curve: i32) -> *const c_char;
 
     fn SSL_get0_peer_certificates(ssl: *const SSL) -> *const STACK_OF;
 
-    pub(super) fn SSL_set_min_proto_version(ssl: *mut SSL, version: u16)
-        -> c_int;
+    pub(super) fn SSL_set_min_proto_version(ssl: *mut SSL, version: u16) -> c_int;
 
-    pub(super) fn SSL_set_max_proto_version(ssl: *mut SSL, version: u16)
-        -> c_int;
+    pub(super) fn SSL_set_max_proto_version(ssl: *mut SSL, version: u16) -> c_int;
 
-    pub(super) fn SSL_set_tlsext_host_name(
-        ssl: *mut SSL, name: *const c_char,
-    ) -> c_int;
+    pub(super) fn SSL_set_tlsext_host_name(ssl: *mut SSL, name: *const c_char) -> c_int;
 
     fn SSL_set_quic_early_data_context(
-        ssl: *mut SSL, context: *const u8, context_len: usize,
+        ssl: *mut SSL,
+        context: *const u8,
+        context_len: usize,
     ) -> c_int;
 
     #[cfg(test)]
-    fn SSL_set_private_key_method(
-        ssl: *mut SSL, key_method: *const SSL_PRIVATE_KEY_METHOD,
-    );
+    fn SSL_set_private_key_method(ssl: *mut SSL, key_method: *const SSL_PRIVATE_KEY_METHOD);
 
     fn SSL_reset_early_data_reject(ssl: *mut SSL);
 
@@ -354,11 +347,15 @@ extern "C" {
     fn SSL_get_early_data_reason(ssl: *const SSL) -> ssl_early_data_reason_t;
 
     fn SSL_SESSION_to_bytes(
-        session: *const SSL_SESSION, out: *mut *mut u8, out_len: *mut usize,
+        session: *const SSL_SESSION,
+        out: *mut *mut u8,
+        out_len: *mut usize,
     ) -> c_int;
 
     fn SSL_SESSION_from_bytes(
-        input: *const u8, input_len: usize, ctx: *const SSL_CTX,
+        input: *const u8,
+        input_len: usize,
+        ctx: *const SSL_CTX,
     ) -> *mut SSL_SESSION;
 
     // STACK_OF

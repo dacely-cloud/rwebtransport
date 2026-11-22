@@ -18,7 +18,7 @@
 [![ci](https://github.com/dacely-cloud/rwebtransport/actions/workflows/ci.yml/badge.svg)](https://github.com/dacely-cloud/rwebtransport/actions/workflows/ci.yml)
 [![node](https://img.shields.io/badge/node-24%20%7C%2026-22e3ab.svg?labelColor=0e1520)](#requirements)
 [![types](https://img.shields.io/badge/types-included-2563ff.svg?labelColor=0e1520)](https://www.typescriptlang.org/)
-[![quic](https://img.shields.io/badge/QUIC-quiche%200.29-7c3aed.svg?labelColor=0e1520)](https://github.com/cloudflare/quiche)
+[![quic](https://img.shields.io/badge/QUIC-quiche%200.30-7c3aed.svg?labelColor=0e1520)](https://github.com/cloudflare/quiche)
 [![tls](https://img.shields.io/badge/TLS-BoringSSL-654ff0.svg?labelColor=0e1520)](https://boringssl.googlesource.com/boringssl/)
 [![license](https://img.shields.io/badge/license-Apache--2.0-8b9ab4.svg?labelColor=0e1520)](./LICENSE)
 
@@ -66,7 +66,7 @@
 
 **WebTransport is the modern transport for realtime apps:** lower latency than WebSocket, multiple independent streams over one connection with no head-of-line blocking, and unreliable datagrams for the data you would rather drop than delay. Browsers have shipped it for years. Node.js has not.
 
-`rwebtransport` closes that gap. It is not an emulation over HTTP/2 or a WebSocket shim. It is a genuine HTTP/3 endpoint speaking QUIC over UDP, built on the same [Cloudflare quiche](https://github.com/cloudflare/quiche) engine that powers WebTransport at scale, exposed through the exact `WebTransport` API you already know from the browser, plus a matching `WebTransportServer`.
+`rwebtransport` is an HTTP/3 endpoint speaking QUIC over UDP, built on [Cloudflare quiche](https://github.com/cloudflare/quiche). It exposes the browser-style `WebTransport` API and a matching `WebTransportServer`. It prefers the current `webtransport-h3` protocol with reliable stream resets and falls back to the older `webtransport` protocol for peers that advertise legacy support. Each session uses its own QUIC connection.
 
 QUIC + HTTP/3 + WebTransport, implemented natively in Rust. It ships with prebuilt binaries. No round-trips through a browser, no polyfills, no HTTP/2 emulation, just an actual HTTP/3 datagram on the wire. And it provides the full standard surface: `WebTransport`, `WebTransportBidirectionalStream`, `WebTransportSendStream` and `WebTransportReceiveStream` as WHATWG streams, and `WebTransportDatagramDuplexStream`, all matching the [W3C spec](https://w3c.github.io/webtransport/).
 
@@ -473,7 +473,7 @@ flowchart TB
     end
 
     subgraph ENGINE["vendored engine"]
-      QUICHE["Cloudflare quiche 0.29, QUIC transport and HTTP/3"]
+      QUICHE["Cloudflare quiche 0.30, QUIC transport and HTTP/3"]
       BSSL["BoringSSL for the TLS 1.3 handshake"]
     end
 
@@ -554,7 +554,7 @@ The suite covers the QUIC handshake, Extended CONNECT, bidirectional and unidire
 The native core treats the peer and the caller as untrusted, on both the client and the server:
 
 - **A panic can never crash Node.** The entire driver thread runs inside a panic boundary; a panic (or a fatal setup error) is surfaced as an `error` event that rejects `ready`/`closed`. It never aborts the process and never silently hangs the session.
-- **Bounded receive queues and parsers.** Event delivery to the JS loop is backpressured (unread stream data stays flow-controlled in QUIC, excess datagrams are dropped), servers queue at most 128 unread sessions, each incoming stream direction queues at most 128 unread streams, and finished native streams are pruned. HTTP/3 and capsule parser allocations are limited to 8 MiB per connection and 64 MiB across a server. Exceeding a queue or parser budget terminates the affected session.
+- **Bounded receive queues and parsers.** Stream payload stays in QUIC until the application pulls it. Native receive batches have size limits, excess datagrams can be dropped, and each listener caps live connections and retained receive memory. See [server resource limits](./docs/server.md#server-initiated-streams-and-datagrams).
 - **No blocking on the event loop.** DNS resolution, the socket bind, and the QUIC handshake all run on the driver thread, so the constructor never blocks Node.
 - **Hostile input is fail-closed.** Malformed HTTP/3, bad QPACK, oversized frames, unexpected resets, and out-of-range numbers from JS are handled by rejecting or closing cleanly rather than panicking.
 

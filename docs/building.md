@@ -31,8 +31,8 @@ Any other combination (for example `darwin-x64` on an Intel Mac, or `win32-arm64
 `loadNative()` in [`../src/loader.ts`](../src/loader.ts) resolves the addon the first time you construct a `WebTransport` or `WebTransportServer`, then caches it. The order is:
 
 1. **Assert the runtime.** If `process.versions.node` is not major 24 or 26, it throws immediately.
-2. **Prefer a prebuilt binary.** It looks for `prebuilds/<platform>-<arch>/rwebtransport.node` under the package root. If that file exists, it is `require()`d and returned.
-3. **Compile on the fly.** If no prebuilt binary is present, it runs [`../scripts/build.js`](../scripts/build.js) with the current Node executable (`execFileSync`, output streamed to your terminal), then loads the addon that the build produced. This needs a Rust toolchain plus the BoringSSL build prerequisites (see below). If the build script is missing, or if it finishes without producing the expected file, the loader throws with a clear message telling you to reinstall or run `npm run build:rust`.
+2. **Prefer a prebuilt binary.** The loader tries `prebuilds/<platform>-<arch>/rwebtransport.node` under the package root. Published Linux binaries target glibc 2.28 and libstdc++ with symbols through GLIBCXX_3.4.25.
+3. **Compile on the fly.** When the prebuilt binary is missing or the dynamic linker rejects it, the loader runs [`../scripts/build.js`](../scripts/build.js) and loads the result. If a prebuild exists, the source build is stored alongside it as `rwebtransport-local.node`. This needs a Rust toolchain and the BoringSSL build prerequisites below.
 
 So a fresh install on a supported platform loads a prebuilt binary with zero compilation, while an unsupported platform transparently compiles once and caches the result on disk for every later run.
 
@@ -213,7 +213,7 @@ After all prebuild jobs succeed, the publish job on `ubuntu-24.04`:
 3. Downloads every `prebuild-*` artifact and assembles them back into `prebuilds/<target>/rwebtransport.node`.
 4. Builds the TypeScript layer with `npm run build:ts`.
 5. Packs `prebuilds/` into `rwebtransport-prebuilds.tar.gz` and attaches it to the GitHub Release.
-6. Runs `npm publish --access public`, gated on an `NPM_TOKEN` secret being present.
+6. Publishes to npm with provenance using npm Trusted Publishing over GitHub Actions OIDC.
 
 The published package therefore contains the four prebuilds plus the full Rust source, giving both the fast path (a matching prebuilt binary) and the fallback path (compile from source, which is how `darwin-x64` and any other unlisted target are served) on any install.
 

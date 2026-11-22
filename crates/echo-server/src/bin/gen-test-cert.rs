@@ -72,7 +72,7 @@ fn main() {
         .ip("::1")
         .build(&b.x509v3_context(None, None))
         .expect("SAN");
-    b.append_extension(san).expect("append SAN");
+    b.append_extension(&san).expect("append SAN");
 
     b.sign(&pkey, MessageDigest::sha256()).expect("sign");
     let cert = b.build();

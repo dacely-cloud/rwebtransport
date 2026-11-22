@@ -434,7 +434,11 @@ exportKeyingMaterial(
 ): Promise<Uint8Array>
 ```
 
-Exports RFC 5705 TLS keying material bound to this session. This method is
+Exports TLS keying material. Sessions using `webtransport-h3` derive it with
+the WebTransport exporter label and include the session ID, application label
+and application context in the exporter context. The modern format limits the
+label and context to 255 bytes each. Legacy sessions use the direct TLS
+exporter. This method is
 present on both the client and the server session. Both endpoints of the same
 session derive identical bytes for the same `label`, `context`, and
 `outputLength`, and nobody outside the TLS session can, which makes the result

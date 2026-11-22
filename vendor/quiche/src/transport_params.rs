@@ -71,21 +71,16 @@ impl<T> UnknownTransportParameter<T> {
 }
 
 #[cfg(feature = "qlog")]
-impl From<UnknownTransportParameter<Vec<u8>>>
-    for qlog::events::quic::UnknownTransportParameter
-{
+impl From<UnknownTransportParameter<Vec<u8>>> for qlog::events::quic::UnknownTransportParameter {
     fn from(value: UnknownTransportParameter<Vec<u8>>) -> Self {
         Self {
             id: value.id,
-            value: qlog::HexSlice::maybe_string(Some(value.value.as_slice()))
-                .unwrap_or_default(),
+            value: qlog::HexSlice::maybe_string(Some(value.value.as_slice())).unwrap_or_default(),
         }
     }
 }
 
-impl From<UnknownTransportParameter<&[u8]>>
-    for UnknownTransportParameter<Vec<u8>>
-{
+impl From<UnknownTransportParameter<&[u8]>> for UnknownTransportParameter<Vec<u8>> {
     // When an instance of an UnknownTransportParameter is actually
     // stored in UnknownTransportParameters, then we make a copy
     // of the bytes if the source is an instance of an UnknownTransportParameter
@@ -189,6 +184,8 @@ pub struct TransportParams {
     pub retry_source_connection_id: Option<ConnectionId<'static>>,
     /// DATAGRAM frame extension parameter, if any.
     pub max_datagram_frame_size: Option<u64>,
+    /// Receive support for RESET_STREAM_AT (draft-ietf-quic-reliable-stream-reset).
+    pub reset_stream_at: bool,
     /// Unknown peer transport parameters and values, if any.
     pub unknown_params: Option<UnknownTransportParameters>,
     // pub preferred_address: ...,
@@ -214,6 +211,7 @@ impl Default for TransportParams {
             initial_source_connection_id: None,
             retry_source_connection_id: None,
             max_datagram_frame_size: None,
+            reset_stream_at: false,
             unknown_params: Default::default(),
         }
     }
@@ -221,7 +219,9 @@ impl Default for TransportParams {
 
 impl TransportParams {
     pub(crate) fn decode(
-        buf: &[u8], is_server: bool, unknown_size: Option<usize>,
+        buf: &[u8],
+        is_server: bool,
+        unknown_size: Option<usize>,
     ) -> Result<TransportParams> {
         let mut params = octets::Octets::with_slice(buf);
         let mut seen_params = HashSet::new();
@@ -251,13 +251,12 @@ impl TransportParams {
                         return Err(Error::InvalidTransportParam);
                     }
 
-                    tp.original_destination_connection_id =
-                        Some(val.to_vec().into());
-                },
+                    tp.original_destination_connection_id = Some(val.to_vec().into());
+                }
 
                 0x0001 => {
                     tp.max_idle_timeout = val.get_varint()?;
-                },
+                }
 
                 0x0002 => {
                     if is_server {
@@ -270,7 +269,7 @@ impl TransportParams {
                             .try_into()
                             .map_err(|_| Error::BufferTooShort)?,
                     ));
-                },
+                }
 
                 0x0003 => {
                     tp.max_udp_payload_size = val.get_varint()?;
@@ -278,23 +277,23 @@ impl TransportParams {
                     if tp.max_udp_payload_size < 1200 {
                         return Err(Error::InvalidTransportParam);
                     }
-                },
+                }
 
                 0x0004 => {
                     tp.initial_max_data = val.get_varint()?;
-                },
+                }
 
                 0x0005 => {
                     tp.initial_max_stream_data_bidi_local = val.get_varint()?;
-                },
+                }
 
                 0x0006 => {
                     tp.initial_max_stream_data_bidi_remote = val.get_varint()?;
-                },
+                }
 
                 0x0007 => {
                     tp.initial_max_stream_data_uni = val.get_varint()?;
-                },
+                }
 
                 0x0008 => {
                     let max = val.get_varint()?;
@@ -304,7 +303,7 @@ impl TransportParams {
                     }
 
                     tp.initial_max_streams_bidi = max;
-                },
+                }
 
                 0x0009 => {
                     let max = val.get_varint()?;
@@ -314,7 +313,7 @@ impl TransportParams {
                     }
 
                     tp.initial_max_streams_uni = max;
-                },
+                }
 
                 0x000a => {
                     let ack_delay_exponent = val.get_varint()?;
@@ -324,7 +323,7 @@ impl TransportParams {
                     }
 
                     tp.ack_delay_exponent = ack_delay_exponent;
-                },
+                }
 
                 0x000b => {
                     let max_ack_delay = val.get_varint()?;
@@ -334,11 +333,11 @@ impl TransportParams {
                     }
 
                     tp.max_ack_delay = max_ack_delay;
-                },
+                }
 
                 0x000c => {
                     tp.disable_active_migration = true;
-                },
+                }
 
                 0x000d => {
                     if is_server {
@@ -346,7 +345,7 @@ impl TransportParams {
                     }
 
                     // TODO: decode preferred_address
-                },
+                }
 
                 0x000e => {
                     let limit = val.get_varint()?;
@@ -356,11 +355,11 @@ impl TransportParams {
                     }
 
                     tp.active_conn_id_limit = limit;
-                },
+                }
 
                 0x000f => {
                     tp.initial_source_connection_id = Some(val.to_vec().into());
-                },
+                }
 
                 0x00010 => {
                     if is_server {
@@ -368,32 +367,36 @@ impl TransportParams {
                     }
 
                     tp.retry_source_connection_id = Some(val.to_vec().into());
-                },
+                }
+
+                0x001d => {
+                    if val.cap() != 0 {
+                        return Err(Error::InvalidTransportParam);
+                    }
+                    tp.reset_stream_at = true;
+                }
 
                 0x0020 => {
                     tp.max_datagram_frame_size = Some(val.get_varint()?);
-                },
+                }
 
                 // Track unknown transport parameters specially.
                 unknown_tp_id => {
                     if let Some(unknown_params) = &mut tp.unknown_params {
-                        // It is _not_ an error not to have space enough to track
-                        // an unknown parameter.
+                        // Failing to track an unknown parameter is harmless.
                         let _ = unknown_params.push(UnknownTransportParameter {
                             id: unknown_tp_id,
                             value: val.buf(),
                         });
                     }
-                },
+                }
             }
         }
 
         Ok(tp)
     }
 
-    pub(crate) fn encode_param(
-        b: &mut octets::OctetsMut, ty: u64, len: usize,
-    ) -> Result<()> {
+    pub(crate) fn encode_param(b: &mut octets::OctetsMut, ty: u64, len: usize) -> Result<()> {
         b.put_varint(ty)?;
         b.put_varint(len as u64)?;
 
@@ -401,7 +404,9 @@ impl TransportParams {
     }
 
     pub(crate) fn encode<'a>(
-        tp: &TransportParams, is_server: bool, out: &'a mut [u8],
+        tp: &TransportParams,
+        is_server: bool,
+        out: &'a mut [u8],
     ) -> Result<&'a mut [u8]> {
         let mut b = octets::OctetsMut::with_slice(out);
 
@@ -414,11 +419,7 @@ impl TransportParams {
 
         if tp.max_idle_timeout != 0 {
             assert!(tp.max_idle_timeout <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0001,
-                octets::varint_len(tp.max_idle_timeout),
-            )?;
+            TransportParams::encode_param(&mut b, 0x0001, octets::varint_len(tp.max_idle_timeout))?;
             b.put_varint(tp.max_idle_timeout)?;
         }
 
@@ -441,11 +442,7 @@ impl TransportParams {
 
         if tp.initial_max_data != 0 {
             assert!(tp.initial_max_data <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x0004,
-                octets::varint_len(tp.initial_max_data),
-            )?;
+            TransportParams::encode_param(&mut b, 0x0004, octets::varint_len(tp.initial_max_data))?;
             b.put_varint(tp.initial_max_data)?;
         }
 
@@ -460,9 +457,7 @@ impl TransportParams {
         }
 
         if tp.initial_max_stream_data_bidi_remote != 0 {
-            assert!(
-                tp.initial_max_stream_data_bidi_remote <= octets::MAX_VAR_INT
-            );
+            assert!(tp.initial_max_stream_data_bidi_remote <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
                 &mut b,
                 0x0006,
@@ -513,11 +508,7 @@ impl TransportParams {
 
         if tp.max_ack_delay != 0 {
             assert!(tp.max_ack_delay <= octets::MAX_VAR_INT);
-            TransportParams::encode_param(
-                &mut b,
-                0x000b,
-                octets::varint_len(tp.max_ack_delay),
-            )?;
+            TransportParams::encode_param(&mut b, 0x000b, octets::varint_len(tp.max_ack_delay))?;
             b.put_varint(tp.max_ack_delay)?;
         }
 
@@ -549,6 +540,10 @@ impl TransportParams {
             }
         }
 
+        if tp.reset_stream_at {
+            TransportParams::encode_param(&mut b, 0x001d, 0)?;
+        }
+
         if let Some(max_datagram_frame_size) = tp.max_datagram_frame_size {
             assert!(max_datagram_frame_size <= octets::MAX_VAR_INT);
             TransportParams::encode_param(
@@ -567,11 +562,12 @@ impl TransportParams {
     /// Creates a qlog event for connection transport parameters and TLS fields
     #[cfg(feature = "qlog")]
     pub fn to_qlog(
-        &self, initiator: TransportInitiator, cipher: Option<crypto::Algorithm>,
+        &self,
+        initiator: TransportInitiator,
+        cipher: Option<crypto::Algorithm>,
     ) -> EventData {
-        let original_destination_connection_id = qlog::HexSlice::maybe_string(
-            self.original_destination_connection_id.as_ref(),
-        );
+        let original_destination_connection_id =
+            qlog::HexSlice::maybe_string(self.original_destination_connection_id.as_ref());
 
         let stateless_reset_token = qlog::HexSlice::maybe_string(
             self.stateless_reset_token.map(|s| s.to_be_bytes()).as_ref(),
@@ -579,50 +575,38 @@ impl TransportParams {
 
         let tls_cipher: Option<String> = cipher.map(|f| format!("{f:?}"));
 
-        EventData::QuicParametersSet(Box::new(
-            qlog::events::quic::ParametersSet {
-                initiator: Some(initiator),
-                tls_cipher,
-                original_destination_connection_id,
-                stateless_reset_token,
-                disable_active_migration: Some(self.disable_active_migration),
-                max_idle_timeout: Some(self.max_idle_timeout),
-                max_udp_payload_size: Some(self.max_udp_payload_size),
-                ack_delay_exponent: Some(self.ack_delay_exponent),
-                max_ack_delay: Some(self.max_ack_delay),
-                active_connection_id_limit: Some(self.active_conn_id_limit),
+        EventData::QuicParametersSet(Box::new(qlog::events::quic::ParametersSet {
+            initiator: Some(initiator),
+            tls_cipher,
+            original_destination_connection_id,
+            stateless_reset_token,
+            disable_active_migration: Some(self.disable_active_migration),
+            max_idle_timeout: Some(self.max_idle_timeout),
+            max_udp_payload_size: Some(self.max_udp_payload_size),
+            ack_delay_exponent: Some(self.ack_delay_exponent),
+            max_ack_delay: Some(self.max_ack_delay),
+            active_connection_id_limit: Some(self.active_conn_id_limit),
 
-                initial_max_data: Some(self.initial_max_data),
-                initial_max_stream_data_bidi_local: Some(
-                    self.initial_max_stream_data_bidi_local,
-                ),
-                initial_max_stream_data_bidi_remote: Some(
-                    self.initial_max_stream_data_bidi_remote,
-                ),
-                initial_max_stream_data_uni: Some(
-                    self.initial_max_stream_data_uni,
-                ),
-                initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
-                initial_max_streams_uni: Some(self.initial_max_streams_uni),
+            initial_max_data: Some(self.initial_max_data),
+            initial_max_stream_data_bidi_local: Some(self.initial_max_stream_data_bidi_local),
+            initial_max_stream_data_bidi_remote: Some(self.initial_max_stream_data_bidi_remote),
+            initial_max_stream_data_uni: Some(self.initial_max_stream_data_uni),
+            initial_max_streams_bidi: Some(self.initial_max_streams_bidi),
+            initial_max_streams_uni: Some(self.initial_max_streams_uni),
 
-                unknown_parameters: self
-                    .unknown_params
-                    .as_ref()
-                    .map(|unknown_params| {
-                        unknown_params
-                            .into_iter()
-                            .cloned()
-                            .map(
-                                Into::<
-                                    qlog::events::quic::UnknownTransportParameter,
-                                >::into,
-                            )
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+            unknown_parameters: self
+                .unknown_params
+                .as_ref()
+                .map(|unknown_params| {
+                    unknown_params
+                        .into_iter()
+                        .cloned()
+                        .map(Into::<qlog::events::quic::UnknownTransportParameter>::into)
+                        .collect()
+                })
+                .unwrap_or_default(),
 
-                ..Default::default()
-            },
-        ))
+            ..Default::default()
+        }))
     }
 }

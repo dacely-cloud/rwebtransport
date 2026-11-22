@@ -20,7 +20,9 @@ directions:
 - **Driver to JS: a non-blocking neon `Channel`.** Incoming streams, readable
   chunks, datagrams, and lifecycle events (`ready`, `closed`) are delivered to
   the event loop through neon's `Channel`, which schedules callbacks without
-  blocking the driver thread.
+  blocking the driver thread. Each receive batch has a byte and work budget.
+  At 16 queued batches, the driver defers further application reads and keeps
+  processing QUIC timers and shutdown. A drained batch wakes the driver.
 - **Shared state: atomics.** Flow-control counters and status flags that both
   sides read are plain atomics, so neither side takes a lock the other could be
   holding.

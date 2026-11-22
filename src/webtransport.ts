@@ -106,7 +106,7 @@ function buildConfig(url: string, options: WebTransportOptions): ConnectConfig {
     const headerNames: string[] = [];
     const headerValues: string[] = [];
     for (const [name, value] of Object.entries(options.headers ?? {})) {
-        headerNames.push(name);
+        headerNames.push(name.toLowerCase());
         headerValues.push(value);
     }
 

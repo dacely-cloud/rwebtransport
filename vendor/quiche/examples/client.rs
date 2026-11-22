@@ -66,8 +66,7 @@ fn main() {
 
     // Create the UDP socket backing the QUIC connection, and register it with
     // the event loop.
-    let mut socket =
-        mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
+    let mut socket = mio::net::UdpSocket::bind(bind_addr.parse().unwrap()).unwrap();
     poll.registry()
         .register(&mut socket, mio::Token(0), mio::Interest::READABLE)
         .unwrap();
@@ -79,13 +78,7 @@ fn main() {
     config.verify_peer(false);
 
     config
-        .set_application_protos(&[
-            b"hq-interop",
-            b"hq-29",
-            b"hq-28",
-            b"hq-27",
-            b"http/0.9",
-        ])
+        .set_application_protos(&[b"hq-interop", b"hq-29", b"hq-28", b"hq-27", b"http/0.9"])
         .unwrap();
 
     config.set_max_idle_timeout(5000);
@@ -109,8 +102,7 @@ fn main() {
 
     // Create a QUIC connection and initiate handshake.
     let mut conn =
-        quiche::connect(url.domain(), &scid, local_addr, peer_addr, &mut config)
-            .unwrap();
+        quiche::connect(url.domain(), &scid, local_addr, peer_addr, &mut config).unwrap();
 
     info!(
         "connecting to {:} from {:} with scid {}",
@@ -164,7 +156,7 @@ fn main() {
                     }
 
                     panic!("recv() failed: {e:?}");
-                },
+                }
             };
 
             debug!("got {len} bytes");
@@ -181,7 +173,7 @@ fn main() {
                 Err(e) => {
                     error!("recv failed: {e:?}");
                     continue 'read;
-                },
+                }
             };
 
             debug!("processed {read} bytes");
@@ -212,24 +204,14 @@ fn main() {
 
                 let stream_buf = &buf[..read];
 
-                debug!(
-                    "stream {} has {} bytes (fin? {})",
-                    s,
-                    stream_buf.len(),
-                    fin
-                );
+                debug!("stream {} has {} bytes (fin? {})", s, stream_buf.len(), fin);
 
-                print!("{}", unsafe {
-                    std::str::from_utf8_unchecked(stream_buf)
-                });
+                print!("{}", unsafe { std::str::from_utf8_unchecked(stream_buf) });
 
                 // The server reported that it has no more data to send, which
                 // we got the full response. Close the connection.
                 if s == HTTP_REQ_STREAM_ID && fin {
-                    info!(
-                        "response received in {:?}, closing...",
-                        req_start.elapsed()
-                    );
+                    info!("response received in {:?}, closing...", req_start.elapsed());
 
                     conn.close(true, 0x00, b"kthxbye").unwrap();
                 }
@@ -245,14 +227,14 @@ fn main() {
                 Err(quiche::Error::Done) => {
                     debug!("done writing");
                     break;
-                },
+                }
 
                 Err(e) => {
                     error!("send failed: {e:?}");
 
                     conn.close(false, 0x1, b"fail").ok();
                     break;
-                },
+                }
             };
 
             if let Err(e) = socket.send_to(&out[..write], send_info.to) {

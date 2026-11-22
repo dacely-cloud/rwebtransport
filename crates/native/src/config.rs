@@ -106,6 +106,8 @@ pub fn build_config(p: &ClientConfigParams) -> Result<quiche::Config, String> {
     config.set_initial_max_streams_uni(p.initial_max_streams_uni);
     config.set_disable_active_migration(true);
     config.enable_dgram(true, p.dgram_recv_queue, p.dgram_send_queue);
+    config.enable_reliable_stream_reset();
+    config.set_stream_recv_memory_limits(32 * 1024 * 1024, 32 * 1024 * 1024);
 
     Ok(config)
 }
@@ -137,7 +139,13 @@ pub fn build_server_config(cert_path: &str, key_path: &str) -> Result<quiche::Co
         .set_application_protos(&[H3_ALPN])
         .map_err(|e| format!("set_application_protos: {e:?}"))?;
 
-    let p = ClientConfigParams::default();
+    let p = ClientConfigParams {
+        initial_max_data: 2 * 1024 * 1024,
+        initial_max_stream_data: 256 * 1024,
+        dgram_recv_queue: 128,
+        dgram_send_queue: 128,
+        ..ClientConfigParams::default()
+    };
     config.set_max_idle_timeout(p.max_idle_timeout_ms);
     config.set_max_recv_udp_payload_size(p.max_udp_payload_size);
     config.set_max_send_udp_payload_size(p.max_udp_payload_size);
@@ -149,6 +157,10 @@ pub fn build_server_config(cert_path: &str, key_path: &str) -> Result<quiche::Co
     config.set_initial_max_streams_uni(p.initial_max_streams_uni);
     config.set_disable_active_migration(true);
     config.enable_dgram(true, p.dgram_recv_queue, p.dgram_send_queue);
+    config.enable_reliable_stream_reset();
+    config.set_max_connection_window(4 * 1024 * 1024);
+    config.set_max_stream_window(1024 * 1024);
+    config.set_stream_recv_memory_limits(6 * 1024 * 1024, 96 * 1024 * 1024);
 
     Ok(config)
 }

@@ -33,6 +33,25 @@ pub const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 pub const SETTINGS_WT_MAX_SESSIONS: u64 = 0x14e9_cd29;
 /// Older draft `SETTINGS_ENABLE_WEBTRANSPORT` (kept for maximum compatibility).
 pub const SETTINGS_ENABLE_WEBTRANSPORT: u64 = 0x2b60_3742;
+/// draft-ietf-webtrans-http3-17 SETTINGS_WT_ENABLED.
+pub const SETTINGS_WT_ENABLED: u64 = 0x20b8_933b;
+pub const SETTINGS_WT_ENABLED_DRAFT15: u64 = 0x2c7c_f000;
+pub const LEGACY_WT_TOKEN: &[u8] = b"webtransport";
+pub const WT_H3_TOKEN: &[u8] = b"webtransport-h3";
+pub const WT_EXPORTER_LABEL: &[u8] = b"EXPORTER-WebTransport";
+
+/// Serialize the session-bound exporter context from WebTransport-H3 §4.8.
+pub fn exporter_context(session_id: u64, label: &[u8], context: &[u8]) -> Option<Vec<u8>> {
+    let label_len = u8::try_from(label.len()).ok()?;
+    let context_len = u8::try_from(context.len()).ok()?;
+    let mut output = Vec::with_capacity(10 + label.len() + context.len());
+    output.extend_from_slice(&session_id.to_be_bytes());
+    output.push(label_len);
+    output.extend_from_slice(label);
+    output.push(context_len);
+    output.extend_from_slice(context);
+    Some(output)
+}
 /// `SETTINGS_WT_INITIAL_MAX_DATA`: initial per-session send-data allowance.
 pub const SETTINGS_WT_INITIAL_MAX_DATA: u64 = 0x2b61;
 /// `SETTINGS_WT_INITIAL_MAX_STREAMS_UNI`: initial per-session uni stream limit.
@@ -171,9 +190,20 @@ pub fn frame(ty: u64, payload: &[u8]) -> Vec<u8> {
 /// Bytes for the client control stream: the stream-type prefix followed by our
 /// SETTINGS frame.
 pub fn control_stream_prefix() -> Vec<u8> {
+    control_stream_prefix_for(false)
+}
+
+pub fn control_stream_prefix_for(reliable_reset: bool) -> Vec<u8> {
     let mut out = Vec::new();
     put_varint(H3_CONTROL_STREAM_TYPE, &mut out);
-    out.extend_from_slice(&frame(FRAME_SETTINGS, &settings_payload()));
+    let mut settings = settings_payload();
+    if reliable_reset {
+        put_varint(SETTINGS_WT_ENABLED, &mut settings);
+        put_varint(1, &mut settings);
+        put_varint(SETTINGS_WT_ENABLED_DRAFT15, &mut settings);
+        put_varint(1, &mut settings);
+    }
+    out.extend_from_slice(&frame(FRAME_SETTINGS, &settings));
     out
 }
 
@@ -188,7 +218,7 @@ pub fn settings_payload() -> Vec<u8> {
         (SETTINGS_ENABLE_CONNECT_PROTOCOL, 1),
         (SETTINGS_H3_DATAGRAM, 1),
         (SETTINGS_ENABLE_WEBTRANSPORT, 1),
-        (SETTINGS_WT_MAX_SESSIONS, 256),
+        (SETTINGS_WT_MAX_SESSIONS, 1),
         (SETTINGS_WT_INITIAL_MAX_DATA, WT_INITIAL_MAX_DATA),
         (SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI, WT_INITIAL_MAX_STREAMS),
         (SETTINGS_WT_INITIAL_MAX_STREAMS_UNI, WT_INITIAL_MAX_STREAMS),
@@ -206,6 +236,8 @@ pub struct PeerSettings {
     pub enable_connect_protocol: bool,
     pub h3_datagram: bool,
     pub enable_webtransport: bool,
+    pub wt_enabled: bool,
+    pub wt_enabled_draft15: bool,
     pub wt_max_sessions: u64,
     /// Peer's initial per-session send-data allowance (SETTINGS_WT_INITIAL_MAX_DATA).
     pub wt_initial_max_data: u64,
@@ -236,7 +268,10 @@ pub fn parse_settings(mut payload: &[u8]) -> Result<PeerSettings, String> {
         }
         if matches!(
             id,
-            SETTINGS_ENABLE_CONNECT_PROTOCOL | SETTINGS_H3_DATAGRAM | SETTINGS_ENABLE_WEBTRANSPORT
+            SETTINGS_ENABLE_CONNECT_PROTOCOL
+                | SETTINGS_H3_DATAGRAM
+                | SETTINGS_ENABLE_WEBTRANSPORT
+                | SETTINGS_WT_ENABLED
         ) && val > 1
         {
             return Err("invalid boolean SETTINGS value".into());
@@ -252,6 +287,8 @@ pub fn parse_settings(mut payload: &[u8]) -> Result<PeerSettings, String> {
             SETTINGS_ENABLE_CONNECT_PROTOCOL => s.enable_connect_protocol = val != 0,
             SETTINGS_H3_DATAGRAM => s.h3_datagram = val != 0,
             SETTINGS_ENABLE_WEBTRANSPORT => s.enable_webtransport = val != 0,
+            SETTINGS_WT_ENABLED => s.wt_enabled = val != 0,
+            SETTINGS_WT_ENABLED_DRAFT15 => s.wt_enabled_draft15 = val != 0,
             SETTINGS_WT_MAX_SESSIONS => s.wt_max_sessions = val,
             SETTINGS_WT_INITIAL_MAX_DATA => s.wt_initial_max_data = val,
             SETTINGS_WT_INITIAL_MAX_STREAMS_BIDI => s.wt_initial_max_streams_bidi = val,
@@ -270,6 +307,84 @@ pub const WT_AVAILABLE_PROTOCOLS: &[u8] = b"wt-available-protocols";
 /// Structured-Field Item String.
 pub const WT_PROTOCOL: &[u8] = b"wt-protocol";
 
+/// Validated request routing fields and the selected HTTP upgrade token.
+pub struct ConnectTarget<'a> {
+    pub protocol: &'a [u8],
+    pub authority: &'a str,
+    pub path: &'a str,
+    pub origin: Option<&'a str>,
+}
+
+pub fn validate_connect_headers(headers: &[Header]) -> Option<ConnectTarget<'_>> {
+    use quiche::h3::NameValue;
+
+    let (mut method, mut protocol, mut scheme, mut authority, mut path, mut origin) =
+        (None, None, None, None, None, None);
+    let mut regular = false;
+    for header in headers {
+        let (name, value) = (header.name(), header.value());
+        if value.iter().any(|&b| b == 0 || b == b'\r' || b == b'\n') {
+            return None;
+        }
+        if name.first() == Some(&b':') {
+            if regular {
+                return None;
+            }
+            let field = match name {
+                b":method" => &mut method,
+                b":protocol" => &mut protocol,
+                b":scheme" => &mut scheme,
+                b":authority" => &mut authority,
+                b":path" => &mut path,
+                _ => return None,
+            };
+            if field.replace(value).is_some() {
+                return None;
+            }
+        } else {
+            regular = true;
+            if name.is_empty()
+                || !name.iter().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b"!#$%&'*+-.^_`|~".contains(b)
+                })
+                || matches!(
+                    name,
+                    b"connection"
+                        | b"proxy-connection"
+                        | b"keep-alive"
+                        | b"transfer-encoding"
+                        | b"upgrade"
+                )
+                || (name == b"te" && !value.eq_ignore_ascii_case(b"trailers"))
+            {
+                return None;
+            }
+            if name == b"origin" && origin.replace(std::str::from_utf8(value).ok()?).is_some() {
+                return None;
+            }
+        }
+    }
+    let authority = std::str::from_utf8(authority?).ok()?;
+    let path = std::str::from_utf8(path?).ok()?;
+    if method? != b"CONNECT"
+        || scheme? != b"https"
+        || authority.is_empty()
+        || authority
+            .bytes()
+            .any(|b| !b.is_ascii_graphic() || b"@/?#".contains(&b))
+        || !path.starts_with('/')
+        || path.bytes().any(|b| !b.is_ascii_graphic() || b == b'#')
+    {
+        return None;
+    }
+    Some(ConnectTarget {
+        protocol: protocol?,
+        authority,
+        path,
+        origin,
+    })
+}
+
 /// Build the Extended CONNECT request header list for a WebTransport session.
 pub fn connect_headers(
     authority: &str,
@@ -278,9 +393,20 @@ pub fn connect_headers(
     extra: &[(String, String)],
     protocols: &[String],
 ) -> Vec<Header> {
+    connect_headers_for(LEGACY_WT_TOKEN, authority, path, origin, extra, protocols)
+}
+
+pub fn connect_headers_for(
+    token: &[u8],
+    authority: &str,
+    path: &str,
+    origin: Option<&str>,
+    extra: &[(String, String)],
+    protocols: &[String],
+) -> Vec<Header> {
     let mut h = vec![
         Header::new(b":method", b"CONNECT"),
-        Header::new(b":protocol", b"webtransport"),
+        Header::new(b":protocol", token),
         Header::new(b":scheme", b"https"),
         Header::new(b":authority", authority.as_bytes()),
         Header::new(b":path", path.as_bytes()),
@@ -408,17 +534,47 @@ pub fn decode_header_block(block: &[u8]) -> Result<Vec<Header>, String> {
 
 /// Extract the numeric `:status` from a decoded response header list.
 pub fn status_of(headers: &[Header]) -> Option<u16> {
-    for h in headers {
-        if h.name() == b":status" {
-            return std::str::from_utf8(h.value()).ok()?.trim().parse().ok();
-        }
+    let (first, rest) = headers.split_first()?;
+    let status = first.value();
+    if first.name() != b":status"
+        || status.len() != 3
+        || !status.iter().all(u8::is_ascii_digit)
+        || rest.iter().any(|field| field.name().starts_with(b":"))
+    {
+        return None;
     }
-    None
+    let status = std::str::from_utf8(status).ok()?.parse().ok()?;
+    ((100..600).contains(&status) && status != 101).then_some(status)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validates_extended_connect_routing_fields() {
+        let mut request =
+            connect_headers_for(WT_H3_TOKEN, "example.test", "/x?q=1", None, &[], &[]);
+        assert_eq!(
+            validate_connect_headers(&request).unwrap().protocol,
+            WT_H3_TOKEN
+        );
+        request.push(Header::new(b":path", b"/other"));
+        assert!(validate_connect_headers(&request).is_none());
+        request.pop();
+        request.remove(2);
+        assert!(validate_connect_headers(&request).is_none());
+    }
+
+    #[test]
+    fn exporter_context_includes_session_id_and_both_field_lengths() {
+        assert_eq!(
+            exporter_context(4, b"ab", b"c").unwrap(),
+            [0, 0, 0, 0, 0, 0, 0, 4, 2, b'a', b'b', 1, b'c']
+        );
+        assert!(exporter_context(0, &[0; 256], b"").is_none());
+        assert!(exporter_context(0, b"", &[0; 256]).is_none());
+    }
 
     #[test]
     fn settings_reject_truncation_duplicates_and_invalid_boolean_values() {
@@ -526,7 +682,7 @@ mod tests {
     fn settings_advertise_and_parse_wt_flow_control() {
         let s = parse_settings(&settings_payload()).unwrap();
         assert!(s.webtransport_ok());
-        assert_eq!(s.wt_max_sessions, 256);
+        assert_eq!(s.wt_max_sessions, 1);
         assert_eq!(s.wt_initial_max_data, WT_INITIAL_MAX_DATA);
         assert_eq!(s.wt_initial_max_streams_bidi, WT_INITIAL_MAX_STREAMS);
         assert_eq!(s.wt_initial_max_streams_uni, WT_INITIAL_MAX_STREAMS);

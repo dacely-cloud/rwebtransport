@@ -66,7 +66,7 @@ impl<F: BufFactory> SendReserve<'_, F> {
         inner.data.push_back(buf);
 
         inner.off += len as u64;
-        inner.len += len as u64;
+        inner.buffered_bytes += len as u64;
         self.reserved -= len;
 
         Ok(())
@@ -76,6 +76,51 @@ impl<F: BufFactory> SendReserve<'_, F> {
 impl<F: BufFactory> Drop for SendReserve<'_, F> {
     fn drop(&mut self) {
         assert_eq!(self.reserved, 0)
+    }
+}
+
+/// A received STOP_SENDING error and its application notification state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum PeerStopSendingState {
+    /// No STOP_SENDING has been received.
+    #[default]
+    NotReceived,
+
+    /// STOP_SENDING was received but has not been reported to the application.
+    NotReported(u64),
+
+    /// STOP_SENDING was reported; retain its code for subsequent write errors.
+    Reported(u64),
+}
+
+impl PeerStopSendingState {
+    /// Returns whether a STOP_SENDING has been received, regardless of
+    /// delivery.
+    pub(crate) fn is_stopped(self) -> bool {
+        match self {
+            Self::NotReceived => false,
+            Self::NotReported(_) | Self::Reported(_) => true,
+        }
+    }
+
+    /// Returns the peer's error without consuming its application notification.
+    fn check_not_stopped(self) -> Result<()> {
+        match self {
+            Self::NotReceived => Ok(()),
+            Self::NotReported(code) | Self::Reported(code) => Err(Error::StreamStopped(code)),
+        }
+    }
+
+    /// Records application delivery and retains the code for later errors.
+    fn report(&mut self) -> Result<()> {
+        match *self {
+            Self::NotReceived => Ok(()),
+            Self::NotReported(code) => {
+                *self = Self::Reported(code);
+                Err(Error::StreamStopped(code))
+            }
+            Self::Reported(code) => Err(Error::StreamStopped(code)),
+        }
     }
 }
 
@@ -106,8 +151,12 @@ where
     /// retransmissions.
     emit_off: u64,
 
-    /// The amount of data currently buffered.
-    len: u64,
+    /// The number of bytes buffered and ready to be emitted to the peer.
+    ///
+    /// This includes fresh data that has not yet been sent, as well as data
+    /// marked for retransmission. It excludes data that has been emitted but
+    /// not yet acknowledged (in-flight data).
+    buffered_bytes: u64,
 
     /// The maximum offset we are allowed to send to the peer.
     max_data: u64,
@@ -118,14 +167,24 @@ where
     /// The final stream offset written to the stream, if any.
     fin_off: Option<u64>,
 
+    /// Whether a STREAM frame carrying FIN has been acknowledged.
+    fin_acked: bool,
+
+    /// Whether a RESET_STREAM frame has been acknowledged, or is not needed
+    /// because the send side was already complete when it was reset.
+    reset_acked: bool,
+
     /// Whether the stream's send-side has been shut down.
     shutdown: bool,
+
+    /// When set, resets retain and retransmit this prefix.
+    pub(crate) reliable_reset_size: Option<u64>,
 
     /// Ranges of data offsets that have been acked.
     acked: ranges::RangeSet,
 
-    /// The error code received via STOP_SENDING.
-    error: Option<u64>,
+    /// The STOP_SENDING error and whether it was returned to the application.
+    peer_stop_sending: PeerStopSendingState,
 }
 
 impl<F: BufFactory> SendBuf<F> {
@@ -138,9 +197,7 @@ impl<F: BufFactory> SendBuf<F> {
     }
 
     /// Try to reserve the required number of bytes to be sent
-    fn reserve_for_write(
-        &mut self, mut len: usize, mut fin: bool,
-    ) -> Result<SendReserve<'_, F>> {
+    fn reserve_for_write(&mut self, mut len: usize, mut fin: bool) -> Result<SendReserve<'_, F>> {
         let max_off = self.off + len as u64;
 
         // Get the stream send capacity. This will return an error if the stream
@@ -211,7 +268,10 @@ impl<F: BufFactory> SendBuf<F> {
     /// (this may be lower than the size of the input buffer, in case of partial
     /// writes, in which case the unwritten buffer is also returned).
     pub fn append_buf(
-        &mut self, mut data: F::Buf, cap: usize, fin: bool,
+        &mut self,
+        mut data: F::Buf,
+        cap: usize,
+        fin: bool,
     ) -> Result<(usize, Option<F::Buf>)>
     where
         F::Buf: BufSplit,
@@ -223,8 +283,7 @@ impl<F: BufFactory> SendBuf<F> {
             return Ok((0, Some(data)));
         }
 
-        let remainder =
-            (reserve.reserved < len).then(|| data.split_at(reserve.reserved));
+        let remainder = (reserve.reserved < len).then(|| data.split_at(reserve.reserved));
 
         let ret = reserve.reserved;
 
@@ -243,10 +302,10 @@ impl<F: BufFactory> SendBuf<F> {
         while out_len > 0 {
             let off_front = self.off_front();
 
-            if self.is_empty() ||
-                off_front >= self.off ||
-                off_front != next_off ||
-                off_front >= self.max_data
+            if self.is_empty()
+                || off_front >= self.off
+                || off_front != next_off
+                || off_front >= self.max_data
             {
                 break;
             }
@@ -269,7 +328,7 @@ impl<F: BufFactory> SendBuf<F> {
             let out_pos = (next_off - out_off) as usize;
             out[out_pos..out_pos + buf_len].copy_from_slice(&buf[..buf_len]);
 
-            self.len -= buf_len as u64;
+            self.buffered_bytes -= buf_len as u64;
 
             out_len -= buf_len;
 
@@ -291,7 +350,7 @@ impl<F: BufFactory> SendBuf<F> {
         // This is more efficient than tracking `fin` using the range buffers
         // themselves, and lets us avoid queueing empty buffers just so we can
         // propagate the final size.
-        let fin = self.fin_off == Some(next_off);
+        let fin = !self.is_reset() && self.fin_off == Some(next_off);
 
         // Record the largest offset that has been sent so we can accurately
         // report final_size
@@ -320,17 +379,31 @@ impl<F: BufFactory> SendBuf<F> {
         self.acked.insert(off..off + len as u64);
     }
 
-    pub fn ack_and_drop(&mut self, off: u64, len: usize) {
+    /// Marks the stream's final size as acknowledged by the peer.
+    pub(crate) fn ack_fin(&mut self) {
+        self.fin_acked = true;
+    }
+
+    /// Marks the stream's reset as acknowledged by the peer.
+    pub(crate) fn ack_reset_stream(&mut self) {
+        self.reset_acked = true;
+    }
+
+    pub(crate) fn reset_acknowledged(&self) -> bool {
+        self.reset_acked
+    }
+
+    pub fn ack_and_drop(&mut self, off: u64, len: usize) -> usize {
         self.ack(off, len);
 
         let ack_off = self.ack_off();
 
         if self.data.is_empty() {
-            return;
+            return 0;
         }
 
         if off > ack_off {
-            return;
+            return 0;
         }
 
         let mut drop_until = None;
@@ -354,26 +427,43 @@ impl<F: BufFactory> SendBuf<F> {
         }
 
         if let Some(drop) = drop_until {
+            // Calculate the total length of buffers being dropped and subtract
+            // from buffered_bytes.
+            let dropped_len: u64 = (0..=drop).map(|i| self.data[i].len() as u64).sum();
+            self.buffered_bytes = self.buffered_bytes.saturating_sub(dropped_len);
+
             self.data.drain(..=drop);
 
             // When a buffer is marked for retransmission, but then acked before
             // it could be retransmitted, we might end up decreasing the SendBuf
             // position too much, so make sure that doesn't happen.
             self.pos = self.pos.saturating_sub(drop + 1);
+
+            dropped_len as usize
+        } else {
+            0
         }
     }
 
-    pub fn retransmit(&mut self, off: u64, len: usize) {
-        let max_off = off + len as u64;
+    pub fn retransmit(&mut self, off: u64, len: usize) -> usize {
+        let mut max_off = off + len as u64;
+        if self.is_reset() {
+            max_off = max_off.min(self.reliable_reset_size.unwrap_or(0));
+            if max_off <= off {
+                return 0;
+            }
+        }
         let ack_off = self.ack_off();
 
         if self.data.is_empty() {
-            return;
+            return 0;
         }
 
         if max_off <= ack_off {
-            return;
+            return 0;
         }
+
+        let mut total_retransmitted = 0;
 
         for i in 0..self.data.len() {
             let buf = &mut self.data[i];
@@ -396,8 +486,8 @@ impl<F: BufFactory> SendBuf<F> {
 
             let prev_pos = buf.pos;
 
-            // Reduce the buffer's position (expand the buffer) if the retransmit
-            // range is past the buffer's starting offset.
+            // Expand the buffer by moving its position back when the retransmit
+            // range starts after the buffer offset.
             buf.pos = if off > buf.off && off <= buf.max_off() {
                 cmp::min(buf.pos, buf.start + (off - buf.off) as usize)
             } else {
@@ -406,16 +496,45 @@ impl<F: BufFactory> SendBuf<F> {
 
             self.pos = cmp::min(self.pos, i);
 
-            self.len += (prev_pos - buf.pos) as u64;
+            let retransmitted = (prev_pos - buf.pos) as u64;
+            self.buffered_bytes += retransmitted;
+            total_retransmitted += retransmitted;
 
             if let Some(b) = new_buf {
                 self.data.insert(i + 1, b);
             }
         }
+
+        total_retransmitted as usize
     }
 
     /// Resets the stream at the current offset and clears all buffered data.
     pub fn reset(&mut self) -> (u64, u64) {
+        // A send side whose data and FIN were already acknowledged needs no
+        // RESET_STREAM and stays complete. This must run before the caller
+        // marks the stream as stopped or shut down.
+        self.reset_acked |= self.is_complete();
+
+        if let Some(reliable) = self.reliable_reset_size {
+            let final_size = self.emit_off.max(reliable);
+            let unsent = self.off.saturating_sub(final_size);
+            while let Some(buf) = self.data.back_mut() {
+                if buf.off >= reliable {
+                    self.data.pop_back();
+                    continue;
+                }
+                if buf.max_off() > reliable {
+                    let _ = buf.split_off((reliable - buf.off) as usize);
+                }
+                break;
+            }
+            self.pos = self.pos.min(self.data.len());
+            self.buffered_bytes = self.data.iter().map(|buf| buf.len() as u64).sum();
+            self.fin_off = Some(final_size);
+            self.off = final_size;
+            return (final_size, unsent);
+        }
+
         let unsent_off = cmp::max(self.off_front(), self.emit_off);
         let unsent_len = self.off_back().saturating_sub(unsent_off);
 
@@ -429,7 +548,7 @@ impl<F: BufFactory> SendBuf<F> {
         self.ack(0, self.off as usize);
 
         self.pos = 0;
-        self.len = 0;
+        self.buffered_bytes = 0;
 
         (self.emit_off, unsent_len)
     }
@@ -438,26 +557,40 @@ impl<F: BufFactory> SendBuf<F> {
     ///
     /// Calling this again after the first time has no effect.
     pub fn stop(&mut self, error_code: u64) -> Result<(u64, u64)> {
-        if self.error.is_some() {
+        if self.peer_stop_sending.is_stopped()
+            || (self.shutdown && self.reliable_reset_size.is_some())
+        {
             return Err(Error::Done);
         }
 
         let (max_off, unsent) = self.reset();
 
-        self.error = Some(error_code);
+        self.peer_stop_sending = PeerStopSendingState::NotReported(error_code);
 
         Ok((max_off, unsent))
     }
 
     /// Shuts down sending data.
     pub fn shutdown(&mut self) -> Result<(u64, u64)> {
-        if self.shutdown {
+        if self.shutdown
+            || (self.peer_stop_sending.is_stopped() && self.reliable_reset_size.is_some())
+        {
             return Err(Error::Done);
         }
 
+        let (max_off, unsent) = self.reset();
+
         self.shutdown = true;
 
-        Ok(self.reset())
+        Ok((max_off, unsent))
+    }
+
+    /// Seeds send offsets without buffering the preceding data.
+    #[cfg(test)]
+    pub fn seed_offsets_for_test(&mut self, off: u64) {
+        assert!(self.data.is_empty());
+        self.off = off;
+        self.emit_off = off;
     }
 
     /// Returns the final offset after FIN or a reset.
@@ -486,6 +619,11 @@ impl<F: BufFactory> SendBuf<F> {
         self.off
     }
 
+    /// Returns true if the next call to [`Self::emit`] will emit an empty FIN.
+    pub fn empty_fin_next(&self) -> bool {
+        self.fin_off == Some(self.off_front())
+    }
+
     /// The maximum offset we are allowed to send to the peer.
     pub fn max_off(&self) -> u64 {
         self.max_data
@@ -505,11 +643,15 @@ impl<F: BufFactory> SendBuf<F> {
 
     /// Returns true if the send-side of the stream is complete.
     ///
-    /// This happens when the stream's send final size is known, and the peer
-    /// has already acked all stream data up to that point.
+    /// This happens when the peer has acknowledged the stream's final size and
+    /// all stream data up to that point, or has acknowledged RESET_STREAM.
     pub fn is_complete(&self) -> bool {
+        if self.is_reset() {
+            return self.reset_acked && self.ack_off() >= self.reliable_reset_size.unwrap_or(0);
+        }
+
         if let Some(fin_off) = self.fin_off {
-            if self.acked == (0..fin_off) {
+            if self.fin_acked && self.acked == (0..fin_off) {
                 return true;
             }
         }
@@ -517,14 +659,24 @@ impl<F: BufFactory> SendBuf<F> {
         false
     }
 
-    /// Returns true if the stream was stopped before completion.
-    pub fn is_stopped(&self) -> bool {
-        self.error.is_some()
+    /// Returns the received STOP_SENDING error's notification state.
+    pub(crate) fn peer_stop_sending_state(&self) -> PeerStopSendingState {
+        self.peer_stop_sending
     }
 
     /// Returns true if the stream was shut down.
     pub fn is_shutdown(&self) -> bool {
         self.shutdown
+    }
+
+    /// Returns true if the send side was shut down by the application or
+    /// stopped by the peer.
+    pub(crate) fn is_reset(&self) -> bool {
+        self.shutdown || self.peer_stop_sending.is_stopped()
+    }
+
+    pub(crate) fn can_send_data(&self) -> bool {
+        !self.is_reset() || self.reliable_reset_size.is_some()
     }
 
     /// Returns true if there is no data.
@@ -546,11 +698,16 @@ impl<F: BufFactory> SendBuf<F> {
     /// Returns the outgoing flow control capacity.
     pub fn cap(&self) -> Result<usize> {
         // The stream was stopped, so return the error code instead.
-        if let Some(e) = self.error {
-            return Err(Error::StreamStopped(e));
-        }
+        self.peer_stop_sending.check_not_stopped()?;
 
         Ok((self.max_data - self.off) as usize)
+    }
+
+    /// Returns capacity, reporting a received STOP_SENDING to the application.
+    /// Internal writability checks use `cap()` without consuming notification.
+    pub fn cap_and_report_stop_sending(&mut self) -> Result<usize> {
+        self.peer_stop_sending.report()?;
+        self.cap()
     }
 
     /// Returns the number of separate buffers stored.
@@ -558,18 +715,77 @@ impl<F: BufFactory> SendBuf<F> {
     pub fn bufs_count(&self) -> usize {
         self.data.len()
     }
+
+    /// Returns the number of bytes ready to be emitted to the peer.
+    ///
+    /// This includes fresh data that has not yet been sent, as well as data
+    /// marked for retransmission. It excludes data that has been emitted but
+    /// not yet acknowledged (in-flight data).
+    pub fn buffered_bytes(&self) -> u64 {
+        self.buffered_bytes
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
+    #[test]
+    fn reliable_reset_retransmits_prefix_only_and_waits_for_ack() {
+        let mut send = <SendBuf>::new(20);
+        send.reliable_reset_size = Some(3);
+        assert_eq!(send.write(b"abcdef", false), Ok(6));
+        assert_eq!(send.emit(&mut [0; 6]), Ok((6, false)));
+        assert_eq!(send.shutdown(), Ok((6, 0)));
+        send.ack_reset_stream();
+        assert!(!send.is_complete());
+        assert_eq!(send.retransmit(0, 6), 3);
+        let mut data = [0; 6];
+        assert_eq!(send.emit(&mut data), Ok((3, false)));
+        assert_eq!(&data[..3], b"abc");
+        send.ack_and_drop(0, 3);
+        assert!(send.is_complete());
+    }
+
     use super::*;
+
+    #[rstest]
+    fn reset_waits_for_ack(
+        #[values(true, false)] local_reset: bool,
+        #[values(true, false)] acked_before_reset: bool,
+    ) {
+        let mut send = <SendBuf>::new(15);
+        let mut out = [0; 5];
+        assert_eq!(send.write(b"hello", true), Ok(5));
+        assert_eq!(send.emit(&mut out), Ok((5, true)));
+
+        if acked_before_reset {
+            send.ack_and_drop(0, 5);
+            send.ack_fin();
+        }
+
+        let result = if local_reset {
+            send.shutdown()
+        } else {
+            send.stop(42)
+        };
+        assert_eq!(result, Ok((5, 0)));
+        assert_eq!(send.is_complete(), acked_before_reset);
+
+        send.ack_and_drop(0, 5);
+        send.ack_fin();
+        assert_eq!(send.is_complete(), acked_before_reset);
+
+        send.ack_reset_stream();
+        assert!(send.is_complete());
+    }
 
     #[test]
     fn empty_write() {
         let mut buf = [0; 5];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         let (written, fin) = send.emit(&mut buf).unwrap();
         assert_eq!(written, 0);
@@ -581,22 +797,22 @@ mod tests {
         let mut buf = [0; 128];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
         assert!(send.write(first, false).is_ok());
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         assert!(send.write(second, true).is_ok());
-        assert_eq!(send.len, 19);
+        assert_eq!(send.buffered_bytes, 19);
 
         let (written, fin) = send.emit(&mut buf[..128]).unwrap();
         assert_eq!(written, 19);
         assert!(fin);
         assert_eq!(&buf[..written], b"somethinghelloworld");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
     }
 
     #[test]
@@ -604,16 +820,16 @@ mod tests {
         let mut buf = [0; 10];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
         assert!(send.write(first, false).is_ok());
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         assert!(send.write(second, true).is_ok());
-        assert_eq!(send.len, 19);
+        assert_eq!(send.buffered_bytes, 19);
 
         assert_eq!(send.off_front(), 0);
 
@@ -621,7 +837,7 @@ mod tests {
         assert_eq!(written, 10);
         assert!(!fin);
         assert_eq!(&buf[..written], b"somethingh");
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         assert_eq!(send.off_front(), 10);
 
@@ -629,7 +845,7 @@ mod tests {
         assert_eq!(written, 5);
         assert!(!fin);
         assert_eq!(&buf[..written], b"ellow");
-        assert_eq!(send.len, 4);
+        assert_eq!(send.buffered_bytes, 4);
 
         assert_eq!(send.off_front(), 15);
 
@@ -637,7 +853,7 @@ mod tests {
         assert_eq!(written, 4);
         assert!(fin);
         assert_eq!(&buf[..written], b"orld");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         assert_eq!(send.off_front(), 19);
     }
@@ -647,7 +863,7 @@ mod tests {
         let mut buf = [0; 15];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
         assert_eq!(send.off_front(), 0);
 
         let first = b"something";
@@ -659,49 +875,49 @@ mod tests {
         assert!(send.write(second, true).is_ok());
         assert_eq!(send.off_front(), 0);
 
-        assert_eq!(send.len, 19);
+        assert_eq!(send.buffered_bytes, 19);
 
         let (written, fin) = send.emit(&mut buf[..4]).unwrap();
         assert_eq!(written, 4);
         assert!(!fin);
         assert_eq!(&buf[..written], b"some");
-        assert_eq!(send.len, 15);
+        assert_eq!(send.buffered_bytes, 15);
         assert_eq!(send.off_front(), 4);
 
         let (written, fin) = send.emit(&mut buf[..5]).unwrap();
         assert_eq!(written, 5);
         assert!(!fin);
         assert_eq!(&buf[..written], b"thing");
-        assert_eq!(send.len, 10);
+        assert_eq!(send.buffered_bytes, 10);
         assert_eq!(send.off_front(), 9);
 
         let (written, fin) = send.emit(&mut buf[..5]).unwrap();
         assert_eq!(written, 5);
         assert!(!fin);
         assert_eq!(&buf[..written], b"hello");
-        assert_eq!(send.len, 5);
+        assert_eq!(send.buffered_bytes, 5);
         assert_eq!(send.off_front(), 14);
 
         send.retransmit(4, 5);
-        assert_eq!(send.len, 10);
+        assert_eq!(send.buffered_bytes, 10);
         assert_eq!(send.off_front(), 4);
 
         send.retransmit(0, 4);
-        assert_eq!(send.len, 14);
+        assert_eq!(send.buffered_bytes, 14);
         assert_eq!(send.off_front(), 0);
 
         let (written, fin) = send.emit(&mut buf[..11]).unwrap();
         assert_eq!(written, 9);
         assert!(!fin);
         assert_eq!(&buf[..written], b"something");
-        assert_eq!(send.len, 5);
+        assert_eq!(send.buffered_bytes, 5);
         assert_eq!(send.off_front(), 14);
 
         let (written, fin) = send.emit(&mut buf[..11]).unwrap();
         assert_eq!(written, 5);
         assert!(fin);
         assert_eq!(&buf[..written], b"world");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
         assert_eq!(send.off_front(), 19);
     }
 
@@ -710,24 +926,24 @@ mod tests {
         let mut buf = [0; 10];
 
         let mut send = <SendBuf>::default();
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         let first = b"something";
         let second = b"helloworld";
 
         assert_eq!(send.write(first, false), Ok(0));
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         assert_eq!(send.write(second, true), Ok(0));
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         send.update_max_data(5);
 
         assert_eq!(send.write(first, false), Ok(5));
-        assert_eq!(send.len, 5);
+        assert_eq!(send.buffered_bytes, 5);
 
         assert_eq!(send.write(second, true), Ok(0));
-        assert_eq!(send.len, 5);
+        assert_eq!(send.buffered_bytes, 5);
 
         assert_eq!(send.off_front(), 0);
 
@@ -735,7 +951,7 @@ mod tests {
         assert_eq!(written, 5);
         assert!(!fin);
         assert_eq!(&buf[..written], b"somet");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         assert_eq!(send.off_front(), 5);
 
@@ -743,15 +959,15 @@ mod tests {
         assert_eq!(written, 0);
         assert!(!fin);
         assert_eq!(&buf[..written], b"");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         send.update_max_data(15);
 
         assert_eq!(send.write(&first[5..], false), Ok(4));
-        assert_eq!(send.len, 4);
+        assert_eq!(send.buffered_bytes, 4);
 
         assert_eq!(send.write(second, true), Ok(6));
-        assert_eq!(send.len, 10);
+        assert_eq!(send.buffered_bytes, 10);
 
         assert_eq!(send.off_front(), 5);
 
@@ -759,12 +975,12 @@ mod tests {
         assert_eq!(written, 10);
         assert!(!fin);
         assert_eq!(&buf[..10], b"hinghellow");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         send.update_max_data(25);
 
         assert_eq!(send.write(&second[6..], true), Ok(4));
-        assert_eq!(send.len, 4);
+        assert_eq!(send.buffered_bytes, 4);
 
         assert_eq!(send.off_front(), 15);
 
@@ -772,7 +988,7 @@ mod tests {
         assert_eq!(written, 4);
         assert!(fin);
         assert_eq!(&buf[..written], b"orld");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
     }
 
     #[test]
@@ -780,15 +996,15 @@ mod tests {
         let mut buf = [0; 10];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
 
         let first = b"something";
 
         assert!(send.write(first, false).is_ok());
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         assert!(send.write(&[], true).is_ok());
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         assert_eq!(send.off_front(), 0);
 
@@ -796,7 +1012,7 @@ mod tests {
         assert_eq!(written, 9);
         assert!(fin);
         assert_eq!(&buf[..written], b"something");
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
     }
 
     /// Check SendBuf::len calculation on a retransmit case
@@ -805,7 +1021,7 @@ mod tests {
         let mut buf = [0; 15];
 
         let mut send = <SendBuf>::new(u64::MAX);
-        assert_eq!(send.len, 0);
+        assert_eq!(send.buffered_bytes, 0);
         assert_eq!(send.off_front(), 0);
 
         let first = b"something";
@@ -813,17 +1029,17 @@ mod tests {
         assert!(send.write(first, false).is_ok());
         assert_eq!(send.off_front(), 0);
 
-        assert_eq!(send.len, 9);
+        assert_eq!(send.buffered_bytes, 9);
 
         let (written, fin) = send.emit(&mut buf[..4]).unwrap();
         assert_eq!(written, 4);
         assert!(!fin);
         assert_eq!(&buf[..written], b"some");
-        assert_eq!(send.len, 5);
+        assert_eq!(send.buffered_bytes, 5);
         assert_eq!(send.off_front(), 4);
 
         send.retransmit(3, 5);
-        assert_eq!(send.len, 6);
+        assert_eq!(send.buffered_bytes, 6);
         assert_eq!(send.off_front(), 3);
     }
 
@@ -850,5 +1066,46 @@ mod tests {
         let (fin_off, unsent) = send.stop(0).unwrap();
         assert_eq!(fin_off, 50);
         assert_eq!(unsent, 0);
+    }
+
+    #[test]
+    fn peer_stop_sending_notification_lifecycle() {
+        let mut send = <SendBuf>::new(100);
+        assert_eq!(send.cap_and_report_stop_sending(), Ok(100));
+        assert_eq!(
+            send.peer_stop_sending_state(),
+            PeerStopSendingState::NotReceived
+        );
+
+        send.stop(0).unwrap();
+        assert_eq!(
+            send.peer_stop_sending_state(),
+            PeerStopSendingState::NotReported(0)
+        );
+        assert_eq!(send.cap(), Err(Error::StreamStopped(0)));
+        assert_eq!(
+            send.peer_stop_sending_state(),
+            PeerStopSendingState::NotReported(0)
+        );
+        assert_eq!(
+            send.cap_and_report_stop_sending(),
+            Err(Error::StreamStopped(0))
+        );
+        assert_eq!(
+            send.cap_and_report_stop_sending(),
+            Err(Error::StreamStopped(0))
+        );
+        assert_eq!(
+            send.peer_stop_sending_state(),
+            PeerStopSendingState::Reported(0)
+        );
+        // Reporting preserves the code for subsequent writes and duplicate
+        // STOP_SENDING must not replace it or create another notification.
+        assert_eq!(send.stop(42), Err(Error::Done));
+        assert_eq!(send.cap(), Err(Error::StreamStopped(0)));
+        assert_eq!(
+            send.peer_stop_sending_state(),
+            PeerStopSendingState::Reported(0)
+        );
     }
 }

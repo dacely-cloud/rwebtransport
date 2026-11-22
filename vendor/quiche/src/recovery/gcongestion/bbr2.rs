@@ -33,6 +33,7 @@ mod mode;
 mod network_model;
 mod probe_bw;
 mod probe_rtt;
+mod rtt_jump_detector;
 mod startup;
 
 use std::time::Duration;
@@ -50,6 +51,7 @@ use super::bbr::SendTimeState;
 use super::Acked;
 use super::BbrBwLoReductionStrategy;
 use super::BbrParams;
+use super::BbrRttJumpDetector;
 use super::CongestionControl;
 use super::Lost;
 use super::RttStats;
@@ -190,6 +192,10 @@ struct Params {
     /// initial cwnd by the first RTT estimate.
     initial_pacing_rate_bytes_per_second: Option<u64>,
 
+    /// Lower bound on the congestion window in packets.  If not set,
+    /// the initial congestion window is used as the lower bound.
+    min_cwnd_packets: Option<usize>,
+
     /// If true, scale the pacing rate when updating mss when doing pmtud.
     scale_pacing_rate_by_mss: bool,
 
@@ -207,6 +213,9 @@ struct Params {
     /// 1/8th of an RTT into the future, so the error introduced by
     /// setting `time_sent` to `now` is bounded.
     time_sent_set_to_now: bool,
+
+    /// Selects the RTT jump detector implementation.
+    rtt_jump_detector: BbrRttJumpDetector,
 }
 
 impl Params {
@@ -252,6 +261,14 @@ impl Params {
         apply_override!(disable_probe_down_early_exit);
         apply_override!(time_sent_set_to_now);
         apply_optional_override!(initial_pacing_rate_bytes_per_second);
+        apply_optional_override!(min_cwnd_packets);
+
+        #[cfg(feature = "internal")]
+        {
+            if let Some(custom_value) = custom_bbr_settings.rtt_jump_detector {
+                self.rtt_jump_detector = custom_value;
+            }
+        }
 
         if let Some(custom_value) = custom_bbr_settings.bw_lo_reduction_strategy {
             self.bw_lo_mode = custom_value.into();
@@ -342,11 +359,15 @@ const DEFAULT_PARAMS: Params = Params {
 
     initial_pacing_rate_bytes_per_second: None,
 
+    min_cwnd_packets: None,
+
     scale_pacing_rate_by_mss: false,
 
     disable_probe_down_early_exit: false,
 
     time_sent_set_to_now: true,
+
+    rtt_jump_detector: BbrRttJumpDetector::Disabled,
 };
 
 #[derive(Debug, PartialEq)]
@@ -378,10 +399,8 @@ impl From<BbrBwLoReductionStrategy> for BwLoMode {
     fn from(value: BbrBwLoReductionStrategy) -> Self {
         match value {
             BbrBwLoReductionStrategy::Default => BwLoMode::Default,
-            BbrBwLoReductionStrategy::MinRttReduction =>
-                BwLoMode::MinRttReduction,
-            BbrBwLoReductionStrategy::InflightReduction =>
-                BwLoMode::InflightReduction,
+            BbrBwLoReductionStrategy::MinRttReduction => BwLoMode::MinRttReduction,
+            BbrBwLoReductionStrategy::InflightReduction => BwLoMode::InflightReduction,
             BbrBwLoReductionStrategy::CwndReduction => BwLoMode::CwndReduction,
         }
     }
@@ -412,9 +431,7 @@ impl<T: Ord + Clone + Copy + From<u8>> Limits<T> {
     }
 }
 
-fn initial_pacing_rate(
-    cwnd_in_bytes: usize, smoothed_rtt: Duration, params: &Params,
-) -> Bandwidth {
+fn initial_pacing_rate(cwnd_in_bytes: usize, smoothed_rtt: Duration, params: &Params) -> Bandwidth {
     if let Some(pacing_rate) = params.initial_pacing_rate_bytes_per_second {
         return Bandwidth::from_bytes_per_second(pacing_rate);
     }
@@ -477,7 +494,9 @@ struct BBRv2CongestionEvent {
 
 impl BBRv2CongestionEvent {
     fn new(
-        event_time: Instant, prior_cwnd: usize, prior_bytes_in_flight: usize,
+        event_time: Instant,
+        prior_cwnd: usize,
+        prior_bytes_in_flight: usize,
         is_probing_for_bandwidth: bool,
     ) -> Self {
         BBRv2CongestionEvent {
@@ -498,8 +517,10 @@ impl BBRv2CongestionEvent {
 
 impl BBRv2 {
     pub fn new(
-        initial_congestion_window: usize, max_congestion_window: usize,
-        max_segment_size: usize, smoothed_rtt: Duration,
+        initial_congestion_window: usize,
+        max_congestion_window: usize,
+        max_segment_size: usize,
+        smoothed_rtt: Duration,
         custom_bbr_params: Option<&BbrParams>,
     ) -> Self {
         let cwnd = initial_congestion_window * max_segment_size;
@@ -510,12 +531,15 @@ impl BBRv2 {
             DEFAULT_PARAMS
         };
 
+        let min_cwnd =
+            params.min_cwnd_packets.unwrap_or(initial_congestion_window) * max_segment_size;
+
         BBRv2 {
             mode: Mode::startup(BBRv2NetworkModel::new(&params, smoothed_rtt)),
             cwnd,
             pacing_rate: initial_pacing_rate(cwnd, smoothed_rtt, &params),
             cwnd_limits: Limits {
-                lo: initial_congestion_window * max_segment_size,
+                lo: min_cwnd,
                 hi: max_congestion_window * max_segment_size,
             },
             initial_cwnd: initial_congestion_window * max_segment_size,
@@ -533,11 +557,8 @@ impl BBRv2 {
 
     fn on_exit_quiescence(&mut self, now: Instant) {
         if let Some(last_quiescence_start) = self.last_quiescence_start.take() {
-            self.mode.do_on_exit_quiescence(
-                now,
-                last_quiescence_start,
-                &self.params,
-            )
+            self.mode
+                .do_on_exit_quiescence(now, last_quiescence_start, &self.params)
         }
     }
 
@@ -557,19 +578,14 @@ impl BBRv2 {
 
         if network_model.total_bytes_acked() == bytes_acked {
             // After the first ACK, cwnd is still the initial congestion window.
-            self.pacing_rate = Bandwidth::from_bytes_and_time_delta(
-                self.cwnd,
-                network_model.min_rtt(),
-            );
+            self.pacing_rate =
+                Bandwidth::from_bytes_and_time_delta(self.cwnd, network_model.min_rtt());
 
-            if let Some(pacing_rate) =
-                self.params.initial_pacing_rate_bytes_per_second
-            {
+            if let Some(pacing_rate) = self.params.initial_pacing_rate_bytes_per_second {
                 // Do not allow the pacing rate calculated from the first RTT
                 // measurement to be higher than the configured initial pacing
                 // rate.
-                let initial_pacing_rate =
-                    Bandwidth::from_bytes_per_second(pacing_rate);
+                let initial_pacing_rate = Bandwidth::from_bytes_per_second(pacing_rate);
                 self.pacing_rate = self.pacing_rate.min(initial_pacing_rate);
             }
 
@@ -582,16 +598,14 @@ impl BBRv2 {
             return;
         }
 
-        if self.params.decrease_startup_pacing_at_end_of_round &&
-            network_model.pacing_gain() < self.params.startup_pacing_gain
+        if self.params.decrease_startup_pacing_at_end_of_round
+            && network_model.pacing_gain() < self.params.startup_pacing_gain
         {
             self.pacing_rate = target_rate;
             return;
         }
 
-        if self.params.bw_lo_mode != BwLoMode::Default &&
-            network_model.loss_events_in_round() > 0
-        {
+        if self.params.bw_lo_mode != BwLoMode::Default && network_model.loss_events_in_round() > 0 {
             self.pacing_rate = target_rate;
             return;
         }
@@ -602,8 +616,7 @@ impl BBRv2 {
 
     fn update_congestion_window(&mut self, bytes_acked: usize) {
         let network_model = self.mode.network_model();
-        let mut target_cwnd =
-            self.get_target_congestion_window(network_model.cwnd_gain());
+        let mut target_cwnd = self.get_target_congestion_window(network_model.cwnd_gain());
 
         let prior_cwnd = self.cwnd;
         if network_model.full_bandwidth_reached() {
@@ -639,6 +652,10 @@ impl BBRv2 {
     pub(crate) fn ack_rate(&self) -> Option<Bandwidth> {
         self.mode.network_model().ack_rate()
     }
+
+    pub(crate) fn rtt_persistent_jump_count(&self) -> u64 {
+        self.mode.network_model().rtt_persistent_jump_count()
+    }
 }
 
 impl CongestionControl for BBRv2 {
@@ -660,8 +677,12 @@ impl CongestionControl for BBRv2 {
     }
 
     fn on_packet_sent(
-        &mut self, sent_time: Instant, bytes_in_flight: usize,
-        packet_number: u64, bytes: usize, is_retransmissible: bool,
+        &mut self,
+        sent_time: Instant,
+        bytes_in_flight: usize,
+        packet_number: u64,
+        bytes: usize,
+        is_retransmissible: bool,
     ) {
         if bytes_in_flight == 0 && self.params.avoid_unnecessary_probe_rtt {
             self.on_exit_quiescence(sent_time);
@@ -678,9 +699,15 @@ impl CongestionControl for BBRv2 {
     }
 
     fn on_congestion_event(
-        &mut self, _rtt_updated: bool, prior_in_flight: usize,
-        _bytes_in_flight: usize, event_time: Instant, acked_packets: &[Acked],
-        lost_packets: &[Lost], least_unacked: u64, _rtt_stats: &RttStats,
+        &mut self,
+        _rtt_updated: bool,
+        prior_in_flight: usize,
+        _bytes_in_flight: usize,
+        event_time: Instant,
+        acked_packets: &[Acked],
+        lost_packets: &[Lost],
+        least_unacked: u64,
+        _rtt_stats: &RttStats,
         recovery_stats: &mut RecoveryStats,
     ) {
         let mut congestion_event = BBRv2CongestionEvent::new(
@@ -700,8 +727,8 @@ impl CongestionControl for BBRv2 {
 
         // Number of mode changes allowed for this congestion event.
         let mut mode_changes_allowed = MAX_MODE_CHANGES_PER_CONGESTION_EVENT;
-        while mode_changes_allowed > 0 &&
-            self.mode.do_on_congestion_event(
+        while mode_changes_allowed > 0
+            && self.mode.do_on_congestion_event(
                 prior_in_flight,
                 event_time,
                 acked_packets,
@@ -721,16 +748,12 @@ impl CongestionControl for BBRv2 {
         self.update_congestion_window(congestion_event.bytes_acked);
 
         let network_model = self.mode.network_model_mut();
-        network_model
-            .on_congestion_event_finish(least_unacked, &congestion_event);
-        self.last_sample_is_app_limited =
-            congestion_event.last_packet_send_state.is_app_limited;
+        network_model.on_congestion_event_finish(least_unacked, &congestion_event);
+        self.last_sample_is_app_limited = congestion_event.last_packet_send_state.is_app_limited;
         if !self.last_sample_is_app_limited {
             self.has_non_app_limited_sample = true;
         }
-        if congestion_event.bytes_in_flight == 0 &&
-            self.params.avoid_unnecessary_probe_rtt
-        {
+        if congestion_event.bytes_in_flight == 0 && self.params.avoid_unnecessary_probe_rtt {
             self.on_enter_quiescence(event_time);
         }
     }
@@ -753,9 +776,7 @@ impl CongestionControl for BBRv2 {
         bytes_in_flight >= self.get_congestion_window()
     }
 
-    fn pacing_rate(
-        &self, _bytes_in_flight: usize, _rtt_stats: &RttStats,
-    ) -> Bandwidth {
+    fn pacing_rate(&self, _bytes_in_flight: usize, _rtt_stats: &RttStats) -> Bandwidth {
         self.pacing_rate
     }
 
@@ -769,17 +790,14 @@ impl CongestionControl for BBRv2 {
     }
 
     fn update_mss(&mut self, new_mss: usize) {
-        self.cwnd_limits.hi = (self.cwnd_limits.hi as u64 * new_mss as u64 /
-            self.mss as u64) as usize;
-        self.cwnd_limits.lo = (self.cwnd_limits.lo as u64 * new_mss as u64 /
-            self.mss as u64) as usize;
-        self.cwnd =
-            (self.cwnd as u64 * new_mss as u64 / self.mss as u64) as usize;
-        self.initial_cwnd = (self.initial_cwnd as u64 * new_mss as u64 /
-            self.mss as u64) as usize;
+        self.cwnd_limits.hi =
+            (self.cwnd_limits.hi as u64 * new_mss as u64 / self.mss as u64) as usize;
+        self.cwnd_limits.lo =
+            (self.cwnd_limits.lo as u64 * new_mss as u64 / self.mss as u64) as usize;
+        self.cwnd = (self.cwnd as u64 * new_mss as u64 / self.mss as u64) as usize;
+        self.initial_cwnd = (self.initial_cwnd as u64 * new_mss as u64 / self.mss as u64) as usize;
         if self.params.scale_pacing_rate_by_mss {
-            self.pacing_rate =
-                self.pacing_rate * (new_mss as f64 / self.mss as f64);
+            self.pacing_rate = self.pacing_rate * (new_mss as f64 / self.mss as f64);
         }
         self.mss = new_mss;
     }
@@ -851,5 +869,34 @@ mod tests {
             bbr2.pacing_rate.to_bytes_per_period(initial_rtt),
             (2.88499 * pacing_cwnd as f64) as u64
         );
+    }
+
+    #[rstest]
+    fn min_cwnd_packets_override(
+        #[values(None, Some(4), Some(40))] min_cwnd_packets: Option<usize>,
+    ) {
+        const INIT_PACKET_SIZE: usize = 1200;
+        const INIT_WINDOW_PACKETS: usize = 10;
+        const MAX_WINDOW_PACKETS: usize = 10000;
+        let initial_rtt = Duration::from_millis(333);
+        let bbr_params = &BbrParams {
+            min_cwnd_packets,
+            ..Default::default()
+        };
+
+        let bbr2 = BBRv2::new(
+            INIT_WINDOW_PACKETS,
+            MAX_WINDOW_PACKETS,
+            INIT_PACKET_SIZE,
+            initial_rtt,
+            Some(bbr_params),
+        );
+
+        // If not set, the initial congestion window is the lower bound.
+        let expected_lo = min_cwnd_packets.unwrap_or(INIT_WINDOW_PACKETS) * INIT_PACKET_SIZE;
+        assert_eq!(bbr2.cwnd_limits.lo, expected_lo);
+        assert_eq!(bbr2.cwnd_limits.hi, MAX_WINDOW_PACKETS * INIT_PACKET_SIZE);
+        // The initial cwnd itself is not affected.
+        assert_eq!(bbr2.cwnd, INIT_WINDOW_PACKETS * INIT_PACKET_SIZE);
     }
 }

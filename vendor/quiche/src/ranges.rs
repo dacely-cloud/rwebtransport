@@ -80,6 +80,18 @@ impl RangeSet {
         }
     }
 
+    /// Returns true if the collection contains the given value.
+    pub fn contains(&self, item: u64) -> bool {
+        match self {
+            RangeSet::Inline(set) => set
+                .inner
+                .iter()
+                .any(|&(start, end)| start <= item && item < end),
+
+            RangeSet::BTree(set) => set.prev_to(item).is_some_and(|range| item < range.end),
+        }
+    }
+
     /// Converts the inner representation from a BTree to Inline and vice versa
     /// when the proper conditions are met. Keeps the stored data intact.
     #[inline(always)]
@@ -91,7 +103,7 @@ impl RangeSet {
                     inner: old_inner.into_inner().expect("At capacity").into(),
                     capacity: set.capacity,
                 });
-            },
+            }
 
             RangeSet::BTree(set) if set.inner.len() <= MIN_TO_INLINE => {
                 let old_inner = std::mem::take(&mut set.inner);
@@ -99,9 +111,9 @@ impl RangeSet {
                     inner: SmallVec::from_iter(old_inner),
                     capacity: set.capacity,
                 })
-            },
+            }
 
-            _ => {},
+            _ => {}
         }
     }
 
@@ -121,16 +133,11 @@ impl RangeSet {
     }
 
     /// Iterate over the stored ranges in incremental order.
-    pub fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = Range<u64>> + ExactSizeIterator + '_
-    {
+    pub fn iter(&self) -> impl DoubleEndedIterator<Item = Range<u64>> + ExactSizeIterator + '_ {
         match self {
-            RangeSet::BTree(set) =>
-                Either::Left(set.inner.iter().map(|(k, v)| *k..*v)),
+            RangeSet::BTree(set) => Either::Left(set.inner.iter().map(|(k, v)| *k..*v)),
 
-            RangeSet::Inline(set) =>
-                Either::Right(set.inner.iter().map(|(s, e)| *s..*e)),
+            RangeSet::Inline(set) => Either::Right(set.inner.iter().map(|(s, e)| *s..*e)),
         }
     }
 
@@ -139,11 +146,9 @@ impl RangeSet {
     #[cfg(test)]
     pub fn flatten(&self) -> impl DoubleEndedIterator<Item = u64> + '_ {
         match self {
-            RangeSet::BTree(set) =>
-                Either::Left(set.inner.iter().flat_map(|(k, v)| *k..*v)),
+            RangeSet::BTree(set) => Either::Left(set.inner.iter().flat_map(|(k, v)| *k..*v)),
 
-            RangeSet::Inline(set) =>
-                Either::Right(set.inner.iter().flat_map(|(s, e)| *s..*e)),
+            RangeSet::Inline(set) => Either::Right(set.inner.iter().flat_map(|(s, e)| *s..*e)),
         }
     }
 
@@ -162,8 +167,7 @@ impl RangeSet {
         match self {
             RangeSet::Inline(set) => set.inner.last().map(|(_, e)| *e - 1),
 
-            RangeSet::BTree(set) =>
-                set.inner.last_key_value().map(|(_, v)| *v - 1),
+            RangeSet::BTree(set) => set.inner.last_key_value().map(|(_, v)| *v - 1),
         }
     }
 
@@ -209,22 +213,22 @@ impl InlineRangeSet {
                         return;
                     }
 
-                    // At this point we know (start <= *e)
+                    // At this point, `start <= *e`.
                     if start < *s {
                         // We know we are completely past the previous range, so
-                        // we can simply adjust the lower bound
+                        // we can simply adjust the lower bound.
                         *s = start;
                     }
 
                     if end > *e {
-                        // We adjusted the upper bound of an existing range, we
-                        // must now check it does not overlap with the next range
+                        // Check for overlap between the expanded range and the
+                        // next range.
                         *e = end;
                         break;
                     } else {
                         return;
                     }
-                },
+                }
 
                 None => {
                     if self.inner.len() == self.capacity {
@@ -233,7 +237,7 @@ impl InlineRangeSet {
 
                     self.inner.push((start, end));
                     return;
-                },
+                }
             }
         }
 
@@ -386,13 +390,92 @@ impl std::fmt::Debug for RangeSet {
 }
 
 fn range_overlaps(r: &Range<u64>, other: &Range<u64>) -> bool {
-    other.start >= r.start && other.start <= r.end ||
-        other.end >= r.start && other.end <= r.end
+    other.start >= r.start && other.start <= r.end || other.end >= r.start && other.end <= r.end
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn contains_inline() {
+        let mut r = RangeSet::default();
+        assert!(!r.contains(0));
+        assert!(!r.contains(u64::MAX));
+
+        r.insert(4..7);
+        r.insert(9..12);
+        r.insert(u64::MAX - 2..u64::MAX);
+        assert!(matches!(r, RangeSet::Inline(_)));
+
+        for item in 0..15 {
+            assert_eq!(
+                r.contains(item),
+                (4..7).contains(&item) || (9..12).contains(&item)
+            );
+        }
+
+        assert!(!r.contains(u64::MAX - 3));
+        assert!(r.contains(u64::MAX - 2));
+        assert!(r.contains(u64::MAX - 1));
+        assert!(!r.contains(u64::MAX));
+    }
+
+    #[test]
+    fn contains_btree() {
+        let mut r = RangeSet::default();
+
+        for start in [4, 9, 14, u64::MAX - 3] {
+            r.insert(start..start + 3);
+        }
+
+        assert!(matches!(r, RangeSet::BTree(_)));
+
+        for item in 0..20 {
+            assert_eq!(
+                r.contains(item),
+                (4..7).contains(&item) || (9..12).contains(&item) || (14..17).contains(&item)
+            );
+        }
+
+        assert!(!r.contains(u64::MAX - 4));
+        assert!(r.contains(u64::MAX - 3));
+        assert!(r.contains(u64::MAX - 1));
+        assert!(!r.contains(u64::MAX));
+
+        r.remove_until(13);
+        assert!(matches!(r, RangeSet::Inline(_)));
+        assert!(!r.contains(12));
+        assert!(r.contains(14));
+        assert!(r.contains(16));
+        assert!(!r.contains(17));
+    }
+
+    #[test]
+    fn adjacent_singletons_merge() {
+        let mut r = RangeSet::default();
+
+        for item in [0, 2, 4, 6] {
+            r.push_item(item);
+        }
+
+        assert!(matches!(r, RangeSet::BTree(_)));
+
+        for item in [5, 1, 3] {
+            assert!(!r.contains(item));
+            r.push_item(item);
+            assert!(r.contains(item));
+        }
+
+        assert_eq!(r, 0..7);
+        assert!(matches!(r, RangeSet::Inline(_)));
+
+        for item in 0..7 {
+            assert!(r.contains(item));
+        }
+
+        assert!(!r.contains(7));
+    }
 
     #[test]
     fn insert_non_overlapping() {
@@ -453,27 +536,31 @@ mod tests {
 
         r.insert(10..15);
         assert_eq!(r.len(), 2);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 6, 9, 10, 11, 12, 13, 14
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 6, 9, 10, 11, 12, 13, 14]
+        );
 
         r.insert(2..5);
         assert_eq!(r.len(), 2);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14]
+        );
 
         r.insert(8..10);
         assert_eq!(r.len(), 2);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14]
+        );
 
         r.insert(6..10);
         assert_eq!(r.len(), 1);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+        );
     }
 
     #[test]
@@ -482,32 +569,36 @@ mod tests {
 
         r.insert(3..6);
         r.insert(16..20);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 16, 17, 18, 19]
+        );
 
         r.insert(10..11);
         assert_eq!(r.len(), 3);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 10, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 10, 16, 17, 18, 19]
+        );
 
         assert!(matches!(r, RangeSet::Inline(_)));
 
         r.insert(13..14);
         assert_eq!(r.len(), 4);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 10, 13, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 10, 13, 16, 17, 18, 19]
+        );
 
         // Make sure it converted to a btree at capacity
         assert!(matches!(r, RangeSet::BTree(_)));
 
         r.insert(4..17);
         assert_eq!(r.len(), 1);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+        );
 
         // Make sure it converted back to inline
         assert!(matches!(r, RangeSet::Inline(_)));
@@ -558,44 +649,50 @@ mod tests {
 
         r.push_item(15);
         assert_eq!(r.len(), 3);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            4, 5, 6, 9, 10, 11, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[4, 5, 6, 9, 10, 11, 15]
+        );
 
         r.push_item(15);
         assert_eq!(r.len(), 3);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            4, 5, 6, 9, 10, 11, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[4, 5, 6, 9, 10, 11, 15]
+        );
 
         r.push_item(1);
         assert_eq!(r.len(), 4);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            1, 4, 5, 6, 9, 10, 11, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[1, 4, 5, 6, 9, 10, 11, 15]
+        );
 
         r.push_item(12);
         r.push_item(13);
         r.push_item(14);
 
         assert_eq!(r.len(), 3);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            1, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[1, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15]
+        );
 
         r.push_item(2);
         r.push_item(3);
         assert_eq!(r.len(), 2);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14, 15]
+        );
 
         r.push_item(8);
         r.push_item(7);
         assert_eq!(r.len(), 1);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+        );
     }
 
     #[test]
@@ -614,9 +711,10 @@ mod tests {
         r.insert(9..12);
         assert_eq!(r.len(), 2);
         assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[4, 5, 6, 9, 10, 11]);
-        assert_eq!(&r.flatten().rev().collect::<Vec<u64>>(), &[
-            11, 10, 9, 6, 5, 4
-        ]);
+        assert_eq!(
+            &r.flatten().rev().collect::<Vec<u64>>(),
+            &[11, 10, 9, 6, 5, 4]
+        );
     }
 
     #[test]
@@ -641,24 +739,28 @@ mod tests {
         r.insert(9..11);
         r.insert(13..14);
         r.insert(16..20);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 9, 10, 13, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 9, 10, 13, 16, 17, 18, 19]
+        );
 
         r.remove_until(2);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            3, 4, 5, 9, 10, 13, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[3, 4, 5, 9, 10, 13, 16, 17, 18, 19]
+        );
 
         r.remove_until(4);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            5, 9, 10, 13, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[5, 9, 10, 13, 16, 17, 18, 19]
+        );
 
         r.remove_until(6);
-        assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[
-            9, 10, 13, 16, 17, 18, 19
-        ]);
+        assert_eq!(
+            &r.flatten().collect::<Vec<u64>>(),
+            &[9, 10, 13, 16, 17, 18, 19]
+        );
 
         r.remove_until(10);
         assert_eq!(&r.flatten().collect::<Vec<u64>>(), &[13, 16, 17, 18, 19]);

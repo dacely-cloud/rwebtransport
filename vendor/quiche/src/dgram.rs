@@ -72,7 +72,7 @@ impl<F: BufFactory> DatagramQueue<F> {
 
                 buf[..len].copy_from_slice(&d.as_ref()[..len]);
                 Ok(len)
-            },
+            }
 
             None => Err(Error::Done),
         }
@@ -80,8 +80,7 @@ impl<F: BufFactory> DatagramQueue<F> {
 
     pub fn pop(&mut self) -> Option<F::DgramBuf> {
         if let Some(d) = self.queue.pop_front() {
-            self.queue_bytes_size =
-                self.queue_bytes_size.saturating_sub(d.as_ref().len());
+            self.queue_bytes_size = self.queue_bytes_size.saturating_sub(d.as_ref().len());
             return Some(d);
         }
 
